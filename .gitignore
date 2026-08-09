@@ -1,0 +1,33 @@
+# Working plan doc — local thinking scratchpad, not repo documentation.
+# Durable findings live in README.md.
+PLAN.md
+
+# Sandboxed GD copy (~400MB app bundle + game state). Recreate with:
+#   ditto "<steam>/Geometry Dash.app" sandbox/"Geometry Dash.app"
+# See README.md. Never commit a copy of the game.
+sandbox/
+
+# Personal save data. Contains the real GD profile — must never leave this machine.
+backups/
+
+# Build output. mod/build alone is ~790MB (CPM deps, codegen, object files).
+mod/build/
+build/
+*.geode
+*.dylib
+*.o
+*.a
+
+# Run artifacts
+build.log
+launch.out
+*.log
+
+# Python
+trainer/.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store

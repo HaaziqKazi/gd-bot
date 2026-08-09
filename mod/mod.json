@@ -1,0 +1,11 @@
+{
+    "geode": "5.8.2",
+    "gd": {
+        "mac": "2.2081"
+    },
+    "version": "v0.1.0",
+    "id": "gdrl.probe",
+    "name": "GDRL Probe",
+    "developer": "gdrl",
+    "description": "Reads PlayLayer/PlayerObject state each frame and exposes it for an external RL trainer."
+}
