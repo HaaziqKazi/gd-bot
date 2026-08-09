@@ -3,6 +3,61 @@
 An RL environment for Geometry Dash, built on a Geode mod that reads live game
 state out of the running process.
 
+## Setting up from scratch
+
+### Prerequisites
+
+1. **Geometry Dash installed via Steam** (appid `322170`).
+2. **Geode installed into that copy** — <https://geode-sdk.org>. Launch GD once
+   and confirm it loads. This is not optional: the sandbox is a copy of a
+   Geode-*patched* bundle, and the patch (a rewritten `libfmod.dylib`) is the
+   entire injection vector. A copy of an unpatched install will not load mods.
+3. Xcode Command Line Tools (`xcode-select --install`).
+
+### Bootstrap
+
+**The order matters.** `geode sdk install` fails with *"No Geode profiles found"*
+until a profile exists, and the profile points at the sandbox — so the sandbox
+must be created first.
+
+```sh
+# 1. build tooling
+brew install cmake ninja
+brew install geode-sdk/geode/geode-cli
+
+# 2. create the sandbox AND register the 'gdrl-sandbox' profile
+./scripts/setup_sandbox.sh
+
+# 3. now the SDK will install (needs the profile from step 2)
+geode sdk install ~/.geode-sdk
+export GEODE_SDK=~/.geode-sdk       # add this to your shell rc
+geode sdk install-binaries
+
+# 4. build the mod and verify end-to-end
+(cd mod && geode build)
+./scripts/phase0_launch_test.sh
+```
+
+Expect the **first** build to take several minutes: it clones the bindings repo
+via CPM, downloads and runs codegen for GD `2.2081`, and compiles everything twice
+(universal). Incremental rebuilds after editing `main.cpp` take seconds.
+
+A successful `phase0_launch_test.sh` prints `probe mod loaded`, an
+`Enabled ... hook` line, and `REAL SAVE UNCHANGED [ok]`.
+
+### Verifying the SDK matches the game
+
+The Geode loader installed in the game and the SDK you build against must agree,
+or the mod will not load:
+
+```sh
+geode sdk version                                        # SDK
+python3 -c "import json;print(json.load(open('$(echo ~)/Library/Application Support/Steam/steamapps/common/Geometry Dash/Geometry Dash.app/Contents/geode/resources/geode.loader/mod.json'))['version'])"
+```
+
+Both were `5.8.2` here. If they differ, update whichever is behind, and update the
+`geode` field in `mod/mod.json` to match.
+
 ## Layout
 
 ```
