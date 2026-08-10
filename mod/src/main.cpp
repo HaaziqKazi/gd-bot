@@ -23,8 +23,10 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/PlayerObject.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 
 using namespace geode::prelude;
 
@@ -45,6 +47,14 @@ namespace {
         return v && *v == '1';
     }
 
+    // getenv on every physics tick is a linear scan of environ and is not
+    // thread-safe against setenv. Read the switches once.
+    const bool g_verbose  = envOn("GDRL_VERBOSE");
+
+    // Forward decl: the conditioning edge detector is armed per attempt, so
+    // every attempt logs the regime it starts in rather than only the changes.
+    void resetCondEdge();
+
     void resetAttemptStats() {
         g_frame     = 0;
         g_maxX      = 0.f;
@@ -52,6 +62,125 @@ namespace {
         g_dtMax     = 0.f;
         g_dtSum     = 0.0;
         g_dtSamples = 0;
+        resetCondEdge();
+    }
+
+    // ---------------------------------------------------------------------
+    // Objective A: the conditioning state.
+    //
+    // GD is eight games sharing a renderer. The same geometry means different
+    // things -- lethal vs irrelevant -- depending on which vehicle is active,
+    // which way gravity points, how big the hitbox is, and how fast the world
+    // scrolls. A policy therefore cannot use a fixed action mapping; it has to
+    // be conditioned on this state.
+    //
+    // Everything below is read straight off PlayerObject/GJBaseGameLayer rather
+    // than inferred from portals passed, so it stays correct through triggers,
+    // mid-level respawns and checkpoint restores.
+    // ---------------------------------------------------------------------
+
+    enum class Vehicle : int {
+        Cube = 0, Ship = 1, Ball = 2, Ufo = 3,
+        Wave = 4, Robot = 5, Spider = 6, Swing = 7,
+    };
+
+    const char* vehicleName(Vehicle v) {
+        switch (v) {
+            case Vehicle::Cube:   return "cube";
+            case Vehicle::Ship:   return "ship";
+            case Vehicle::Ball:   return "ball";
+            case Vehicle::Ufo:    return "ufo";
+            case Vehicle::Wave:   return "wave";
+            case Vehicle::Robot:  return "robot";
+            case Vehicle::Spider: return "spider";
+            case Vehicle::Swing:  return "swing";
+        }
+        return "?";
+    }
+
+    // Cube is the absence of every flag, so it is the fallthrough.
+    //
+    // Order is deliberate and defensive. The derived modes are checked before
+    // the ones they derive from: swing is ship-like and spider is ball-like,
+    // and if GD leaves the parent flag set while the child is active, checking
+    // the parent first would silently report the wrong vehicle -- a wrong
+    // conditioning label that still trains, which is the failure mode this repo
+    // keeps running into. modeFlagBits() below makes any overlap visible rather
+    // than letting this ordering quietly paper over it.
+    Vehicle deriveVehicle(PlayerObject* p) {
+        if (p->m_isSwing)  return Vehicle::Swing;
+        if (p->m_isSpider) return Vehicle::Spider;
+        if (p->m_isRobot)  return Vehicle::Robot;
+        if (p->m_isDart)   return Vehicle::Wave;
+        if (p->m_isBird)   return Vehicle::Ufo;
+        if (p->m_isBall)   return Vehicle::Ball;
+        if (p->m_isShip)   return Vehicle::Ship;
+        return Vehicle::Cube;
+    }
+
+    unsigned modeFlagBits(PlayerObject* p) {
+        return (unsigned(p->m_isShip)   << 0) | (unsigned(p->m_isBall)   << 1)
+             | (unsigned(p->m_isBird)   << 2) | (unsigned(p->m_isDart)   << 3)
+             | (unsigned(p->m_isRobot)  << 4) | (unsigned(p->m_isSpider) << 5)
+             | (unsigned(p->m_isSwing)  << 6);
+    }
+
+    struct CondState {
+        Vehicle vehicle     = Vehicle::Cube;
+        bool    upsideDown  = false;
+        bool    sideways    = false;
+        bool    mini        = false;
+        bool    dual        = false;
+        bool    onGround    = false;
+        bool    dashing     = false;
+        float   vehicleSize = 1.f;
+        float   playerSpeed = 0.9f;
+        double  gravity     = 1.0;
+        float   timeWarp    = 1.f;
+
+        // Only the axes that change how inputs must be interpreted. Cosmetic
+        // and continuously-varying quantities (position, velocity) belong in
+        // the observation, not the conditioning vector.
+        bool differsFrom(const CondState& o) const {
+            return vehicle    != o.vehicle
+                || upsideDown != o.upsideDown
+                || sideways   != o.sideways
+                || mini       != o.mini
+                || dual       != o.dual
+                || vehicleSize != o.vehicleSize
+                || playerSpeed != o.playerSpeed
+                || gravity     != o.gravity
+                || timeWarp    != o.timeWarp;
+        }
+    };
+
+    CondState readCond(GJBaseGameLayer* layer, PlayerObject* p) {
+        CondState s;
+        s.vehicle     = deriveVehicle(p);
+        s.upsideDown  = p->m_isUpsideDown;
+        s.sideways    = p->m_isSideways;
+        s.onGround    = p->m_isOnGround;
+        s.dashing     = p->m_isDashing;
+        s.vehicleSize = p->m_vehicleSize;
+        s.mini        = p->m_vehicleSize < 0.9f;   // 1.0 normal, 0.6 mini
+        s.playerSpeed = p->m_playerSpeed;
+        s.gravity     = p->m_gravity;
+        // NOT `m_player2 != nullptr`. GD allocates the second PlayerObject
+        // unconditionally and merely hides it outside dual sections, so the
+        // pointer test reports dual=1 on every level including Stereo Madness.
+        // Caught by the COND log on the first real run.
+        s.dual        = layer->m_gameState.m_isDualMode;
+        s.timeWarp    = layer->m_gameState.m_timeWarp;
+        return s;
+    }
+
+    // Last conditioning state seen, for edge detection.
+    CondState g_cond;
+    bool      g_condInit = false;
+
+    void resetCondEdge() {
+        g_cond     = CondState{};
+        g_condInit = false;
     }
 }
 
@@ -125,11 +254,16 @@ class $modify(GDRLMenuLayer, MenuLayer) {
 
 class $modify(GDRLPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-
+        // Reset *before* delegating. PlayLayer::init calls resetLevel() before
+        // it returns, which reaches the hook below; with the old ordering that
+        // fired against the previous level's counters and emitted a fabricated
+        // ATTEMPT row on every level entry after the first.
         g_attempt    = 0;
         g_dumpedGrid = false;
         resetAttemptStats();
+
+        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+
         log::info("[gdrl] === level '{}' ===", level->m_levelName.c_str());
         return true;
     }
@@ -220,14 +354,78 @@ class $modify(GDRLBaseGameLayer, GJBaseGameLayer) {
             }
         }
 
-        // Periodic state dump, off by default -- it drowns the DEATH lines.
-        if (envOn("GDRL_VERBOSE") && g_frame % 60 == 0) {
+        // --- Objective A: conditioning-state edge log ---------------------
+        //
+        // Sampled per render frame rather than per physics tick, which is fine
+        // *for cataloguing*: a regime change persists for many ticks, so no
+        // transition can hide between two samples. Tick-exact attribution comes
+        // from m_currentStep, logged alongside, and from the switchedToMode
+        // hook below which fires on the transition itself.
+        //
+        // Emitted on change only. A level is a few dozen regime changes, so
+        // this is a complete record of the conditioning trajectory at a cost
+        // that does not perturb the frame budget.
+        const CondState cur = readCond(this, p);
+        if (!g_condInit || cur.differsFrom(g_cond)) {
+            const unsigned bits = modeFlagBits(p);
+
+            // Exactly zero (cube) or one vehicle flag should ever be set. More
+            // than one means deriveVehicle's ordering is load-bearing rather
+            // than merely defensive, and the labels it produces are a guess.
+            if (bits & (bits - 1)) {
+                log::error("[gdrl] OVERLAPPING VEHICLE FLAGS bits=0b{:07b} -- "
+                           "vehicle label '{}' is not trustworthy",
+                           bits, vehicleName(cur.vehicle));
+            }
+
             log::info(
-                "[gdrl] f={:<5} dt={:.5f} pos=({:.1f},{:.1f}) yv={:+.2f} "
-                "ground={} ship={} up={} size={:.2f} spd={:.2f}",
-                g_frame, dt, p->getPositionX(), p->getPositionY(), p->m_yVelocity,
-                (int)p->m_isOnGround, (int)p->m_isShip,
-                (int)p->m_isUpsideDown, p->m_vehicleSize, p->m_playerSpeed);
+                "[gdrl] COND step={:<7} x={:.3f} {:<6} grav={} size={:.2f} "
+                "spd={:.2f} gmul={:.2f} warp={:.2f} dual={} sideways={}",
+                m_currentStep, p->getPositionX(), vehicleName(cur.vehicle),
+                cur.upsideDown ? "up" : "dn", cur.vehicleSize, cur.playerSpeed,
+                cur.gravity, cur.timeWarp, (int)cur.dual, (int)cur.sideways);
+
+            g_cond     = cur;
+            g_condInit = true;
         }
+
+        // Periodic state dump, off by default -- it drowns the ATTEMPT and
+        // COND lines, which are the actual data.
+        if (g_verbose && g_frame % 60 == 0) {
+            log::info(
+                "[gdrl] f={:<5} step={:<7} dt={:.5f} pos=({:.1f},{:.1f}) "
+                "yv={:+.2f} {} ground={} up={} size={:.2f} spd={:.2f}",
+                g_frame, m_currentStep, dt, p->getPositionX(), p->getPositionY(),
+                p->m_yVelocity, vehicleName(cur.vehicle),
+                (int)p->m_isOnGround, (int)p->m_isUpsideDown,
+                p->m_vehicleSize, p->m_playerSpeed);
+        }
+    }
+};
+
+// Mode transitions, caught at the source.
+//
+// The COND edge log above tells you the conditioning state changed; this tells
+// you what changed it. GameObjectType is logged raw because the portal-id ->
+// enum mapping is not something to assume -- run a level with known portals and
+// read the correspondence off the log, the same way the section grid factors
+// were pinned down.
+//
+// Guarded on the active PlayLayer's player: PlayerObject is also instantiated
+// for icon previews in menus and the garage, where these calls are meaningless.
+class $modify(GDRLPlayerObject, PlayerObject) {
+    void switchedToMode(GameObjectType type) {
+        const Vehicle before = deriveVehicle(this);
+        PlayerObject::switchedToMode(type);
+        const Vehicle after  = deriveVehicle(this);
+
+        auto* pl = PlayLayer::get();
+        if (!pl || (pl->m_player1 != this && pl->m_player2 != this)) return;
+        if (before == after) return;
+
+        log::info("[gdrl] MODE step={:<7} x={:.3f} {} -> {} (objectType={}) p{}",
+                  pl->m_currentStep, this->getPositionX(),
+                  vehicleName(before), vehicleName(after),
+                  (int)type, pl->m_player2 == this ? 2 : 1);
     }
 };

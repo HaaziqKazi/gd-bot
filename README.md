@@ -204,6 +204,52 @@ Still unverified: longer trajectories, trigger-heavy levels, determinism *across
 processes* (needed for parallel workers), and sequences that actually contain
 inputs.
 
+## Conditioning state: the eight vehicles and their modifiers
+
+GD is eight games sharing a renderer. The same geometry is lethal in cube and
+irrelevant in ship; a gravity flip inverts what "up" means. A policy therefore
+cannot use one static action mapping — it has to be conditioned on the active
+physics regime. The mod emits that regime as a `COND` line whenever any axis of
+it changes, plus a `MODE` line from `PlayerObject::switchedToMode` for the
+transition itself.
+
+Fields, all read live off `PlayerObject` / `GJBaseGameLayer` rather than inferred
+from portals passed, so they stay correct through triggers and respawns:
+
+| Axis | Source | Notes |
+|---|---|---|
+| Vehicle | `m_isShip` `m_isBird` `m_isBall` `m_isDart` `m_isRobot` `m_isSpider` `m_isSwing` | cube is the absence of all seven; `m_isBird` = UFO, `m_isDart` = wave |
+| Gravity | `m_isUpsideDown`, `m_gravity` | flag plus continuous multiplier |
+| Size | `m_vehicleSize` | 1.0 normal, 0.6 mini |
+| Speed | `m_playerSpeed` | 0.9 at "1x" |
+| Global rate | `m_gameState.m_timeWarp` | independent of player speed |
+| Dual | `m_gameState.m_isDualMode` | **not** `m_player2` — see below |
+| Misc | `m_isSideways` `m_isDashing` `m_isOnGround` `m_isPlatformer` | |
+
+**`m_player2` is not a dual-mode test.** GD allocates the second `PlayerObject`
+unconditionally and hides it outside dual sections, so `m_player2 != nullptr` is
+true on every level. It reported `dual=1` on Stereo Madness on the first run.
+`m_gameState.m_isDualMode` is the real flag.
+
+**Baselines are not 1.0.** Normal gravity reads `m_gravity = 0.96`, the same way
+"1x" speed reads `m_playerSpeed = 0.90`. Both are normalised against their
+measured baseline on the Python side rather than against 1.0.
+
+**Vehicle flags are checked derived-first.** Swing is ship-like and spider is
+ball-like, and if GD leaves a parent flag set while a child mode is active,
+testing the parent first silently yields the wrong label — a wrong conditioning
+input that still trains. `deriveVehicle` orders the checks defensively and the
+probe logs an error if more than one vehicle flag is ever set at once, so the
+ordering cannot quietly paper over an overlap. No overlap observed so far, but
+only cube has actually been reached: with no input the player dies at the first
+spike, so every non-cube mode is unverified until input injection exists.
+
+**`m_currentStep` is the physics-tick counter.** It sits next to `m_randomSeed`,
+`m_replayRandSeed` and `m_queuedButtons` (`gd::vector<PlayerButtonCommand>`, fed
+by `queueButton(button, push, isPlayer2, timestamp)`) — i.e. the timestamped
+input-injection path and the seed state needed for cross-process determinism are
+all in that one region of `GJBaseGameLayer`.
+
 ## Two probe bugs worth not repeating
 
 Both produced confident, plausible-looking numbers from a broken measurement.
