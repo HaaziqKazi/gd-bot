@@ -1,14 +1,23 @@
 // GDRL Probe
 //
 // Phase 0 (done): mod builds universal, loads, and can hook.
-// Phase 1 (here): read live game state and work out how to query a local window
-//                 of geometry around the player.
+// Phase 1 (done-ish): live player state + section grid decoded.
+// Phase 2a (here): does the same input sequence produce the same outcome?
 //
-// The section grid is a 2D uniform spatial index the game already maintains, and
-// re-buckets when triggers move objects. Rather than guess how world coordinates
-// map onto section indices, this logs the factors alongside the player position
-// and the game's own active-window indices, so the mapping can be read off a real
-// level instead of assumed.
+// This is the load-bearing question for the whole project. The plan treats GD as
+// a perfect forward model -- search over input sequences, replay, distill. All of
+// that collapses if replays are not reproducible.
+//
+// The worry is concrete: update() receives real wall-clock frame time (~0.0084s,
+// jittering, on a 120Hz display), not a fixed timestep. If physics integrates raw
+// dt, trajectories drift with rendering load.
+//
+// Test: "no input" is a valid fixed input sequence. The player runs into the first
+// spike and GD auto-retries, so we get many independent attempts of the same
+// input for free -- no input injection needed yet. If physics is genuinely
+// fixed-step, every attempt must die at a bit-identical position even though dt
+// varies between them. Logging dt spread alongside the death position tests
+// exactly that: same outcome despite different frame timing.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -20,20 +29,29 @@
 using namespace geode::prelude;
 
 namespace {
+    int    g_attempt      = 0;
     int    g_frame        = 0;
     bool   g_dumpedGrid   = false;
+    float  g_maxX         = 0.f;   // furthest x reached in the current attempt
+
+    // dt spread within the current attempt
     float  g_dtMin        = 1e9f;
     float  g_dtMax        = 0.f;
-    int    g_dtSamples    = 0;
     double g_dtSum        = 0.0;
+    int    g_dtSamples    = 0;
 
-    void resetProbeState() {
-        g_frame      = 0;
-        g_dumpedGrid = false;
-        g_dtMin      = 1e9f;
-        g_dtMax      = 0.f;
-        g_dtSamples  = 0;
-        g_dtSum      = 0.0;
+    bool envOn(const char* name) {
+        const char* v = std::getenv(name);
+        return v && *v == '1';
+    }
+
+    void resetAttemptStats() {
+        g_frame     = 0;
+        g_maxX      = 0.f;
+        g_dtMin     = 1e9f;
+        g_dtMax     = 0.f;
+        g_dtSum     = 0.0;
+        g_dtSamples = 0;
     }
 }
 
@@ -63,8 +81,8 @@ $execute {
 // one. Reads and writes share the same path computation, so this answers the same
 // question with nothing at stake.
 //
-// Expect 'Player' and 0 stars. A real username or a real star count here means
-// the sandbox is reading the real save and isolation has regressed.
+// Expect 'Player' and 0 stars. A real username or star count here means the
+// sandbox is reading the real save and isolation has regressed.
 class $modify(GDRLMenuLayer, MenuLayer) {
     bool init() {
         if (!MenuLayer::init()) return false;
@@ -77,16 +95,20 @@ class $modify(GDRLMenuLayer, MenuLayer) {
             log::info("[gdrl] ISOLATION stars      = {}",
                       GameStatsManager::sharedState()->getStat("6"));
 
-            // Drive straight into a level when asked. Training needs thousands of
-            // episode resets, so the mod has to own level entry -- clicking
-            // through menus is not an option. Gated on an env var so an ordinary
-            // launch still reaches the menu normally.
+            // Training needs thousands of episode resets, so the mod has to own
+            // level entry -- clicking through menus is not an option. Gated on an
+            // env var so an ordinary launch still reaches the menu normally.
             //
             // Deferred by a frame: replacing the scene from inside MenuLayer::init
             // would tear down the scene currently being constructed.
-            if (const char* want = std::getenv("GDRL_AUTOPLAY"); want && *want == '1') {
+            if (envOn("GDRL_AUTOPLAY")) {
                 Loader::get()->queueInMainThread([] {
-                    auto* level = GameLevelManager::sharedState()->getMainLevel(1, true);
+                    // Second arg is dontGetLevelString. Passing true yields a
+                    // level object with no content: 2 objects, levelLength 793,
+                    // nothing to collide with. It still loads and still "runs",
+                    // so every measurement taken against it looks plausible and
+                    // is meaningless. Must be false.
+                    auto* level = GameLevelManager::sharedState()->getMainLevel(1, false);
                     if (!level) {
                         log::error("[gdrl] getMainLevel(1) returned null");
                         return;
@@ -105,9 +127,44 @@ class $modify(GDRLPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-        resetProbeState();
+        g_attempt    = 0;
+        g_dumpedGrid = false;
+        resetAttemptStats();
         log::info("[gdrl] === level '{}' ===", level->m_levelName.c_str());
         return true;
+    }
+
+    // The determinism measurement, taken at the attempt boundary.
+    //
+    // Printed at maximum precision on purpose: the question is not "roughly the
+    // same place" but "bit-identical". A drift of 1e-4 across attempts would still
+    // mean replays diverge, and would still sink search-based planning -- it would
+    // just take longer to notice.
+    //
+    // destroyPlayer turned out to be unusable for this: it fires every physics
+    // tick with a constant killer id, which is not death semantics and suggests a
+    // mis-mapped binding. resetLevel is called once per attempt and needs no
+    // assumptions about GD's death plumbing, so the summary is emitted here from
+    // state accumulated in update().
+    //
+    // ATTEMPT lines are the determinism data. Across attempts of an identical
+    // input sequence (here: no input at all), maxX and t must be bit-identical
+    // while the dt spread varies. Same outcome despite different frame timing is
+    // exactly what fixed-step physics predicts.
+    void resetLevel() {
+        const double dtMean = g_dtSamples ? g_dtSum / g_dtSamples : 0.0;
+        if (g_frame > 0) {
+            log::info(
+                "[gdrl] ATTEMPT {:<3} maxX={:.9f} t={:.9f} frames={:<6} "
+                "dt[min={:.6f} max={:.6f} mean={:.6f}]",
+                g_attempt, g_maxX, m_attemptTime, g_frame,
+                g_dtMin, g_dtMax, dtMean);
+        }
+
+        PlayLayer::resetLevel();
+
+        g_attempt++;
+        resetAttemptStats();
     }
 };
 
@@ -124,6 +181,8 @@ class $modify(GDRLBaseGameLayer, GJBaseGameLayer) {
         g_dtMax = std::max(g_dtMax, dt);
         g_dtSum += dt;
         g_dtSamples++;
+        g_frame++;
+        g_maxX = std::max(g_maxX, p->getPositionX());
 
         if (!g_dumpedGrid) {
             g_dumpedGrid = true;
@@ -147,34 +206,28 @@ class $modify(GDRLBaseGameLayer, GJBaseGameLayer) {
             log::info("[gdrl] sectionYFactor   = {}", m_sectionYFactor);
             log::info("[gdrl] levelLength      = {}", m_levelLength);
             log::info("[gdrl] object count     = {}", m_objects ? m_objects->count() : 0u);
+
+            // Fail loudly on an empty level. An empty level runs happily and
+            // produces measurements that look real, which cost a whole debugging
+            // cycle once already. Stereo Madness is ~2400 objects; anything in
+            // single digits means the level string never loaded.
+            const unsigned objCount = m_objects ? m_objects->count() : 0u;
+            if (objCount < 10) {
+                log::error("[gdrl] LEVEL LOOKS EMPTY ({} objects, length {}) -- "
+                           "level string almost certainly did not load. Any "
+                           "measurement from this run is invalid.",
+                           objCount, m_levelLength);
+            }
         }
 
-        // Once a second at 60fps. Logging both candidate mappings (divide vs
-        // multiply) against the game's own active-window indices reveals which
-        // convention the factors follow without having to guess.
-        if (g_frame++ % 60 == 0) {
-            const float px = p->getPositionX();
-            const float py = p->getPositionY();
-
-            // m_vehicleSize is the mini/normal scale and m_playerSpeed the speed
-            // multiplier -- both feed the observation window, which must cover a
-            // constant time horizon rather than a constant distance.
+        // Periodic state dump, off by default -- it drowns the DEATH lines.
+        if (envOn("GDRL_VERBOSE") && g_frame % 60 == 0) {
             log::info(
                 "[gdrl] f={:<5} dt={:.5f} pos=({:.1f},{:.1f}) yv={:+.2f} "
                 "ground={} ship={} up={} size={:.2f} spd={:.2f}",
-                g_frame, dt, px, py, p->m_yVelocity,
+                g_frame, dt, p->getPositionX(), p->getPositionY(), p->m_yVelocity,
                 (int)p->m_isOnGround, (int)p->m_isShip,
                 (int)p->m_isUpsideDown, p->m_vehicleSize, p->m_playerSpeed);
-
-            log::info(
-                "[gdrl]   active x=[{}..{}] y=[{}..{}] | x/xf={:.2f} x*xf={:.2f} "
-                "| y/yf={:.2f} y*yf={:.2f}",
-                m_leftSectionIndex, m_rightSectionIndex,
-                m_bottomSectionIndex, m_topSectionIndex,
-                m_sectionXFactor != 0.f ? px / m_sectionXFactor : -1.f,
-                px * m_sectionXFactor,
-                m_sectionYFactor != 0.f ? py / m_sectionYFactor : -1.f,
-                py * m_sectionYFactor);
         }
     }
 };

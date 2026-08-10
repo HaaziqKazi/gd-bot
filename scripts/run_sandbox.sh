@@ -35,6 +35,21 @@ if [[ ! -d "$APP" ]]; then
     exit 1
 fi
 
+# GD links libsteam_api and calls SteamAPI_Init on startup. With Steam not
+# running that fails and the process exits a few hundred ms in -- again *after*
+# Geode has loaded, hooked, and logged a healthy startup, so the Geode log gives
+# no hint. Fail loudly here instead of letting it look like a mod problem.
+#
+# This is a real constraint on unattended training: Steam must be running. The
+# eventual fix for a headless rig is to stub libsteam_api.dylib, at which point
+# set GDRL_SKIP_STEAM_CHECK=1.
+if [[ "${GDRL_SKIP_STEAM_CHECK:-0}" != "1" ]] && ! pgrep -x steam_osx >/dev/null 2>&1; then
+    echo "Steam is not running -- GD will exit silently a few hundred ms after launch." >&2
+    echo "Start it with:  open -a Steam" >&2
+    echo "(then wait for it to finish signing in before relaunching)" >&2
+    exit 1
+fi
+
 mkdir -p "$SANDBOX_HOME/Library/Application Support/GeometryDash"
 
 echo "[run] app  : $APP"

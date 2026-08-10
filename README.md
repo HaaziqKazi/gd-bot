@@ -131,6 +131,26 @@ and installed its hooks — so the Geode log looks completely healthy right up t
 the point where the process vanishes. `run.sh` therefore `cd`s to
 `Contents/Resources` before exec.
 
+## Launch gotcha: Steam must be running
+
+Separate from the working-directory issue, and with an identical symptom. GD links
+`libsteam_api` and calls `SteamAPI_Init` at startup; with Steam not running that
+fails and the process exits a few hundred ms in:
+
+```
+[S_API FAIL] SteamAPI_Init() failed; ipcserver GetSteamPath failed.
+[S_API] SteamAPI_Init(): did not locate a running instance of Steam.
+```
+
+The Geode log again looks perfectly healthy — it reaches `Loading early mods`,
+`Continuing next frame...`, `Entry took 0.007s`, and simply stops. Nothing in it
+suggests Steam. `run_sandbox.sh` now preflights this and fails with a clear
+message.
+
+**This is a real constraint on unattended training:** Steam has to be up. For a
+headless rig the fix is to stub `libsteam_api.dylib`, then set
+`GDRL_SKIP_STEAM_CHECK=1`.
+
 ## Save isolation: `HOME` is not enough
 
 Setting only `HOME` does **not** redirect GD's save directory. Verified directly:
@@ -152,6 +172,57 @@ mod save dir    = .../sandbox/home/Library/Application Support/GeometryDash/...
 Note `getWritablePath2()` is RobTop's addition rather than stock cocos. Prefer
 asking the game where it will write over watching for writes — a short run that
 happens not to save is indistinguishable from successful isolation.
+
+## Physics is fixed-step at 240Hz (determinism holds)
+
+`GJBaseGameLayer::update(float dt)` receives **real wall-clock frame time**, which
+jitters (~0.0084s on a 120Hz display). That looked like a threat to determinism —
+the entire search-and-replay plan needs the same inputs to give the same result.
+
+They do. GD accumulates the variable render `dt` and consumes it in fixed
+**1/240s** physics steps. Measured over 37 consecutive attempts of an identical
+input sequence (no input at all) on Stereo Madness:
+
+```
+maxX   = 507.615234375   bit-identical across all 37
+t      = 1.629166752     bit-identical (= 391/240 exactly)
+frames = 316 .. 440      render frames vary by ~40%
+dt max = 0.0159 .. 0.0332  including a 4x frame hitch
+```
+
+Directly observable in the per-tick data: `t` advances in exact 1/240 increments
+and x by exactly `1.298250437` per tick (≈311.6 units/s at "1x", which is
+`m_playerSpeed = 0.90` internally).
+
+**Consequence for input injection:** the render:physics ratio is *not* constant —
+316–440 render frames covered the same 391 physics ticks. Inputs must therefore be
+applied per **physics tick**, not per render frame, or the same intended input
+sequence will land on different ticks between runs and reintroduce the
+nondeterminism the engine itself does not have.
+
+Still unverified: longer trajectories, trigger-heavy levels, determinism *across
+processes* (needed for parallel workers), and sequences that actually contain
+inputs.
+
+## Two probe bugs worth not repeating
+
+Both produced confident, plausible-looking numbers from a broken measurement.
+
+**Reading state after delegating.** Hooking `destroyPlayer` and reading position
+*after* calling the original reports the respawn point, not the death — every
+attempt showed an identical `x=1.298` and `t=1/240`, which reads as a flawless
+determinism result and is actually just measuring the reset. Snapshot before
+delegating.
+
+**`getMainLevel(id, dontGetLevelString)`.** Passing `true` yields a level object
+with no content — 2 objects, `levelLength` 793 instead of 26724. It loads, it
+runs, and it produces measurements that look real. `main.cpp` now hard-errors when
+a level has fewer than 10 objects.
+
+`destroyPlayer` itself proved unusable as a death signal: it fires every physics
+tick with a constant killer id, suggesting a mis-mapped binding. Attempt
+boundaries are measured at `resetLevel` instead, which needs no assumptions about
+GD's death plumbing.
 
 ## Build gotcha: architecture
 
