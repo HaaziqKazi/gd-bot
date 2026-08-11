@@ -70,6 +70,26 @@ namespace {
     const bool g_expOn      = envInt("GDRL_EXP", 0) == 1;
     const int  g_deltaTicks = envInt("GDRL_DELTA_TICKS", 0);
 
+    // Experiment 3: cut the fixed 64-frame floor.
+    //
+    // frames = 96/k + 64 says the residue is death/respawn animation, which does
+    // not scale with dt because it is driven by the cocos scheduler in real time
+    // rather than by update()'s dt. destroyPlayer sets m_inResetDelay and arms a
+    // delayed reset -- there is an `fmov s0, #1.0` immediately before a call in
+    // its body, consistent with the ~1.07s measured.
+    //
+    // delayedResetLevel has no bl call sites, so it is invoked through a
+    // scheduled selector and the delay is not a constant worth patching. Forcing
+    // resetLevel() as soon as m_inResetDelay is observed skips the wait instead.
+    //
+    // The risk is a double reset: GD's own delayed callback may still fire after
+    // ours and start a second attempt. That needs no special detection -- a
+    // spurious reset produces an attempt whose maxX is not 507.615234375, and
+    // the determinism invariant is already checked on every line.
+    const bool g_fastReset = envInt("GDRL_FAST_RESET", 0) == 1;
+
+    long g_fastResets = 0;
+
     // Ungated lifetime hit counts for the two inlined functions. Kept so that
     // "never called" stays distinguishable from "the detour never ran" -- that
     // ambiguity made the first run of this experiment uninterpretable despite
@@ -129,14 +149,23 @@ class $modify(GDRLExpBaseGameLayer, GJBaseGameLayer) {
                       "step {}->{} (ticks={})",
                       g_updCalls, dt, useDt, before, m_currentStep, d);
         }
+
+        // Skip the post-death wait. Done after delegating so the attempt's final
+        // frame is fully simulated before the reset is forced.
+        if (g_fastReset) {
+            if (auto* pl = PlayLayer::get(); pl && pl->m_inResetDelay) {
+                g_fastResets++;
+                pl->resetLevel();
+            }
+        }
     }
 };
 
 class $modify(GDRLExpPlayLayer, PlayLayer) {
     void resetLevel() {
         if (g_expOn) {
-            log::info("[gdrl] PCHITS gmd={} pc={} upd={}",
-                      g_gmdHits, g_pcHits, g_updCalls);
+            log::info("[gdrl] PCHITS gmd={} pc={} upd={} fastResets={}",
+                      g_gmdHits, g_pcHits, g_updCalls, g_fastResets);
 
             if (g_updCalls > 0) {
                 std::string hist;
@@ -159,7 +188,7 @@ class $modify(GDRLExpPlayLayer, PlayLayer) {
 
 $execute {
     if (g_expOn) {
-        log::info("[gdrl] EXP instrumentation ON (GDRL_DELTA_TICKS={})",
-                  g_deltaTicks);
+        log::info("[gdrl] EXP instrumentation ON (GDRL_DELTA_TICKS={} "
+                  "GDRL_FAST_RESET={})", g_deltaTicks, (int)g_fastReset);
     }
 }

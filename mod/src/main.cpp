@@ -317,6 +317,23 @@ class $modify(GDRLPlayLayer, PlayLayer) {
     // while the dt spread varies. Same outcome despite different frame timing is
     // exactly what fixed-step physics predicts.
     void resetLevel() {
+        // Capture the final position at the attempt boundary, before delegating.
+        //
+        // g_maxX is otherwise sampled once per render frame in update(), which
+        // makes it a function of the frame rate rather than of the simulation:
+        // at 32 ticks/frame the player advances ~41.5 units between samples, and
+        // the last pre-death sample can miss the true endpoint. Skipping the
+        // respawn animation exposed exactly that -- maxX read 498.527496338
+        // instead of 507.615234375, short by 9.087738037 units, which is 6.999988
+        // physics ticks. The simulation was identical; t matched to the bit. Only
+        // the sampling had changed.
+        //
+        // Before delegating, for the reason in "Two probe bugs worth not
+        // repeating": after the original, this reads the respawn, not the death.
+        if (auto* p = m_player1) {
+            g_maxX = std::max(g_maxX, p->getPositionX());
+        }
+
         const double dtMean = g_dtSamples ? g_dtSum / g_dtSamples : 0.0;
         if (g_frame > 0) {
             log::info(

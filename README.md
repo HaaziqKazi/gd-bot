@@ -257,8 +257,29 @@ frames = 96/k + 64
 of fixed death/respawn animation that does not**. That fixed cost is the
 throughput ceiling, not `dt`: at k=32 the simulation is already down to 12 frames
 and 84% of each attempt is animation, which is why 8× `dt` bought only 2.55×
-throughput. The asymptote is ~0.94 attempts/sec. Going faster means shortening
-the respawn, then parallel instances — not a larger `dt`.
+throughput.
+
+### Cutting the respawn: `GDRL_FAST_RESET=1`
+
+`destroyPlayer` sets `m_inResetDelay` and arms a delayed reset (there is an
+`fmov s0, #1.0` immediately before a call in its body, matching the ~1.07s).
+`delayedResetLevel` has no `bl` call sites — it is reached through a scheduled
+selector, so the delay is not a constant worth patching. Forcing `resetLevel()`
+as soon as `m_inResetDelay` is observed skips the wait entirely:
+
+| config | frames/attempt | attempts/sec |
+|---|---|---|
+| baseline (real `dt`) | ~160 | 0.35 |
+| `dt` = 32/240 | ~76 | 0.88 |
+| `dt` = 32/240 + fast reset | **15** | **3.9 – 4.1** |
+
+**~11.5× the original rollout rate**, still bit-identical: 175 consecutive
+attempts at `maxX=507.615234375`, `t=1.629166752`, every one `input[clean]`.
+`fastResets` equalled the attempt count exactly, so GD's own delayed callback
+never fired a competing second reset.
+
+Next lever is parallel instances; there is no longer meaningful fixed overhead
+left to remove in a single one.
 
 ## Inlined bindings: an address is not a call site
 
@@ -366,6 +387,20 @@ delegating.
 with no content — 2 objects, `levelLength` 793 instead of 26724. It loads, it
 runs, and it produces measurements that look real. `main.cpp` now hard-errors when
 a level has fewer than 10 objects.
+
+**`maxX` was a function of the frame rate, not the simulation.** It was sampled
+once per render frame in `update()`. That agreed with itself across every run
+until the respawn animation was skipped — which deleted the post-death frames
+that had been quietly capturing the true endpoint — and `maxX` dropped to
+`498.527496338`, short by `9.087738037` units. That is **6.999988 physics
+ticks**: at 32 ticks/frame the player advances ~41.5 units between samples, so
+the last pre-death sample missed the end. `t` was bit-identical throughout,
+because it comes from GD's own accumulator rather than from our sampling.
+
+The metric now snapshots the player position at the attempt boundary, before
+delegating. The general trap: a per-frame sample of a per-tick quantity looks
+stable exactly as long as the frame rate is stable, and silently becomes a
+different measurement the moment anything touches timing.
 
 `destroyPlayer` itself proved unusable as a death signal: it fires every physics
 tick with a constant killer id, suggesting a mis-mapped binding. Attempt
