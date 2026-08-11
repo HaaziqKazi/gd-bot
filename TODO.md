@@ -38,6 +38,61 @@ Stereo Madness.
 
 ---
 
+## Track 0 — Ground-truth validation  ← HIGHEST PRIORITY
+
+Two systems are **built and internally self-consistent but never checked against
+the running game**. Self-consistency is not evidence: a test of the form
+`predictor_output == helper_using_the_same_equations()` has near-zero
+evidentiary value. Both need external, game-grounded ground truth.
+
+### 0.1 Forward projection: validate against real moving geometry
+
+`trainer/trajectory.py` predicts where a moving block will be when the player
+arrives. The maths is implemented and `test_trajectory.py` passes 48 tests — all
+of which compare the predictor against Python fixtures, **none against GD**.
+
+Blocker: there is no reachable move trigger. The census found exactly four in
+all 21 main levels (Fingerdash, x=7813–8455, all touch-triggered) against a best
+reach of x=3959. Synth would create one, but object 901 is rejected (→ 1.1).
+
+- [ ] Unblock a reachable move trigger (via 1.1, or find another route:
+      checkpoint/`loadUpToPosition` seek, spawn near Fingerdash's triggers).
+- [ ] Capture per-tick ground truth: object position each tick from telemetry.
+- [ ] Compare predicted position at player-arrival tick vs observed position.
+- [ ] Quantify: mean error, max error, does error grow with horizon, does it
+      change near trajectory reversals, does it lead or lag.
+- [ ] Investigate the whole path before trusting a number: is the state sampled
+      pre- or post-physics? Same frame of reference? Same origin/centre
+      convention? Stale by one tick? **Suspect off-by-one-frame first.**
+- [ ] Fix discrepancies rather than assuming the predictor is right.
+- [ ] Land a deterministic regression test carrying the recorded dataset.
+
+### 0.2 Physics predictor: identify and validate
+
+The "internal physics predictor" is the player-motion model that produces
+**arrival ticks** — `SpeedProfile` / `UNITS_PER_TICK` in `trajectory.py`. Forward
+projection depends on it: a wrong arrival tick moves the predicted object
+position even if the object model is perfect.
+
+- [ ] Document precisely what it claims to model: inputs, outputs, coordinate
+      convention, timestep, velocity representation, speed caps, what it assumes
+      about future control input, and what it does **not** model (vertical
+      motion? collision? gravity?).
+- [ ] **Known systematic error, already identified:** four of five entries in
+      `UNITS_PER_TICK` are unverified community constants and are demonstrably
+      not proportional to `m_playerSpeed` (`1.6/0.9 = 1.778` vs
+      `576.00/311.58 = 1.849`). → fix via 1.2.
+- [ ] Validate against recorded game trajectories, not against itself. Ground
+      truth ranking: predictor vs live game > vs recorded transitions > vs an
+      independent reimplementation > vs itself.
+- [ ] Check for: systematic drift, timestep mismatch, off-by-one tick, state
+      captured before vs after integration.
+- [ ] Label the existing self-referential tests as regression-only rather than
+      deleting them; supplement with game-grounded ones.
+- [ ] Document remaining modelling limitations honestly.
+
+---
+
 ## Track 1 — Synth content + cheap measurements  ← SELECTED
 
 Highest unblock-per-hour. Two of these are available right now with no new work.
@@ -52,8 +107,22 @@ the cause (a sacrificial first block loaded fine while 901 still did not).
 What is left is the trigger's **property encoding, which was written from
 memory** — the half-remembered-table failure this repo has already paid for.
 
-- [ ] Dump a real level string containing a move trigger. **Fingerdash has four**
-      (x = 7813–8455).
+- [x] **Build the dumper.** `mod/src/level_dump.cpp` + `.hpp`, gated on
+      `GDRL_DUMP_LEVEL=<id>`, default off. Decompresses `m_levelString` (falls
+      back to `ZipUtils::decompressString` when no `;` is present), writes the
+      full decoded level to `level-<id>.txt` and a filtered move-trigger-only
+      view to `level-<id>-move-901.txt`, both under the mod save dir. Refuses to
+      write if fewer than 10 objects decode, so a `dontGetLevelString=true`
+      level cannot produce authoritative-looking evidence. Builds green and
+      universal (`x86_64 arm64`).
+- [ ] **NEXT STEP — run it.** It has never been executed. Invocation:
+      `GDRL_DUMP_LEVEL=21 ./scripts/run_sandbox.sh` (21 = Fingerdash), then read
+      `sandbox/home/Library/Application Support/GeometryDash/geode/mods/gdrl.probe/level-21-move-901.txt`.
+      Expect four move triggers at x = 7813–8455. **UNVALIDATED**: the `;`
+      heuristic for detecting already-decompressed strings, the
+      `ZipUtils::decompressString(s, false, 0)` argument choice, and whether
+      property key `1` is really the object id in this format are all
+      assumptions Codex made and nobody has checked against a real level.
 - [ ] Read the actual property IDs off it; do not reconstruct from memory.
 - [ ] Re-encode 901 in `mod/src/synth.cpp` and confirm it appears in the census.
 
@@ -204,6 +273,19 @@ Decisions).
 - [ ] `cfprefsd` ignores `CFFIXED_USER_HOME`, so anything going through
       `defaults`/CFPreferences still escapes the sandbox. File I/O is redirected;
       preferences are not.
+- [ ] **A sandboxed Codex run can corrupt `mod/build/`.** Observed: it left
+      `build/bindings/codegen/Codegen` as a **0-byte file** and pointed
+      `GEODE_CLI` in `CMakeCache.txt` at a nonexistent `mod/.offline-geode`
+      stub — presumably working around having no network. Both fail in a
+      confusing way, because the bindings CMake *skips rebuilding Codegen when
+      the file merely exists* and then fails to exec it: `Abnormal exit with
+      child return code: exec format error`. Repair without a full rebuild:
+      ```sh
+      rm -f mod/build/CMakeCache.txt mod/build/bindings/codegen/Codegen
+      cd mod && GEODE_SDK=~/.geode-sdk geode build
+      ```
+      If you delegate mod builds to a sandboxed worker, verify
+      `lipo -archs mod/build/gdrl.probe.dylib` afterwards.
 
 ---
 

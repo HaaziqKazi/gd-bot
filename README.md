@@ -880,6 +880,36 @@ derive the encoding from real data** — dump an actual level string containing 
 move trigger (Fingerdash has four) and read the property IDs off it, rather than
 iterating on guesses. Everything else in the file is verified by the census.
 
+## Dumping a real level string (`GDRL_DUMP_LEVEL`) — built, not yet run
+
+`mod/src/level_dump.cpp`. Set `GDRL_DUMP_LEVEL=<id>` and the mod decodes that
+main level's `m_levelString` and writes two files under the mod save dir:
+
+| file | contents |
+|---|---|
+| `level-<id>.txt` | the full decoded level string |
+| `level-<id>-move-901.txt` | only the move triggers, one per line, raw `key,value,…` |
+
+```sh
+GDRL_DUMP_LEVEL=21 ./scripts/run_sandbox.sh    # 21 = Fingerdash
+```
+
+It exists for one reason: the synthetic move trigger (object 901) is rejected by
+GD's parser and the remaining suspect is a **property encoding written from
+memory**. Rather than guess a second time, read the real property IDs off a real
+level. Fingerdash is the only main level with move triggers — four of them, at
+x = 7813–8455.
+
+Defaults are inert: with the variable unset the mod behaves exactly as before.
+It refuses to write when fewer than 10 objects decode, so a
+`dontGetLevelString=true` level cannot produce authoritative-looking evidence.
+
+**Status: implemented and compiling, never executed.** These are assumptions
+nobody has checked against a real level yet — the `;` heuristic used to decide
+whether the string is already decompressed, the
+`ZipUtils::decompressString(s, false, 0)` argument choice, and that property key
+`1` carries the object id.
+
 ## What still needs runtime verification
 
 None of this was measured on a running game — another agent held exclusive use

@@ -29,6 +29,7 @@
 
 #include "nonap.hpp"
 #include "synth.hpp"
+#include "level_dump.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -317,6 +318,8 @@ $execute {
 class $modify(GDRLMenuLayer, MenuLayer) {
     bool init() {
         if (!MenuLayer::init()) return false;
+
+        gdrl::dumpRequestedMainLevel();
 
         static bool logged = false;
         // Autoplay used to fire only on the first MenuLayer. Reaching the menu a
