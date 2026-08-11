@@ -30,6 +30,13 @@
 
 using namespace geode::prelude;
 
+// External linkage on purpose: experiments.cpp sets these to mark its own
+// injected input, so the null-input guard below can let it through while still
+// blocking stray human keypresses. Both are single-threaded, touched only from
+// the game thread inside update().
+bool g_gdrlInjecting     = false;
+long g_gdrlInjectPending = 0;
+
 namespace {
     int    g_attempt      = 0;
     int    g_frame        = 0;
@@ -355,15 +362,26 @@ class $modify(GDRLPlayLayer, PlayLayer) {
 // Hooked on GJBaseGameLayer rather than PlayLayer: in GD 2.2 the player, object
 // list, section grid and update loop all live on the base class.
 class $modify(GDRLBaseGameLayer, GJBaseGameLayer) {
-    // The layer-level input entry point, and the only one that matters: two call
-    // sites in the arm64 binary, both the input dispatcher. Dropping `down` here
-    // stops a jump before it reaches either player object.
-    void handleButton(bool down, int button, bool isPlayer1) {
-        if (g_blockInput && down) {
+    // The guard blocks here rather than at handleButton, because handleButton
+    // cannot tell injected input from human input. The call graph is:
+    //
+    //   queueButton -> [queue] -> processQueuedButtons -> handleButton -> pushButton
+    //
+    // and handleButton's only two call sites are both inside
+    // processQueuedButtons, so everything converges before it. queueButton is
+    // the last point where the caller is still distinguishable -- deliberate
+    // injection sets g_gdrlInjecting synchronously around its own call, and
+    // anything else is a stray human keypress.
+    void queueButton(int button, bool push, bool isPlayer2, double timestamp) {
+        if (g_blockInput && !g_gdrlInjecting) {
             g_inputBlocked++;
             return;
         }
-        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+        // Injected pushes are expected to surface at pushButton a frame or so
+        // later, when the queue drains. Count them so the leak detector can tell
+        // them apart from input that arrived by an unmapped route.
+        if (g_gdrlInjecting && push) g_gdrlInjectPending++;
+        GJBaseGameLayer::queueButton(button, push, isPlayer2, timestamp);
     }
 
     void update(float dt) {
@@ -483,10 +501,14 @@ class $modify(GDRLPlayerObject, PlayerObject) {
     bool pushButton(PlayerButton button) {
         auto* pl = PlayLayer::get();
         if (g_blockInput && pl && (pl->m_player1 == this || pl->m_player2 == this)) {
-            g_inputLeaked++;
-            log::warn("[gdrl] INPUT LEAKED past handleButton: btn={} x={:.3f}",
-                      (int)button, this->getPositionX());
-            return false;
+            if (g_gdrlInjectPending > 0) {
+                g_gdrlInjectPending--;   // ours, arriving as expected
+            } else {
+                g_inputLeaked++;
+                log::warn("[gdrl] INPUT LEAKED past queueButton: btn={} x={:.3f}",
+                          (int)button, this->getPositionX());
+                return false;
+            }
         }
         return PlayerObject::pushButton(button);
     }

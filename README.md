@@ -359,6 +359,57 @@ equality fails on the very first tick.
 Not yet verified: behaviour across a checkpoint restore, and whether the clock
 holds while `m_isPaused`.
 
+## Input injection works, and placement is tick-exact
+
+Everything before this was the null-input trajectory: the cube runs into the
+first spike at x=507.6 and dies at tick 391, ~550 times. That proves the
+environment is deterministic. It does **not** prove GD is a forward model, which
+is what search-and-replay needs — that requires a *chosen* input sequence to
+replay identically.
+
+Injection goes through `queueButton(button, push, isPlayer2, timestamp)`, placed
+against the verified clock. The guard blocks at `queueButton` rather than
+`handleButton`, because the call graph converges before it:
+
+```
+queueButton -> [queue] -> processQueuedButtons -> handleButton -> pushButton
+```
+
+`handleButton`'s only two call sites are both inside `processQueuedButtons`, so
+human and injected input are indistinguishable there. `queueButton` is the last
+point where the caller is still known: deliberate injection sets a flag around
+its own call, everything else is a stray keypress. Injected pushes are credited
+at queue time and debited when they surface at `pushButton`, so the leak detector
+does not fire on our own input.
+
+**One jump changes everything.** A single jump injected at tick 325 carries the
+player past the first spike — `maxX` 507.6 → **958.1**, dying at the next
+obstacle at tick 738 instead of 391.
+
+**Placement resolves to a single tick.** Sweeping the injection tick one at a
+time at `dt` = 1/240, where frame and tick coincide:
+
+| injTick | death tick | maxX |
+|---|---|---|
+| 318 | 412 | `534.878967285` |
+| 319 | 413 | `536.177246094` |
+| ... | +1 each | +1.2983 each |
+| 324 | 418 | `542.668640137` |
+| **325** | **738** | **`958.117858887`** |
+| 326–331 | 738 | `958.117858887` |
+
+One tick later in, one tick later out, and `maxX` moves by exactly `1.2983` —
+the per-tick x advance of `1.298250437`. Then 324 → 325 flips the trajectory
+entirely. No smearing, no jitter.
+
+**Determinism holds with inputs.** Eleven injection ticks × 8 repeats at
+`dt` = 8/240, plus the sweep above: every group bit-identical in both `maxX` and
+death tick, `leaked=0` throughout. The earlier 8-tick granularity was a sampling
+artifact of injecting on frame boundaries, not a limit of GD.
+
+`dt` = 1/240 and `dt` = 8/240 produce identical outcomes for the same injection
+tick, so small-`dt` physics agrees with large-`dt` physics.
+
 ## Conditioning state: the eight vehicles and their modifiers
 
 GD is eight games sharing a renderer. The same geometry is lethal in cube and

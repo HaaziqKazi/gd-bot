@@ -57,6 +57,11 @@
 
 using namespace geode::prelude;
 
+// Defined in main.cpp. Marks input this file injected deliberately, so the
+// null-input guard there passes it through instead of counting it as a leak.
+extern bool g_gdrlInjecting;
+extern long g_gdrlInjectPending;
+
 namespace {
     // The measured physics timestep. Not a guess: t advances in exact 1/240
     // increments across 37 attempts (README, "Physics is fixed-step at 240Hz").
@@ -123,6 +128,39 @@ namespace {
     int    g_clkDeltaBig = 0;
     int    g_clkTraced   = 0;
 
+    // ---------------------------------------------------------------------
+    // Experiment 5: actually inject an input.
+    //
+    // Everything measured so far has been the null-input trajectory -- the cube
+    // runs into the first spike at x=507.6 and dies at tick 391, ~550 times.
+    // That establishes the environment is deterministic; it does NOT establish
+    // that GD is a forward model, which is what search-and-replay needs. That
+    // requires a *given* input sequence to replay identically, and no input has
+    // ever been injected.
+    //
+    // Injection goes through queueButton (10 live call sites, the 4-arg form
+    // with a double timestamp), flagged via g_gdrlInjecting so the null-input
+    // guard lets it past while still blocking stray keypresses.
+    //
+    // GDRL_INJECT_SPAN sweeps the tick across attempts rather than fixing it, so
+    // one launch scans a window instead of one value -- the jump window that
+    // clears the spike is not known ahead of time and guessing it one process
+    // launch at a time is slow.
+    const int g_injectTick = envInt("GDRL_INJECT_TICK", -1);
+    const int g_injectHold = envInt("GDRL_INJECT_HOLD", 8);
+    const int g_injectSpan = envInt("GDRL_INJECT_SPAN", 1);
+
+    long g_expAttempt   = 0;
+    bool g_injPushed    = false;
+    bool g_injReleased  = false;
+    long g_injTickUsed  = -1;
+
+    void resetInjectState() {
+        g_injPushed   = false;
+        g_injReleased = false;
+        g_injTickUsed = -1;
+    }
+
     void resetClockStats() {
         g_clkMaxResid = 0.0;
         g_clkFrames   = 0;
@@ -171,6 +209,31 @@ class $modify(GDRLExpBaseGameLayer, GJBaseGameLayer) {
     // never moves at all. See README.
     void update(float dt) {
         if (!g_expOn) { GJBaseGameLayer::update(dt); return; }
+
+        // Inject before delegating: queueButton only enqueues, and the queue is
+        // drained by processQueuedButtons inside update(). Queuing after the
+        // original would push the input a whole frame late.
+        if (g_injectTick >= 0) {
+            if (auto* pl = PlayLayer::get()) {
+                const long tick   = std::lround(pl->m_attemptTime * kTicksPerSec);
+                const long target = g_injectTick
+                                  + (g_injectSpan > 1 ? g_expAttempt % g_injectSpan : 0);
+
+                if (!g_injPushed && tick >= target) {
+                    g_gdrlInjecting = true;
+                    this->queueButton(1, true, false, pl->m_attemptTime);
+                    g_gdrlInjecting = false;
+                    g_injPushed   = true;
+                    g_injTickUsed = tick;
+                } else if (g_injPushed && !g_injReleased
+                           && tick >= g_injTickUsed + g_injectHold) {
+                    g_gdrlInjecting = true;
+                    this->queueButton(1, false, false, pl->m_attemptTime);
+                    g_gdrlInjecting = false;
+                    g_injReleased = true;
+                }
+            }
+        }
 
         const int   before = m_currentStep;
         const float useDt  = g_deltaTicks > 0
@@ -250,6 +313,13 @@ class $modify(GDRLExpPlayLayer, PlayLayer) {
             }
         }
 
+        if (g_expOn && g_injectTick >= 0) {
+            log::info("[gdrl] INJECT tick={} hold={} pushed={} released={} pending={}",
+                      g_injTickUsed, g_injectHold, (int)g_injPushed,
+                      (int)g_injReleased, g_gdrlInjectPending);
+        }
+        g_expAttempt++;
+
         if (g_expOn && g_clkFrames > 0) {
             std::string dh;
             for (int i = 0; i < 40; i++) {
@@ -264,6 +334,7 @@ class $modify(GDRLExpPlayLayer, PlayLayer) {
         PlayLayer::resetLevel();
         resetExpStats();
         resetClockStats();
+        resetInjectState();
     }
 };
 
