@@ -1028,14 +1028,39 @@ testing the parent first silently yields the wrong label — a wrong conditionin
 input that still trains. `deriveVehicle` orders the checks defensively and the
 probe logs an error if more than one vehicle flag is ever set at once, so the
 ordering cannot quietly paper over an overlap. No overlap observed so far, but
-only cube has actually been reached: with no input the player dies at the first
-spike, so every non-cube mode is unverified until input injection exists.
+only cube has actually been reached. Input injection now exists and reaches
+x=3959.183837891 on Stereo Madness, and that is still cube the whole way — so
+**every non-cube conditioning path remains unexecuted**, and `conditioning.py`
+is unvalidated design rather than validated code.
 
-**`m_currentStep` is the physics-tick counter.** It sits next to `m_randomSeed`,
-`m_replayRandSeed` and `m_queuedButtons` (`gd::vector<PlayerButtonCommand>`, fed
-by `queueButton(button, push, isPlayer2, timestamp)`) — i.e. the timestamped
+Two routes to closing that, of different strength. `PlayerObject`'s seven
+vehicle togglers are all live and callable on arm64 — `toggleFlyMode` (ship,
+bl=12), `toggleBirdMode` (UFO, 13), `toggleRollMode` (ball, 5), `toggleDartMode`
+(wave, 15), `toggleRobotMode` (13), `toggleSpiderMode` (13), `toggleSwingMode`
+(11 bl + 1 b), all `(bool enable, bool noEffects)` — so the mod can force a mode
+and read the flags back without solving a level. That validates the **flag
+decode** and nothing more: a portal also sets size, gravity and speed and may
+run further setup, so forcing a mode is not crossing one. Reaching a real portal
+validates both and is the stronger claim.
+
+Gravity is a separate function, and the obvious-looking one is a trap.
+`toggleGravityMode(bool)` at m1 `0x3dbfb0` belongs to **`CreateParticlePopup`**,
+a level-editor popup — calling it through a `PlayerObject*` would run popup code
+against the wrong `this`. The player-side flip is
+`PlayerObject::flipGravity(bool flip, bool noEffects)` at m1 `0x37b40c`, bl=28.
+This was caught after the wrong address had already been written down and passed
+on: a name matched, and the enclosing class was never checked. **Grepping a
+member name does not tell you which class owns it** — the same trap as "an
+address is not a call site", one level up.
+
+`m_currentStep` sits next to `m_randomSeed`, `m_replayRandSeed` and
+`m_queuedButtons` (`gd::vector<PlayerButtonCommand>`, fed by
+`queueButton(button, push, isPlayer2, timestamp)`), so the timestamped
 input-injection path and the seed state needed for cross-process determinism are
-all in that one region of `GJBaseGameLayer`.
+all in one region of `GJBaseGameLayer`. That adjacency is the *only* thing being
+claimed here. `m_currentStep` itself is **not** the physics-tick counter — it
+reads 0 on every frame of gameplay; see the correction section above, and use
+`lround(m_attemptTime * 240)`.
 
 ## Two probe bugs worth not repeating
 
