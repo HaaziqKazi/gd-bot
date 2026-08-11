@@ -310,6 +310,410 @@ otool -arch arm64 -tV "Geometry Dash" > gd.asm
 grep -cP '\tbl\t0x124490$' gd.asm      # 0 == inlined, do not bother
 ```
 
+### Refinement: `bl` alone under-counts, in two different directions
+
+Counting only `bl` was right about `processCommands` and wrong about several
+other functions. There are three cases, and they need different tests:
+
+| pattern | meaning | example |
+|---|---|---|
+| 0 `bl`, 0 of **any** branch, non-virtual | genuinely inlined; unreachable | `processCommands` |
+| 0 `bl`, ≥1 `b` | **tail-called** — entry still executes, hook fires | `triggerMoveCommand`, `createFollowCommand` |
+| 0 `bl`, 0 `b`, **virtual** | dispatched via `blr` through the vtable; count says nothing | `update`, `spawnXPosition` |
+
+`GJBaseGameLayer::triggerMoveCommand` has zero `bl` call sites and would have
+been written off under the old rule. It is reached by `b 0x10cca4` from
+`EffectGameObject::triggerObject` — a tail call, which still enters at
+instruction 0, so a Geode entry hook on it fires normally. The same is true of
+`createFollowCommand` and `createPlayerFollowCommand`. Meanwhile
+`processCommands` has zero references of *any* kind, which is what actually
+distinguishes it.
+
+```sh
+grep -cP '\tbl\t0x10cca4$' gd.asm   # 0  -- not the test
+grep -cP '\t0x10cca4$'     gd.asm   # 1  -- tail call; it IS reachable
+```
+
+For a virtual, neither count is evidence either way; check the vtable or hook
+it and log.
+
+## The motion pipeline: what moves geometry, and when
+
+Static level geometry is not static. A block at (X, Y) may be mid-flight on a
+move trigger or scheduled to start moving when the player crosses an x well
+ahead of it, which is why the section grid re-buckets during play and why a
+one-shot parse of the level is not an observation. This is the map of the
+system that does the moving, read out of the arm64 slice.
+
+**It runs once per physics step, not per render frame.** `GJBaseGameLayer::update`
+(m1 `0x1229e8`) contains the fixed-step loop — back-edge at `+0x4b0` — and the
+whole motion pipeline sits inside it, in this order:
+
+```
+GJEffectManager::updateSpawnTriggers(dt)          update+0x694
+GJEffectManager::updateTimers(dt, timeWarp)       update+0x9e8
+GJEffectManager::prepareMoveActions(dt, interm.)  update+0x9f8   <- commands step here
+processDynamicObjectActions(type=1, dt)           update+0xa44
+processTransformActions(visibleFrame)             update+0xa50
+processRotationActions()                          update+0xa58
+processDynamicObjectActions(type=0, dt)           update+0xa68
+processMoveActions()                              update+0xa70
+processPlayerFollowActions(dt)                    update+0xa7c
+processAdvancedFollowAction(...)                  [inlined loop]
+processFollowActions()                            update+0xbf4
+processAreaActions(dt, visibleFrame)              update+0xc04
+GJEffectManager::postMoveActions()                update+0xc40
+```
+
+The identical sequence exists outlined as `GJBaseGameLayer::processMoveActionsStep`
+(m1 `0x118368`), whose only caller is `loadUpToPosition` — that is the
+level-seek path, not gameplay. Gameplay runs the copy inlined into `update`.
+
+**Step count and per-step `dt`**, decompiled from `update+0x25c`:
+
+```
+step     = (timeWarp < 1) ? timeWarp/240 : 1/240        (double 0x3F71111111111111)
+acc      = m_extraDelta + dt        , round-tripped through float32
+n        = round(acc / step)
+consumed = step * n
+m_extraDelta = acc - consumed
+numSteps = max(round(consumed * 60 / max(timeWarp,1) * 4), 1)
+dtPerStep= consumed / numSteps
+```
+
+At `timeWarp == 1` this collapses to `numSteps == n` and `dtPerStep == 1/240`
+exactly — an independent confirmation of the 240 Hz result, from the code
+rather than from measurement. `dtPerStep` is what reaches `prepareMoveActions`
+(register `s10`, set by `fcvt s10, d8` at `update+0x568`), so **trigger
+durations are denominated in the same seconds as the tick clock**: one tick of
+lookahead is 1/240 of any trigger's duration.
+
+### The active-command struct, verified against its own code
+
+An in-flight move / rotate / scale is a `GroupCommandObject2`. Its binding
+layout is not merely plausible — the offsets that `GroupCommandObject2::step`
+(m1 `0x44722c`) and `::updateAction` (m1 `0x4472fc`) load and store land
+exactly on the binding's declared field order:
+
+| offset | field | how it is used |
+|---|---|---|
+| `+0x0c` | `m_easingType` | `ldr w0` → arg 2 of `getEasedValue` |
+| `+0x10` | `m_easingRate` | `ldr d1`, narrowed → arg 3 |
+| `+0x18` | `m_duration` | divisor, clamped to `2^-23` |
+| `+0x20` | `m_deltaTime` | `+= dt` every step |
+| `+0x30` / `+0x38` | `m_current{X,Y}Offset` | last applied value |
+| `+0x40` / `+0x48` | `m_delta{X,Y}` | this step's displacement |
+| `+0x70` / `+0x71` | `m_finished` / `m_disabled` | early-outs in `step` |
+| `+0x77` / `+0x78` | `m_lockedIn{X,Y}` | gate the X / Y action entirely |
+| `+0x190` / `+0x194` | `m_actionType{1,2}` | 1=x, 2=y, 3/4=angular |
+| `+0x198` / `+0x1a0` | `m_actionValue{1,2}` | the total to interpolate to |
+| `+0x1ac` | `m_deltaTimeInFloat` | elapsed, float32 |
+| `+0x1b0` | `m_alreadyUpdated` | skips one elapsed advance |
+
+That matters because field adjacency already produced one wrong claim here
+(`m_currentStep`). This time the semantics come from the instructions that
+read the fields, not from the order they are declared in.
+
+The interpolator itself, from `updateAction`:
+
+```
+elapsed  = m_deltaTimeInFloat
+duration = max(m_duration, 2^-23)
+p        = clamp(elapsed / duration, 0, 1)
+out      = value * GameToolbox::getEasedValue(p, m_easingType, m_easingRate)
+displacement_this_step = out - m_current{X,Y}Offset ; then m_current* = out
+```
+
+So the remaining travel to any future time is `out(t) - m_currentXOffset`,
+against the **live** field rather than a recomputed `out(0)`. The two normally
+agree; after a pause or a checkpoint restore they can disagree, and the live
+one is what GD will subtract from next step.
+
+Types 3 and 4 run identical code and share one slot (`+0x90`). Which is
+rotation and which is transform is **UNVERIFIED**.
+
+### Easing is cocos2d's family, with two quirks worth not "fixing"
+
+`GameToolbox::getEasedValue` (m1 `0x44f990`) is a jump table over 18 curves;
+the table was read out of `__TEXT,__const` at `0x1007287a4` and each branch
+decoded, and the libm stubs it calls resolve through the indirect symbol table
+to `_powf`, `_sinf`, `_cosf`, `_exp2f`.
+
+- `easingType == 0` returns the input **before** the rate is defaulted, so a
+  linear trigger with rate 0 stays linear.
+- A rate `<= 0` becomes `2.0`.
+- **The exponential family does not pin its endpoints, and that is GD's own
+  behaviour.** `ExponentialIn(1) = 0.999` (a materialised `-0.001`,
+  `0xBA83126F`), `ExponentialInOut(0) = 0.5·2⁻¹⁰`, `ExponentialInOut(1) =
+  0.5·(2 − 2⁻¹⁰)`. There is a zero guard on `ExponentialIn` and a one guard on
+  `ExponentialOut`; the InOut branch has neither. A move trigger on
+  `ExponentialIn` therefore stops 0.1% short of its target permanently.
+  `trainer/trajectory.py` reproduces this rather than correcting it, and
+  `test_trajectory.py` pins it so nobody tidies it up later.
+
+### Trigger activation is an x-crossing, and that is readable
+
+`EffectGameObject::spawnXPosition` (m1 `0x1741b8`) is exactly:
+
+```cpp
+if (m_isSpawnTriggered || m_isTouchTriggered) return m_spawnXPosition;  // +0x678
+else                                          return getPosition().x;
+```
+
+so an ordinary trigger fires when the player crosses the trigger object's own
+x. Everything in the forward projection hangs off that: the player's arrival
+tick at any x is computable from the speed profile, so the elapsed time of a
+not-yet-fired trigger *by the time the player gets somewhere else* is also
+computable. `checkSpawnObjects` (6 `bl` sites, one in `update+0xf0c`) is where
+GD does the crossing test.
+
+`EffectGameObject::triggerObject` is the universal "a trigger fired" choke
+point — `RandTriggerGameObject`, `CountTriggerGameObject`,
+`TransformTriggerGameObject`, `CameraTriggerGameObject`,
+`TimerTriggerGameObject` and `ItemTriggerGameObject` all tail-call into it.
+
+## Forward projection: what is and is not computable
+
+Implemented in `trainer/trajectory.py`, tested by `trainer/test_trajectory.py`
+(`python3 -m pytest trainer/test_trajectory.py -q`, 48 tests).
+
+**Exactly computable.** Any live `GroupCommandObject2` with a finite duration
+and no lock flags — move, rotate, scale. Closed form, above. And any pending
+x-activated trigger of those kinds, once its activation x is known, because the
+arrival tick is an integral of a piecewise-constant speed profile.
+
+**Conditionally computable** — the maths is exact, the inputs depend on a
+future the policy has not chosen:
+
+- `m_lockToPlayerX/Y`, `m_lockToCameraX/Y` — the offset tracks the player or
+  camera, so projecting it assumes a player trajectory.
+- Follow commands (`m_followXMod`/`m_followYMod` mirroring another group):
+  exact if the followed group is exact, conditional otherwise. Not resolved
+  recursively.
+- Non-unit `m_moveModX`/`m_moveModY`.
+- Any arrival time that crosses a speed portal other than 1x — see below.
+
+**Not computable, and flagged rather than guessed:**
+
+- Player-follow (`createPlayerFollowCommand`: delay / speed / maxSpeed chasing
+  the player's y).
+- `AdvancedFollowInstance` / `processAdvancedFollowAction` — a steering
+  integrator with no closed form.
+- Keyframe commands (`createKeyframeCommand` → `tk_spline`).
+- Anything whose target group is decided at fire time: `RandTriggerGameObject`,
+  `SequenceTriggerGameObject`, `ChanceObject`, and spawn remapping
+  (`GJBaseGameLayer::m_spawnRemapTriggers`). The target group is drawn from
+  `m_randomSeed` and is not a property of the level.
+- Event-activated triggers (touch, collision, count, timer, item).
+  `spawnXPosition()` returns a stored value for these that means "where it last
+  fired", not "where it will fire".
+
+**Deliberately out of scope:** `EnterEffectInstance` / `processAreaEffects`.
+Those are camera-entry animations; whether they perturb the collision rect or
+only the sprite is UNVERIFIED, and guessing either way puts a systematic error
+into every observation.
+
+The projection emits a **per-object certainty** rather than dropping uncertain
+objects, because the failure modes are asymmetric: dropping a moving hazard
+claims empty space where a hazard may be, projecting it as static claims a
+hazard where there is none. Both are lies; a channel the policy can learn to
+distrust is the only option that does not require the environment to guess.
+
+Two implementation notes that are not obvious:
+
+- **Arrival time is a fixpoint.** An object's arrival tick depends on its x and
+  its x depends on the arrival tick. Two iterations, because the map contracts
+  only while the object's horizontal speed is below the player's. Objects
+  outrunning the player horizontally are flagged `CERTAINTY_UNKNOWN` rather
+  than iterated — more passes would only produce a more confident wrong answer.
+- **Both the now-map and the arrival-map are emitted.** For a static level they
+  are identical and the trunk can ignore one; for a moving level their
+  *difference* is the entire signal, and a difference needs both terms.
+
+`trajectory.py` composes with `conditioning.py` rather than duplicating it:
+trajectory answers *what the geometry will be*, conditioning answers *what it
+means*. Player speed appears in both — as a bucket-plus-residual there because
+it changes how an input is interpreted, as units-per-tick here because it sets
+the horizon. Neither is derivable from the other.
+
+### Only 1x speed is measured
+
+`1.298250437` units/tick at `m_playerSpeed = 0.90` is this repo's own number.
+The other four buckets in `UNITS_PER_TICK` are the widely quoted community
+values (251.16 / 387.42 / 468.00 / 576.00 units/s) and are **unverified**. They
+are not proportional to `m_playerSpeed`: `1.6/0.9 = 1.778` but
+`576.00/311.58 = 1.849`, so deriving them from the multiplier would be 4% out.
+Over a 400-tick lookahead that is ~20 units — a third of a tile, enough to put
+a moving spike on the wrong side of the player. `SpeedProfile.certainty()`
+downgrades any arrival time that depends on an unmeasured bucket.
+
+## Telemetry the mod must emit (spec, not implemented)
+
+The projection needs three things per observation that the current plain-text
+log lines cannot carry: the live command table, the pending-trigger table, and
+per-object group membership. Text is already inadequate here — a few hundred
+objects × ~80 bytes each per tick at 240 Hz is not a log, it is a data channel.
+The spec below assumes a future binary channel (shared memory ring or unix
+socket); the field names are the GD 2.2081 binding names so a mismatch between
+C++ and `trajectory.py` is one grep away.
+
+All structs little-endian, naturally aligned, no bitfields.
+
+```c
+#define GDRL_OBS_MAGIC 0x4C524447u   /* 'GDRL' */
+
+struct GdrlObsHeader {
+    uint32_t magic;              // GDRL_OBS_MAGIC
+    uint16_t version;            // bump on any layout change
+    uint16_t flags;              // bit0: input-clean, bit1: practice mode
+    int32_t  tick;               // lround(PlayLayer::m_attemptTime * 240)
+    double   attemptTime;        // PlayLayer::m_attemptTime  (the verified clock)
+    float    dtPerStep;          // the 's10' fed to prepareMoveActions this step
+    float    timeWarp;           // GJGameState::m_timeWarp
+    double   playerX, playerY;   // PlayerObject::getPositionX()/Y()
+    float    playerSpeed;        // PlayerObject::m_playerSpeed
+    uint32_t objectCount;        // GdrlObject[]        follows
+    uint32_t commandCount;       // GdrlGroupCommand[]  follows
+    uint32_t pendingCount;       // GdrlPendingTrigger[] follows
+    uint32_t speedSegCount;      // GdrlSpeedSegment[]  follows
+};
+
+struct GdrlObject {              // one GameObject in the observation window
+    int32_t  uniqueID;           // GameObject::m_uniqueID
+    int16_t  objectID;           // GameObject::m_objectID
+    uint8_t  kind;               // collapsed from GameObject::m_objectType
+    uint8_t  groupCount;         // GameObject::m_groupCount   (<= 10)
+    int16_t  groups[10];         // GameObject::m_groups (std::array<short,10>*)
+    double   x, y;               // m_positionX, m_positionY   (doubles in GD)
+    float    halfW, halfH;       // from getObjectRect(): size/2, NOT m_width/m_height
+    float    rotation;           // CCNode::getRotation()
+    float    scaleX, scaleY;     // m_scaleX, m_scaleY
+    uint8_t  isHazard;           // m_objectType == Hazard || m_slopeIsHazard
+    uint8_t  isGroupDisabled;    // m_isGroupDisabled
+    uint8_t  pad[2];
+};
+
+struct GdrlGroupCommand {        // one live GroupCommandObject2
+    int32_t  targetGroupID;      // +0x28  m_targetGroupID
+    int32_t  centerGroupID;      // +0x2c  m_centerGroupID
+    int32_t  commandType;        // +0xd0  m_commandType
+    int32_t  actionType1;        // +0x190 m_actionType1   1=x 2=y 3/4=angular
+    int32_t  actionType2;        // +0x194 m_actionType2
+    double   actionValue1;       // +0x198 m_actionValue1
+    double   actionValue2;       // +0x1a0 m_actionValue2
+    double   duration;           // +0x18  m_duration
+    float    deltaTimeInFloat;   // +0x1ac m_deltaTimeInFloat  (elapsed)
+    int32_t  easingType;         // +0x0c  m_easingType
+    double   easingRate;         // +0x10  m_easingRate
+    double   currentXOffset;     // +0x30  m_currentXOffset
+    double   currentYOffset;     // +0x38  m_currentYOffset
+    double   currentAngular;     // +0x90  m_currentRotateOrTransformValue
+    double   moveModX, moveModY; // +0x80  +0x88
+    int32_t  triggerUniqueID;    // +0x158 m_triggerUniqueID
+    int32_t  controlID;          // +0x15c m_controlID
+    uint8_t  finished;           // +0x70
+    uint8_t  disabled;           // +0x71
+    uint8_t  lockedInX;          // +0x77
+    uint8_t  lockedInY;          // +0x78
+    uint8_t  lockToPlayerX;      // +0x73
+    uint8_t  lockToPlayerY;      // +0x74
+    uint8_t  lockToCameraX;      // +0x75
+    uint8_t  lockToCameraY;      // +0x76
+    uint8_t  unmodellable;       // NOT a GD field -- set by the mod when the
+                                 // command came from a player-follow, advanced
+                                 // follow or keyframe source. Explicit, because
+                                 // "all lock flags false" is not evidence of
+                                 // "it is a plain move".
+    uint8_t  pad[3];
+};
+
+struct GdrlPendingTrigger {      // an EffectGameObject that has not fired yet
+    float    activationX;        // EffectGameObject::spawnXPosition()
+    int32_t  targetGroupID;      // m_targetGroupID
+    int32_t  centerGroupID;      // m_centerGroupID
+    float    duration;           // m_duration
+    float    moveOffsetX;        // m_moveOffset.x   (properties 28/29)
+    float    moveOffsetY;        // m_moveOffset.y
+    float    rotationDegrees;    // m_rotationDegrees (property 68)
+    int32_t  times360;           // m_times360        (property 69)
+    int32_t  easingType;         // m_easingType
+    float    easingRate;         // m_easingRate
+    float    spawnTriggerDelay;  // m_spawnTriggerDelay
+    int16_t  objectID;           // m_objectID -- which trigger kind
+    uint8_t  isTouchTriggered;   // m_isTouchTriggered
+    uint8_t  isSpawnTriggered;   // m_isSpawnTriggered
+    uint8_t  isMultiTriggered;   // m_isMultiTriggered
+    uint8_t  useMoveTarget;      // m_useMoveTarget   (property 100)
+    uint8_t  moveTargetMode;     // m_moveTargetMode  (MoveTargetType)
+    uint8_t  lockToPlayerX;      // m_lockToPlayerX
+    uint8_t  lockToPlayerY;      // m_lockToPlayerY
+    uint8_t  targetIsRemapped;   // mod-computed: object is a Rand/Sequence
+                                 // trigger, or its group appears in
+                                 // GJBaseGameLayer::m_spawnRemapTriggers
+    uint8_t  pad[2];
+};
+
+struct GdrlSpeedSegment {        // one speed portal boundary ahead
+    float    startX;
+    int32_t  bucket;             // index into SPEED_MULTIPLIERS
+};
+```
+
+**Where the mod reads each of these, and the hooks it may use:**
+
+- Emission point: hook `GJEffectManager::prepareMoveActions(float dt, bool)`
+  (2 `bl` sites — `update` and `loadUpToPosition`). This is the only
+  per-*physics-step* hook verified in this investigation; `update` itself is
+  per-render-frame and would resample a per-tick quantity, which is exactly the
+  trap that made `maxX` a function of the frame rate.
+- Objects: walk `GJBaseGameLayer::m_sections` for the columns spanning the
+  observation window (`sectionIndex = floor(x / 100)`), not `m_objects` —
+  the grid is the whole point of the grid.
+- Commands: `GJEffectManager` holds them in `m_unkVector518`, `m_unkVector530`,
+  `m_unkVector560`, `m_unkVector5b0`, `m_unkVector600`, `m_unkMap5c8` and
+  `m_unkMap770`. **Which vector holds what is UNVERIFIED** — see below.
+- Pending triggers: `EffectGameObject` instances in `m_sections` ahead of the
+  player, filtered to those with a motion-relevant `m_objectID`.
+- Speed segments: speed-portal objects ahead of the player.
+
+**Do not** design around hooking `GJBaseGameLayer::processCommands` (0
+references of any kind) or resampling in `update` (per frame, not per step).
+
+## What still needs runtime verification
+
+None of this was measured on a running game — another agent held exclusive use
+of GD during this work. The following are the specific measurements that would
+close the gaps, in rough order of how much they matter:
+
+1. **Which `GJEffectManager` vector holds live `GroupCommandObject2`.** Run a
+   level with one known move trigger and log the size of `m_unkVector518`,
+   `530`, `560`, `5b0`, `600`, `m_unkMap5c8` and `m_unkMap770` every step.
+   Exactly one should go 0 → 1 → 0 across the trigger's duration. Everything in
+   the telemetry spec above depends on this and nothing else does.
+2. **Per-tick advance for the four unmeasured speed buckets.** Same protocol as
+   the 1x measurement: null-input run through a level with a 0.5x / 2x / 3x /
+   4x portal, `dx = x[t+1] - x[t]` in the tick after the portal. Replaces four
+   unverified constants in `UNITS_PER_TICK`.
+3. **That `prepareMoveActions` actually fires per step.** Hook it, count calls
+   per attempt, and check the count equals the tick count at `dt = 1/240`.
+   Static analysis says it does; the `processCommands` episode says that is not
+   the same as knowing.
+4. **`m_deltaTimeInFloat` vs the tick clock.** Log both while a 1.0 s move
+   trigger runs. If they agree to within the float32 accumulation error, the
+   projection's time base is confirmed end to end.
+5. **Whether area/enter effects move the collision rect.** Put an enter effect
+   on a hazard, disable the sprite, and see whether the player still dies at
+   the unanimated position. Decides whether `EnterEffectInstance` belongs in
+   the projection at all.
+6. **Which of `ActionType` 3 and 4 is rotation and which is transform.** Fire a
+   rotate trigger and a scale trigger, log `m_actionType1`.
+7. **Timewarp semantics at `timeWarp != 1`.** The decompiled step arithmetic
+   says `numSteps` shrinks and `dtPerStep` grows, which reads as coarser steps
+   rather than faster time. Log `dtPerStep`, `numSteps` and the player's
+   per-step x advance under a timewarp trigger before trusting either reading.
+8. **Whether `m_attemptTime` survives a checkpoint restore**, already open in
+   the input-clock section, and now load-bearing for the projection too.
+
 ## Correction: `m_currentStep` is not the physics-tick counter
 
 It does not advance during gameplay. `m_currentStep` read `0` on every frame of
