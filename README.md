@@ -204,6 +204,108 @@ Still unverified: longer trajectories, trigger-heavy levels, determinism *across
 processes* (needed for parallel workers), and sequences that actually contain
 inputs.
 
+## The null-input guard: "no input" is not free
+
+Every determinism result above rests on *no input at all* being a perfectly
+repeatable input sequence. On a machine anyone is using, it is not. GD captures
+the keyboard and mouse whenever it has focus, and one stray click is a jump.
+
+This contaminated four consecutive runs before it was noticed: **195 button
+events**, with attempts sailing past the first spike to `x=3790` and `x=7967`
+instead of dying at `507.615234375`. It reads as a physics anomaly and is nothing
+of the kind. It was found only by hooking `pushButton` and logging every event.
+
+So the premise is now enforced rather than assumed. With `GDRL_BLOCK_INPUT=1` the
+probe drops every button-down at `GJBaseGameLayer::handleButton`, and every
+`ATTEMPT` line carries its own verdict:
+
+```
+input[clean blocked=0 leaked=0]        usable as null-input evidence
+input[INVALID blocked=12 leaked=3]     a push got through — attempt is void
+input[UNGUARDED blocked=0 leaked=0]    blocking off — not trusted either way
+```
+
+Pushes are dropped, releases are not: GD calls `releaseButton` internally on
+death and reset (31 call sites against 3 for `pushButton`), and swallowing those
+risks latching a button down. `pushButton` is hooked as a second line of defence
+— a push that reaches the player anyway arrived by an unmapped route and marks
+the attempt `INVALID` rather than being silently absorbed.
+
+**A null-input measurement that does not assert `leaked=0` is not evidence.**
+
+## Simulation rate is ours to set (and the ceiling is the respawn animation)
+
+`GJBaseGameLayer::update(float dt)` receives real frame time and does the delta
+accumulation *inline*. Rewriting `dt` on the way in therefore controls how much
+simulated time each rendered frame consumes — and the outcome is invariant under
+it. Measured over **91 attempts in three regimes, every one bit-identical** at
+`maxX=507.615234375`, `t=1.629166752`, every one `leaked=0`:
+
+| `dt` fed to `update` | frames/attempt | attempts/sec | attempts |
+|---|---|---|---|
+| passthrough (real) | ~160 | 0.35 | 19 |
+| `8/240` = 0.033333 | ~112 | 0.56 | 28 |
+| `32/240` = 0.133333 | ~76 | 0.88 | 44 |
+
+The frame cost fits exactly, at k = 1, 2 and 8 with no residual:
+
+```
+frames = 96/k + 64
+```
+
+96 frames of simulation that scale with `dt`, and **64 frames (~1.07s at 60fps)
+of fixed death/respawn animation that does not**. That fixed cost is the
+throughput ceiling, not `dt`: at k=32 the simulation is already down to 12 frames
+and 84% of each attempt is animation, which is why 8× `dt` bought only 2.55×
+throughput. The asymptote is ~0.94 attempts/sec. Going faster means shortening
+the respawn, then parallel instances — not a larger `dt`.
+
+## Inlined bindings: an address is not a call site
+
+Three functions named in earlier plans here are **not hookable in gameplay on
+macOS arm64**, despite Geode reporting `Enabled ... hook` at addresses that
+reconcile exactly with the 2.2081 bindings. The detours simply never execute.
+Confirmed by counting call sites in the shipped arm64 slice:
+
+| symbol | `bl` call sites | status |
+|---|---|---|
+| `GJBaseGameLayer::processCommands` | **0** | inlined everywhere; not callable |
+| `GJBaseGameLayer::getModifiedDelta` | **1** | only `LevelEditorLayer::updateEditor` |
+| `GJBaseGameLayer::handleButton` | 2 | live (the input dispatcher) |
+| `PlayerObject::pushButton` | 3 | live |
+| `GJBaseGameLayer::queueButton` | 10 | live |
+| `PlayerObject::releaseButton` | 31 | live |
+
+`processCommands` looked like the per-tick hook the 240Hz result called for — it
+even takes `isHalfTick`/`isLastTick`. It does not exist as a callable function in
+gameplay. `getModifiedDelta` looked like the way to control `dt`; it survives
+only on the editor path. Both were abandoned for `update`'s own `dt` argument.
+
+**A binding carrying an `m1` address means the function *exists*, not that
+anything *calls* it.** Check call sites before designing around a hook:
+
+```sh
+otool -arch arm64 -tV "Geometry Dash" > gd.asm
+grep -cP '\tbl\t0x124490$' gd.asm      # 0 == inlined, do not bother
+```
+
+## Correction: `m_currentStep` is not the physics-tick counter
+
+It does not advance during gameplay. `m_currentStep` read `0` on every frame of
+**all 91 clean attempts**, spanning thousands of `update` calls, while `t`
+advanced normally in exact 1/240 increments.
+
+The earlier claim that it is the tick counter was inferred from its adjacency to
+`m_randomSeed`, `m_replayRandSeed` and `m_queuedButtons` in the bindings — never
+measured. Adjacency is not semantics. This matters because it was to be the
+tick-exact attribution channel for input placement, and `PlayerButtonCommand`
+carries an `m_step` field that is presumably keyed to the same counter and is
+therefore suspect for the same reason.
+
+Tick-exact input placement still needs a clock. `m_attemptTime` advances in exact
+1/240 steps and is the obvious candidate, but it has not been verified as a
+placement key.
+
 ## Conditioning state: the eight vehicles and their modifiers
 
 GD is eight games sharing a renderer. The same geometry is lethal in cube and

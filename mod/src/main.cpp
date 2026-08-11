@@ -51,11 +51,42 @@ namespace {
     // thread-safe against setenv. Read the switches once.
     const bool g_verbose  = envOn("GDRL_VERBOSE");
 
+    // ---------------------------------------------------------------------
+    // The null-input guard.
+    //
+    // Every determinism result in this repo rests on "no input at all" being a
+    // perfectly repeatable input sequence. It is not, on a machine anyone is
+    // using: GD captures the keyboard and mouse whenever it has focus, and a
+    // single stray click is a jump. That silently contaminated four runs here --
+    // 195 button events, attempts sailing past the first spike to x=3790 and
+    // x=7967 instead of dying at 507.615234375. It reads as a physics anomaly
+    // and is nothing of the kind.
+    //
+    // So the premise is enforced rather than assumed, and every ATTEMPT line
+    // carries its own validity verdict. A null-input measurement that does not
+    // assert leaked=0 is not evidence.
+    const bool g_blockInput = envOn("GDRL_BLOCK_INPUT");
+
+    long g_inputBlocked = 0;   // pushes dropped at handleButton this attempt
+    long g_inputLeaked  = 0;   // pushes that reached the player anyway
+
+    // Blocking drops pushes only. GD calls releaseButton internally on death and
+    // reset -- 31 call sites against 3 for pushButton -- and swallowing those
+    // risks leaving a button latched down, which would be a worse bug than the
+    // one being fixed.
+    const char* inputVerdict() {
+        if (!g_blockInput)      return "UNGUARDED";
+        if (g_inputLeaked > 0)  return "INVALID";
+        return "clean";
+    }
+
     // Forward decl: the conditioning edge detector is armed per attempt, so
     // every attempt logs the regime it starts in rather than only the changes.
     void resetCondEdge();
 
     void resetAttemptStats() {
+        g_inputBlocked = 0;
+        g_inputLeaked  = 0;
         g_frame     = 0;
         g_maxX      = 0.f;
         g_dtMin     = 1e9f;
@@ -290,9 +321,11 @@ class $modify(GDRLPlayLayer, PlayLayer) {
         if (g_frame > 0) {
             log::info(
                 "[gdrl] ATTEMPT {:<3} maxX={:.9f} t={:.9f} frames={:<6} "
-                "dt[min={:.6f} max={:.6f} mean={:.6f}]",
+                "dt[min={:.6f} max={:.6f} mean={:.6f}] "
+                "input[{} blocked={} leaked={}]",
                 g_attempt, g_maxX, m_attemptTime, g_frame,
-                g_dtMin, g_dtMax, dtMean);
+                g_dtMin, g_dtMax, dtMean,
+                inputVerdict(), g_inputBlocked, g_inputLeaked);
         }
 
         PlayLayer::resetLevel();
@@ -305,6 +338,17 @@ class $modify(GDRLPlayLayer, PlayLayer) {
 // Hooked on GJBaseGameLayer rather than PlayLayer: in GD 2.2 the player, object
 // list, section grid and update loop all live on the base class.
 class $modify(GDRLBaseGameLayer, GJBaseGameLayer) {
+    // The layer-level input entry point, and the only one that matters: two call
+    // sites in the arm64 binary, both the input dispatcher. Dropping `down` here
+    // stops a jump before it reaches either player object.
+    void handleButton(bool down, int button, bool isPlayer1) {
+        if (g_blockInput && down) {
+            g_inputBlocked++;
+            return;
+        }
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+    }
+
     void update(float dt) {
         GJBaseGameLayer::update(dt);
 
@@ -414,6 +458,22 @@ class $modify(GDRLBaseGameLayer, GJBaseGameLayer) {
 // Guarded on the active PlayLayer's player: PlayerObject is also instantiated
 // for icon previews in menus and the garage, where these calls are meaningless.
 class $modify(GDRLPlayerObject, PlayerObject) {
+    // Second line of defence for the null-input guard. If a push reaches the
+    // player while handleButton is being blocked, it arrived by a route not yet
+    // mapped -- so it is counted and reported rather than silently swallowed,
+    // and it marks the attempt INVALID. Failing loudly is the whole point: a
+    // contaminated attempt that still looks plausible is what cost a full day.
+    bool pushButton(PlayerButton button) {
+        auto* pl = PlayLayer::get();
+        if (g_blockInput && pl && (pl->m_player1 == this || pl->m_player2 == this)) {
+            g_inputLeaked++;
+            log::warn("[gdrl] INPUT LEAKED past handleButton: btn={} x={:.3f}",
+                      (int)button, this->getPositionX());
+            return false;
+        }
+        return PlayerObject::pushButton(button);
+    }
+
     void switchedToMode(GameObjectType type) {
         const Vehicle before = deriveVehicle(this);
         PlayerObject::switchedToMode(type);

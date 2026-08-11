@@ -18,6 +18,7 @@ project(gdrl-probe VERSION 0.1.0)
 
 add_library(${PROJECT_NAME} SHARED
     src/main.cpp
+    src/experiments.cpp
 )
 
 if (NOT DEFINED ENV{GEODE_SDK})
