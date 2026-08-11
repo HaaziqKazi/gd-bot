@@ -53,6 +53,7 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 
 #include <cstdlib>
+#include <cmath>
 
 using namespace geode::prelude;
 
@@ -89,6 +90,47 @@ namespace {
     const bool g_fastReset = envInt("GDRL_FAST_RESET", 0) == 1;
 
     long g_fastResets = 0;
+
+    // ---------------------------------------------------------------------
+    // Experiment 4: is m_attemptTime a usable input-placement clock?
+    //
+    // m_currentStep was supposed to be the tick counter and never moves, so
+    // tick-exact input placement needs a different clock. PlayLayer::m_attemptTime
+    // is a double (not the SeedValueRSV of the same name on GJGameState) and the
+    // final value has always been an exact multiple of 1/240 -- 1.629166752 =
+    // 391/240. But "the endpoint is a multiple" is much weaker than what a
+    // placement key has to satisfy, and assuming the stronger property from the
+    // weaker observation is the mistake that produced the m_currentStep claim.
+    //
+    // Four properties, each measured rather than inferred:
+    //   1. Quantised   -- t*240 lands on integers, at every sample, not just at
+    //                     the end. Measured as max |t*240 - round(t*240)|.
+    //   2. Monotonic   -- never runs backwards within an attempt.
+    //   3. Commandable -- the per-frame tick delta equals the dt we feed, so a
+    //                     target tick can be scheduled a known distance ahead.
+    //   4. Reproducible-- the same attempt yields the same final tick every time.
+    //
+    // Property 1 is the load-bearing one: if the residual is nonzero, rounding
+    // t*240 to a tick index is a lossy guess and inputs will land off-by-one.
+    constexpr double kTicksPerSec = 240.0;
+
+    double g_clkMaxResid = 0.0;
+    long   g_clkFrames   = 0;
+    long   g_clkLastTick = -1;
+    long   g_clkFinal    = -1;
+    int    g_clkNonMono  = 0;
+    int    g_clkDeltaHist[40] = {};
+    int    g_clkDeltaBig = 0;
+    int    g_clkTraced   = 0;
+
+    void resetClockStats() {
+        g_clkMaxResid = 0.0;
+        g_clkFrames   = 0;
+        g_clkLastTick = -1;
+        g_clkNonMono  = 0;
+        for (int& v : g_clkDeltaHist) v = 0;
+        g_clkDeltaBig = 0;
+    }
 
     // Ungated lifetime hit counts for the two inlined functions. Kept so that
     // "never called" stays distinguishable from "the detour never ran" -- that
@@ -150,6 +192,33 @@ class $modify(GDRLExpBaseGameLayer, GJBaseGameLayer) {
                       g_updCalls, dt, useDt, before, m_currentStep, d);
         }
 
+        // Clock sampling, after delegating so it reflects the tick(s) this frame
+        // actually simulated.
+        if (auto* pl = PlayLayer::get()) {
+            const double t     = pl->m_attemptTime;
+            const double ticks = t * kTicksPerSec;
+            const double resid = std::fabs(ticks - std::nearbyint(ticks));
+            const long   tick  = std::lround(ticks);
+
+            g_clkMaxResid = std::max(g_clkMaxResid, resid);
+            g_clkFrames++;
+
+            if (g_clkLastTick >= 0) {
+                const long d = tick - g_clkLastTick;
+                if (d < 0) g_clkNonMono++;
+                if (d >= 0 && d < 40) g_clkDeltaHist[d]++;
+                else                  g_clkDeltaBig++;
+            }
+            g_clkLastTick = tick;
+            g_clkFinal    = tick;
+
+            if (g_clkTraced < 24) {
+                g_clkTraced++;
+                log::info("[gdrl] CLK t={:.12f} t*240={:.9f} tick={} resid={:.3e}",
+                          t, ticks, tick, resid);
+            }
+        }
+
         // Skip the post-death wait. Done after delegating so the attempt's final
         // frame is fully simulated before the reset is forced.
         if (g_fastReset) {
@@ -181,8 +250,20 @@ class $modify(GDRLExpPlayLayer, PlayLayer) {
             }
         }
 
+        if (g_expOn && g_clkFrames > 0) {
+            std::string dh;
+            for (int i = 0; i < 40; i++) {
+                if (g_clkDeltaHist[i]) dh += fmt::format("{}:{} ", i, g_clkDeltaHist[i]);
+            }
+            if (g_clkDeltaBig) dh += fmt::format(">=40:{}", g_clkDeltaBig);
+            log::info("[gdrl] CLKSUM finalTick={:<6} frames={:<5} maxResid={:.3e} "
+                      "nonMono={} tickDeltas[{}]",
+                      g_clkFinal, g_clkFrames, g_clkMaxResid, g_clkNonMono, dh);
+        }
+
         PlayLayer::resetLevel();
         resetExpStats();
+        resetClockStats();
     }
 };
 

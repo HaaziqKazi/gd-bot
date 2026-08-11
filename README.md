@@ -323,9 +323,41 @@ tick-exact attribution channel for input placement, and `PlayerButtonCommand`
 carries an `m_step` field that is presumably keyed to the same counter and is
 therefore suspect for the same reason.
 
-Tick-exact input placement still needs a clock. `m_attemptTime` advances in exact
-1/240 steps and is the obvious candidate, but it has not been verified as a
-placement key.
+## The input-placement clock: `m_attemptTime`, via `lround(t * 240)`
+
+`PlayLayer::m_attemptTime` is the replacement, and it is verified rather than
+assumed — the `m_currentStep` mistake came from treating a weak observation
+("the endpoint is a multiple of 1/240") as a strong property. Four things a
+placement key must do, each measured over **78 attempts** in two `dt` regimes:
+
+| property | result |
+|---|---|
+| **Monotonic** — never runs backwards | `nonMono=0`, all attempts |
+| **Commandable** — tick delta equals the `dt` fed | at `dt`=8/240: `tickDeltas[8:48, 7:1]` — 48×8 + 7 = **391 exactly** |
+| **Reproducible** — same attempt, same final tick | `finalTick=391`, all attempts, both regimes |
+| **Quantised** — `t*240` lands on integers | **not exactly** — see below |
+
+It is a `double` (not the `SeedValueRSV` of the same name on `GJGameState`), so
+the value itself does not decay over a long level. But `t*240` is *not* an exact
+integer: measured `maxResid = 2.039e-05` ticks. The cause is exact —
+
+```
+1/240 as float32 = 0.004166666883975267   (exact double: 0.004166666666666667)
+error per tick   = 2.173086e-10 s = 5.215406e-08 ticks
+× 391 ticks      = 2.0392e-05 ticks   ==  the measured residual
+```
+
+GD accumulates `m_attemptTime` by adding a **float32** `1/240` into a double. The
+drift is therefore real, deterministic (byte-identical `maxResid` on every
+attempt), and negligible: rounding stays unambiguous until the residual reaches
+0.5 ticks, at ~9.59e6 ticks — **11.1 hours** of attempt time. At two minutes it
+is 1.5e-3 ticks.
+
+**So: `tick = lround(m_attemptTime * 240)`.** Never `t == n/240.0` — exact
+equality fails on the very first tick.
+
+Not yet verified: behaviour across a checkpoint restore, and whether the clock
+holds while `m_isPaused`.
 
 ## Conditioning state: the eight vehicles and their modifiers
 
