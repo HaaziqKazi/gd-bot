@@ -23,8 +23,9 @@ offsets; add 0x100000000 for the address in a ``otool -arch arm64 -tV`` dump.
 Nothing here was inferred from a field name.
 
   (E1) The motion pipeline runs once per *physics step*, not per render frame.
-       ``GJBaseGameLayer::update`` (m1 0x1229e8) contains a step loop
-       (back-edge at +0x4b0 -> +0x4b0), and every motion call sits inside it:
+       ``GJBaseGameLayer::update`` (m1 0x1229e8) contains a step loop whose
+       latch is at +0x4b0 (``add w22,w22,#1; cmp w22,w20; b.ge <exit>``) over a
+       body starting at +0x4bc, and every motion call sits inside it:
 
            GJEffectManager::updateSpawnTriggers(dt)     update+0x694
            GJEffectManager::updateTimers(dt, timeWarp)  update+0x9e8

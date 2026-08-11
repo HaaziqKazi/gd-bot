@@ -346,7 +346,8 @@ one-shot parse of the level is not an observation. This is the map of the
 system that does the moving, read out of the arm64 slice.
 
 **It runs once per physics step, not per render frame.** `GJBaseGameLayer::update`
-(m1 `0x1229e8`) contains the fixed-step loop — back-edge at `+0x4b0` — and the
+(m1 `0x1229e8`) contains the fixed-step loop — latch at `+0x4b0`
+(`add w22,w22,#1; cmp w22,w20; b.ge <exit>`), body from `+0x4bc` — and the
 whole motion pipeline sits inside it, in this order:
 
 ```
