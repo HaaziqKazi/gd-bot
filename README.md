@@ -737,6 +737,56 @@ struct GdrlSpeedSegment {        // one speed portal boundary ahead
 **Do not** design around hooking `GJBaseGameLayer::processCommands` (0
 references of any kind) or resampling in `update` (per frame, not per step).
 
+## The env is validated: defaults are clean and observation is passive
+
+Two checks, both on the merged tree, both reusing the 12-jump sequence. They
+matter because ~550 attempts and the headline result were measured before the
+binary transport existed, and neither the env-var defaults nor the observation
+path had been exercised against them.
+
+**Reproducing the 12-jump result** (the README previously recorded the numbers
+but not a runnable invocation, so this is it):
+
+```sh
+GDRL_AUTOPLAY=1 GDRL_EXP=1 GDRL_BLOCK_INPUT=1 GDRL_PIN_LEVEL=1 \
+GDRL_FAST_RESET=1 GDRL_ADAPTIVE=1 GDRL_DELTA_TICKS=8 \
+GDRL_INJECT_SEQ="325,712,1074,1162,1266,1798,1934,2154,2318,2482,2686,2878" \
+./scripts/run_sandbox.sh
+```
+
+**1. Defaults are clean.** 29 consecutive attempts, every one
+`maxX=3959.183837891 deathTick=3048 t=12.700000662`, `push=12 rel=12`,
+`input[clean blocked=0 leaked=0 ui=0]`. The timing-critical switches all default
+to off in code (`GDRL_DELTA_TICKS=0`, `GDRL_FAST_RESET=0`, `GDRL_ADAPTIVE=0`), so
+nothing `d9fbdb5` added perturbs the baseline.
+
+**2. Observation does not perturb the simulation.** `GameObject` caches its
+collision rect behind a dirty flag, so a telemetry pass calling `getObjectRect()`
+could plausibly change when GD recomputes it — and if it did, every result
+gathered without telemetry would stop applying the moment telemetry was switched
+on, silently, because the numbers would remain self-consistent.
+
+Run with `GDRL_ENV=1` and `trainer/passive_responder.py` attached, answering every
+step with no action:
+
+```
+12 attempts with attached=1, steps=3054 each   (one per physics tick)
+all  maxX=3959.183837891  deathTick=3048
+timeouts=0 protoErr=0 across all 19 attempts
+```
+
+Bit-identical to the telemetry-off run. Note the client has to be attached for
+this to mean anything: with none, the mod times out after `GDRL_ENV_WAIT_US` and
+resumes free-running, and an attempt with `timeouts>0` is not evidence.
+
+**Cost, and why decision rate should be decoupled from physics rate.** `steps=3054`
+is one blocking round-trip per physics tick, ~500/s through Python even for a
+no-op policy. Telemetry-on ran 5.5s per attempt against 3.4s off. A real policy at
+5ms per decision would be ~15s per attempt. Since the outcome is piecewise
+constant in jump tick with plateaus 29-81 ticks wide, per-tick decisions are not
+needed: deciding every 8 ticks is ~380 round-trips instead of 3054, for the same
+trajectory.
+
 ## What still needs runtime verification
 
 None of this was measured on a running game — another agent held exclusive use
