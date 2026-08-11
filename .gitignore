@@ -2,6 +2,13 @@
 # Durable findings live in README.md.
 PLAN.md
 
+# Cross-branch working notes — local only, same reasoning as PLAN.md.
+NOTES.md
+
+# Imported agent transcripts — personal working material, not repo content.
+rexclaudecode*.txt
+*claudecode*.txt
+
 # Sandboxed GD copy (~400MB app bundle + game state). Recreate with:
 #   ditto "<steam>/Geometry Dash.app" sandbox/"Geometry Dash.app"
 # See README.md. Never commit a copy of the game.

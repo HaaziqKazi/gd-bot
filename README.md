@@ -151,6 +151,63 @@ message.
 headless rig the fix is to stub `libsteam_api.dylib`, then set
 `GDRL_SKIP_STEAM_CHECK=1`.
 
+## Running unattended: two throttles, not one
+
+An unfocused GD does not simulate, and fixing only the first cause is not enough.
+
+**1. App Nap.** macOS throttles a backgrounded app hard. `GDRL_NO_APP_NAP=1` holds
+an `NSProcessInfo` activity (`NSActivityUserInitiated | NSActivityLatencyCritical`)
+for the process lifetime — `mod/src/nonap.mm`, which needs an Objective-C++ TU
+because there is no C API for it.
+
+`defaults write com.robtop.geometrydashmac NSAppSleepDisabled` does **not** work:
+`cfprefsd` ignores `CFFIXED_USER_HOME`, so it writes to the *real* home and never
+reaches the sandbox. File I/O is redirected; the preferences system is not.
+
+**2. Occlusion.** GD starts fullscreen, which puts it on its own Space; switching
+away makes it fully occluded, and macOS stops refreshing occluded windows no
+matter what App Nap has been told. `GDRL_WINDOWED=1` calls
+`PlatformToolbox::toggleFullScreen(false, false, false)` so it is an ordinary
+window on the current Space.
+
+Measured, ~90s runs on Stereo Madness, `maxX` bit-identical throughout:
+
+| configuration | attempts | rate |
+|---|---|---|
+| unfocused, nothing done | 0 | player never moves |
+| unfocused, App Nap suppressed, fullscreen | 3 | ~0.03/s |
+| **windowed + focused** | **32** | **0.41/s** |
+| focused fullscreen (baseline) | 37 | 0.41/s |
+
+Windowed costs nothing against the baseline and leaves the screen usable.
+Suppressing App Nap alone restores simulation but leaves it ~12× slow — and that
+partial result is easy to misread as "the App Nap fix did not work", when in fact
+a second, unrelated mechanism is doing the throttling.
+
+## The GD slot lock
+
+GD is an exclusive resource until parallel instances exist: two of them fight over
+the sandbox save dir, the bundle-relative Geode log directory, and the window.
+When that happened, *both* sides' measurements were silently worthless rather than
+obviously broken.
+
+`run_sandbox.sh` takes an atomic `mkdir` lock at `sandbox/.gd.lock` (macOS ships
+no `flock(1)`), records the game's pid and start time, refuses a second launch
+naming the holder, clears stale locks whose holder is gone, and releases on exit.
+`GDRL_NO_LOCK=1` bypasses it.
+
+## The census cross-check
+
+`runCensus` walks `m_sections` — correct, because the grid is what the observation
+window queries — and now also compares the total against `m_objects->count()`.
+
+The reason is that a sparse window and a broken traversal look identical from any
+single observation. A level opening is legitimately almost empty (Stereo Madness
+has ~4 objects in the first 467 units), so "few objects" is not evidence of a bug
+and "many objects" is not evidence of correctness. The full-walk comparison is the
+one cheap check that separates them. Stereo Madness measures 2384 of 2399; the
+shortfall is objects not yet sectioned. Under half logs an error.
+
 ## Save isolation: `HOME` is not enough
 
 Setting only `HOME` does **not** redirect GD's save directory. Verified directly:

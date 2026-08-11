@@ -643,10 +643,28 @@ namespace {
         std::sort(present.begin(), present.end(),
                   [](const IdStat& a, const IdStat& b) { return a.minX < b.minX; });
 
-        log::info("[gdrl] CENSUS lvl={} objects={} distinctIds={} effects={} "
-                  "outOfRangeIds={} sections={}",
-                  g_gdrlLevelID, total, (long)present.size(), effectTotal,
-                  outOfRange, (long)layer->m_sections.size());
+        // Cross-check the section walk against m_objects.
+        //
+        // Walking the grid is correct -- it is what the observation window
+        // queries -- but a sparse window and a broken traversal look identical
+        // from any single observation. A level opening is legitimately almost
+        // empty, so "few objects" is not evidence of a bug, and "many objects"
+        // is not evidence of correctness. Comparing the whole walk against the
+        // array GD maintains separately is the one cheap check that tells them
+        // apart. Stereo Madness measured 2384 of 2399; the shortfall is objects
+        // not yet sectioned, not a traversal fault.
+        const unsigned inArray = layer->m_objects ? layer->m_objects->count() : 0u;
+
+        log::info("[gdrl] CENSUS lvl={} objects={} m_objects={} distinctIds={} "
+                  "effects={} outOfRangeIds={} sections={}",
+                  g_gdrlLevelID, total, (long)inArray, (long)present.size(),
+                  effectTotal, outOfRange, (long)layer->m_sections.size());
+
+        if (inArray > 0 && total < (long)inArray / 2) {
+            log::error("[gdrl] CENSUS TRAVERSAL IS MISSING OBJECTS ({} of {}) -- "
+                       "every window observation is incomplete",
+                       total, (long)inArray);
+        }
 
         // The raw histogram, ordered by where the id first appears, so a
         // playthrough of a known level can be read against it directly.

@@ -14,14 +14,22 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "" FORCE)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-project(gdrl-probe VERSION 0.1.0)
+# OBJCXX is declared because App Nap suppression has no C API -- the only way to
+# hold an NSProcessInfo activity is through Objective-C.
+project(gdrl-probe VERSION 0.1.0 LANGUAGES C CXX OBJCXX)
 
 add_library(${PROJECT_NAME} SHARED
     src/main.cpp
     src/experiments.cpp
     src/telemetry.cpp
     src/probes.cpp
+    src/nonap.mm
 )
+
+# The activity token is retained by hand, so ARC must be off for this file.
+# Left implicit it would depend on whatever the toolchain defaults to, which is
+# exactly the kind of silent-default problem that has already cost time here.
+set_source_files_properties(src/nonap.mm PROPERTIES COMPILE_FLAGS "-fno-objc-arc")
 
 if (NOT DEFINED ENV{GEODE_SDK})
     message(FATAL_ERROR "Unable to find Geode SDK! Set the GEODE_SDK environment variable.")
@@ -30,5 +38,7 @@ else()
 endif()
 
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
+
+target_link_libraries(${PROJECT_NAME} "-framework Foundation")
 
 setup_geode_mod(${PROJECT_NAME})

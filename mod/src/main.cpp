@@ -27,6 +27,8 @@
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <Geode/modify/CCTouchDispatcher.hpp>
 
+#include "nonap.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 
@@ -273,6 +275,19 @@ void gdrlSnapshotMaxX() {
 $execute {
     log::info("[gdrl] probe mod loaded");
 
+    // Insurance against a stray focus loss mid-run. Not load-bearing -- windowed
+    // mode is what actually restores full speed -- but a run that silently drops
+    // to ~1fps partway through is exactly the kind of quiet corruption this repo
+    // keeps getting bitten by, and this makes it not happen.
+    //
+    // Opt-in rather than defaulted: holding a user-initiated activity also
+    // inhibits idle system sleep, which should not happen to someone who merely
+    // launched the game to play it.
+    if (envOn("GDRL_NO_APP_NAP")) {
+        const bool ok = gdrl::disableAppNap("gdrl unattended run");
+        log::info("[gdrl] App Nap suppression: {}", ok ? "ACTIVE" : "FAILED");
+    }
+
     // Settles whether the sandbox actually isolates saves. Watching for writes is
     // unreliable -- a run that simply does not save looks identical to success --
     // so ask cocos which paths it resolved instead. All of these must sit inside
@@ -314,6 +329,28 @@ class $modify(GDRLMenuLayer, MenuLayer) {
                       GameManager::sharedState()->m_playerName.c_str());
             log::info("[gdrl] ISOLATION stars      = {}",
                       GameStatsManager::sharedState()->getStat("6"));
+
+            // Force windowed, once, at startup.
+            //
+            // GD starts fullscreen, which puts it on its own Space. Switching
+            // away then makes it fully occluded, and macOS stops refreshing
+            // occluded windows regardless of App Nap. Measured on Stereo
+            // Madness, ~90s runs, maxX bit-identical throughout:
+            //
+            //   unfocused, nothing done          0 attempts (player never moves)
+            //   unfocused, App Nap suppressed    3 attempts  (~12x slow)
+            //   windowed + focused              32 attempts  0.41/s
+            //   focused fullscreen (baseline)   37 attempts  0.41/s
+            //
+            // So windowed costs nothing against the baseline and leaves the rest
+            // of the screen usable. App Nap suppression alone is NOT sufficient;
+            // the residual throttle is occlusion, a separate mechanism.
+            if (envOn("GDRL_WINDOWED")) {
+                Loader::get()->queueInMainThread([] {
+                    PlatformToolbox::toggleFullScreen(false, false, false);
+                    log::info("[gdrl] forced windowed mode");
+                });
+            }
             } else {
                 log::warn("[gdrl] MENU REACHED mid-run -- re-entering pinned level");
             }
