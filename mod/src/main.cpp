@@ -24,6 +24,8 @@
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
+#include <Geode/modify/CCKeyboardDispatcher.hpp>
+#include <Geode/modify/CCTouchDispatcher.hpp>
 
 #include <algorithm>
 #include <cstdlib>
@@ -37,11 +39,27 @@ using namespace geode::prelude;
 bool g_gdrlInjecting     = false;
 long g_gdrlInjectPending = 0;
 
+// The attempt metrics, exported so experiments.cpp can print an outcome line
+// that carries its own maxX and its own validity verdict instead of having to
+// be correlated against the ATTEMPT line by log position. Two hooks on
+// PlayLayer::resetLevel fire in an order that is a linker detail; a per-attempt
+// record split across both of them would be silently mis-paired the day that
+// order changed.
+float g_gdrlMaxX     = 0.f;   // furthest x reached in the current attempt
+long  g_gdrlBlocked  = 0;     // pushes dropped at queueButton this attempt
+long  g_gdrlLeaked   = 0;     // pushes that reached the player anyway
+int   g_gdrlLevelID  = -1;    // id of the level the current attempt is running on
+long  g_gdrlUiEvents = 0;     // UI-level key/touch events swallowed, this attempt
+long  g_gdrlUiTotal  = 0;     // ... and over the whole run
+
+// Fold the live player position into g_gdrlMaxX. Idempotent, so both resetLevel
+// hooks may call it and whichever runs first fixes the value for both.
+void gdrlSnapshotMaxX();
+
 namespace {
     int    g_attempt      = 0;
     int    g_frame        = 0;
     bool   g_dumpedGrid   = false;
-    float  g_maxX         = 0.f;   // furthest x reached in the current attempt
 
     // dt spread within the current attempt
     float  g_dtMin        = 1e9f;
@@ -74,8 +92,29 @@ namespace {
     // assert leaked=0 is not evidence.
     const bool g_blockInput = envOn("GDRL_BLOCK_INPUT");
 
-    long g_inputBlocked = 0;   // pushes dropped at handleButton this attempt
-    long g_inputLeaked  = 0;   // pushes that reached the player anyway
+    // ---------------------------------------------------------------------
+    // The level pin.
+    //
+    // GDRL_BLOCK_INPUT stops stray input from becoming a *jump*. It does not
+    // stop stray input from being a UI event, and that turned out to matter:
+    // during a sequence search the game left Stereo Madness for the menu, spent
+    // eight seconds there, came back, then loaded **Back On Track** and kept
+    // producing perfectly clean-looking `input[clean blocked=0 leaked=0]`
+    // attempts against different geometry. Two of them landed in the same sweep
+    // group as real ones and looked exactly like nondeterminism.
+    //
+    // The guard therefore has to cover the whole session, not just the button:
+    //   - swallow keyboard and touch events outright (nothing legitimate needs
+    //     them; all our input arrives via queueButton),
+    //   - neuter onQuit and pauseGame, the two exits from PlayLayer,
+    //   - re-enter the pinned level if the game somehow reaches the menu anyway,
+    //   - and stamp the level id onto every attempt so a measurement taken on
+    //     the wrong level is identifiable after the fact rather than plausible.
+    //
+    // The last one is the important one. A blocked exit that silently failed
+    // would leave no trace; a level id on every line cannot.
+    const bool g_pinLevel = envOn("GDRL_PIN_LEVEL");
+    const int  g_pinnedID = 1;   // Stereo Madness
 
     // Blocking drops pushes only. GD calls releaseButton internally on death and
     // reset -- 31 call sites against 3 for pushButton -- and swallowing those
@@ -83,7 +122,7 @@ namespace {
     // one being fixed.
     const char* inputVerdict() {
         if (!g_blockInput)      return "UNGUARDED";
-        if (g_inputLeaked > 0)  return "INVALID";
+        if (g_gdrlLeaked > 0)  return "INVALID";
         return "clean";
     }
 
@@ -92,10 +131,11 @@ namespace {
     void resetCondEdge();
 
     void resetAttemptStats() {
-        g_inputBlocked = 0;
-        g_inputLeaked  = 0;
+        g_gdrlBlocked = 0;
+        g_gdrlLeaked  = 0;
+        g_gdrlUiEvents = 0;
         g_frame     = 0;
-        g_maxX      = 0.f;
+        g_gdrlMaxX      = 0.f;
         g_dtMin     = 1e9f;
         g_dtMax     = 0.f;
         g_dtSum     = 0.0;
@@ -222,6 +262,14 @@ namespace {
     }
 }
 
+void gdrlSnapshotMaxX() {
+    if (auto* pl = PlayLayer::get()) {
+        if (auto* p = pl->m_player1) {
+            g_gdrlMaxX = std::max(g_gdrlMaxX, p->getPositionX());
+        }
+    }
+}
+
 $execute {
     log::info("[gdrl] probe mod loaded");
 
@@ -255,12 +303,20 @@ class $modify(GDRLMenuLayer, MenuLayer) {
         if (!MenuLayer::init()) return false;
 
         static bool logged = false;
-        if (!logged) {
+        // Autoplay used to fire only on the first MenuLayer. Reaching the menu a
+        // second time was therefore terminal for a run: the harness sat in the
+        // menu for the rest of its wall clock. Re-arming makes an escape to the
+        // menu self-correcting instead.
+        if (!logged || g_pinLevel) {
+            if (!logged) {
             logged = true;
             log::info("[gdrl] ISOLATION playerName = '{}'",
                       GameManager::sharedState()->m_playerName.c_str());
             log::info("[gdrl] ISOLATION stars      = {}",
                       GameStatsManager::sharedState()->getStat("6"));
+            } else {
+                log::warn("[gdrl] MENU REACHED mid-run -- re-entering pinned level");
+            }
 
             // Training needs thousands of episode resets, so the mod has to own
             // level entry -- clicking through menus is not an option. Gated on an
@@ -302,8 +358,44 @@ class $modify(GDRLPlayLayer, PlayLayer) {
 
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-        log::info("[gdrl] === level '{}' ===", level->m_levelName.c_str());
+        g_gdrlLevelID = level->m_levelID;
+        log::info("[gdrl] === level '{}' id={} ===",
+                  level->m_levelName.c_str(), g_gdrlLevelID);
+
+        // A run that wandered onto a different level kept producing attempts
+        // that looked clean. Say so loudly and go back.
+        if (g_pinLevel && g_gdrlLevelID != g_pinnedID) {
+            log::error("[gdrl] WRONG LEVEL id={} ('{}') -- every attempt from here "
+                       "is invalid; returning to id={}",
+                       g_gdrlLevelID, level->m_levelName.c_str(), g_pinnedID);
+            Loader::get()->queueInMainThread([] {
+                auto* lv = GameLevelManager::sharedState()->getMainLevel(g_pinnedID, false);
+                if (lv) {
+                    CCDirector::sharedDirector()->replaceScene(
+                        PlayLayer::scene(lv, false, false));
+                }
+            });
+        }
         return true;
+    }
+
+    // The two ways out of PlayLayer, both closed while pinned. If the exit path
+    // is neither of these the level id stamped on every attempt still catches
+    // it -- this is belt and braces, not a claim to have enumerated them.
+    void onQuit() {
+        if (g_pinLevel) {
+            log::warn("[gdrl] onQuit suppressed (level pinned)");
+            return;
+        }
+        PlayLayer::onQuit();
+    }
+
+    void pauseGame(bool unfocused) {
+        if (g_pinLevel) {
+            log::warn("[gdrl] pauseGame({}) suppressed (level pinned)", (int)unfocused);
+            return;
+        }
+        PlayLayer::pauseGame(unfocused);
     }
 
     // The determinism measurement, taken at the attempt boundary.
@@ -326,7 +418,7 @@ class $modify(GDRLPlayLayer, PlayLayer) {
     void resetLevel() {
         // Capture the final position at the attempt boundary, before delegating.
         //
-        // g_maxX is otherwise sampled once per render frame in update(), which
+        // g_gdrlMaxX is otherwise sampled once per render frame in update(), which
         // makes it a function of the frame rate rather than of the simulation:
         // at 32 ticks/frame the player advances ~41.5 units between samples, and
         // the last pre-death sample can miss the true endpoint. Skipping the
@@ -337,19 +429,18 @@ class $modify(GDRLPlayLayer, PlayLayer) {
         //
         // Before delegating, for the reason in "Two probe bugs worth not
         // repeating": after the original, this reads the respawn, not the death.
-        if (auto* p = m_player1) {
-            g_maxX = std::max(g_maxX, p->getPositionX());
-        }
+        gdrlSnapshotMaxX();
 
         const double dtMean = g_dtSamples ? g_dtSum / g_dtSamples : 0.0;
         if (g_frame > 0) {
             log::info(
-                "[gdrl] ATTEMPT {:<3} maxX={:.9f} t={:.9f} frames={:<6} "
+                "[gdrl] ATTEMPT {:<3} lvl={} maxX={:.9f} t={:.9f} frames={:<6} "
                 "dt[min={:.6f} max={:.6f} mean={:.6f}] "
-                "input[{} blocked={} leaked={}]",
-                g_attempt, g_maxX, m_attemptTime, g_frame,
+                "input[{} blocked={} leaked={} ui={} uiTot={}]",
+                g_attempt, g_gdrlLevelID, g_gdrlMaxX, m_attemptTime, g_frame,
                 g_dtMin, g_dtMax, dtMean,
-                inputVerdict(), g_inputBlocked, g_inputLeaked);
+                inputVerdict(), g_gdrlBlocked, g_gdrlLeaked, g_gdrlUiEvents,
+                g_gdrlUiTotal);
         }
 
         PlayLayer::resetLevel();
@@ -374,7 +465,7 @@ class $modify(GDRLBaseGameLayer, GJBaseGameLayer) {
     // anything else is a stray human keypress.
     void queueButton(int button, bool push, bool isPlayer2, double timestamp) {
         if (g_blockInput && !g_gdrlInjecting) {
-            g_inputBlocked++;
+            g_gdrlBlocked++;
             return;
         }
         // Injected pushes are expected to surface at pushButton a frame or so
@@ -395,7 +486,7 @@ class $modify(GDRLBaseGameLayer, GJBaseGameLayer) {
         g_dtSum += dt;
         g_dtSamples++;
         g_frame++;
-        g_maxX = std::max(g_maxX, p->getPositionX());
+        g_gdrlMaxX = std::max(g_gdrlMaxX, p->getPositionX());
 
         if (!g_dumpedGrid) {
             g_dumpedGrid = true;
@@ -504,7 +595,7 @@ class $modify(GDRLPlayerObject, PlayerObject) {
             if (g_gdrlInjectPending > 0) {
                 g_gdrlInjectPending--;   // ours, arriving as expected
             } else {
-                g_inputLeaked++;
+                g_gdrlLeaked++;
                 log::warn("[gdrl] INPUT LEAKED past queueButton: btn={} x={:.3f}",
                           (int)button, this->getPositionX());
                 return false;
@@ -526,5 +617,42 @@ class $modify(GDRLPlayerObject, PlayerObject) {
                   pl->m_currentStep, this->getPositionX(),
                   vehicleName(before), vehicleName(after),
                   (int)type, pl->m_player2 == this ? 2 : 1);
+    }
+};
+
+// UI input, swallowed at the source while the level is pinned.
+//
+// queueButton stops a stray click becoming a jump. It does nothing about the
+// same click hitting a menu button, and that is how a search run ended up
+// running attempts on Back On Track. Nothing this harness does needs keyboard
+// or touch input -- every input it issues goes through queueButton -- so under
+// GDRL_PIN_LEVEL both are dropped wholesale and counted.
+//
+// Counted, not merely dropped: `ui=` on the ATTEMPT line staying at 0 is the
+// evidence that the machine was actually idle, and a nonzero count is the
+// evidence that it was not. Dropping silently would destroy exactly the signal
+// that identified this problem.
+class $modify(GDRLKeyboard, CCKeyboardDispatcher) {
+    bool dispatchKeyboardMSG(enumKeyCodes key, bool down, bool repeat, double ts) {
+        if (g_pinLevel) {
+            if (down && !repeat) {
+                g_gdrlUiEvents++; g_gdrlUiTotal++;
+                log::warn("[gdrl] UI KEY swallowed key={} (uiTot={})",
+                          (int)key, g_gdrlUiTotal);
+            }
+            return true;
+        }
+        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, down, repeat, ts);
+    }
+};
+
+class $modify(GDRLTouch, CCTouchDispatcher) {
+    void touchesBegan(CCSet* touches, CCEvent* event) {
+        if (g_pinLevel) {
+            g_gdrlUiEvents++; g_gdrlUiTotal++;
+            log::warn("[gdrl] UI TOUCH swallowed (uiTot={})", g_gdrlUiTotal);
+            return;
+        }
+        CCTouchDispatcher::touchesBegan(touches, event);
     }
 };

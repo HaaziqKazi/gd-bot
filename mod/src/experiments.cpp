@@ -54,6 +54,9 @@
 
 #include <cstdlib>
 #include <cmath>
+#include <climits>
+#include <string>
+#include <vector>
 
 using namespace geode::prelude;
 
@@ -61,6 +64,16 @@ using namespace geode::prelude;
 // null-input guard there passes it through instead of counting it as a leak.
 extern bool g_gdrlInjecting;
 extern long g_gdrlInjectPending;
+
+// The attempt outcome, also from main.cpp, so the SEQ line below is a complete
+// self-checking record: sequence, outcome and input verdict on one line.
+extern float g_gdrlMaxX;
+extern long  g_gdrlBlocked;
+extern long  g_gdrlLeaked;
+extern int   g_gdrlLevelID;
+extern long  g_gdrlUiEvents;
+extern long  g_gdrlUiTotal;
+extern void  gdrlSnapshotMaxX();
 
 namespace {
     // The measured physics timestep. Not a guess: t advances in exact 1/240
@@ -155,6 +168,153 @@ namespace {
     bool g_injReleased  = false;
     long g_injTickUsed  = -1;
 
+    // ---------------------------------------------------------------------
+    // Experiment 6: multi-input sequences.
+    //
+    // One jump proves placement is tick-exact. It does not prove GD replays a
+    // *sequence* -- the thing search-and-replay actually needs -- because with a
+    // single input there is no opportunity for error to compound. Divergence in
+    // a forward model shows up as drift between inputs, so the test only starts
+    // being informative at n >= 2.
+    //
+    // GDRL_INJECT_SEQ="325,410:12,455"  jump ticks, optional :hold in ticks.
+    //   The button is pushed on the frame whose START tick equals the entry and
+    //   released `hold` ticks later. Hold defaults to GDRL_INJECT_HOLD.
+    //
+    // GDRL_SWEEP_START/SPAN/STEP appends one more jump whose tick walks across
+    // attempts: tick = START + (attempt % SPAN) * STEP. That is the greedy
+    // search step -- fix the prefix that is known to work, scan for the next
+    // jump. Cycling rather than stopping at SPAN is deliberate: every value gets
+    // revisited, so a sweep doubles as a repeat-determinism check for free.
+    //
+    // GDRL_PERTURB_IDX/DELTAS shifts ONE element of the fixed sequence by a
+    // per-attempt delta drawn cyclically from the list. Interleaving -1/0/+1
+    // within a single process is stronger than three separate launches: any
+    // drift that is a function of process state cancels.
+    struct SeqItem { long push; long release; };
+
+    std::vector<SeqItem> g_seqBase;      // parsed from GDRL_INJECT_SEQ
+    std::vector<SeqItem> g_seq;          // this attempt's sequence (perturbed/swept)
+    std::vector<char>    g_seqFired;
+    std::vector<char>    g_seqReleased;
+    long g_seqPushes  = 0;               // pushes actually queued this attempt
+    long g_seqRels    = 0;
+    long g_seqSwept   = -1;              // the swept tick used this attempt
+
+    const int  g_sweepStart = envInt("GDRL_SWEEP_START", -1);
+    const int  g_sweepSpan  = envInt("GDRL_SWEEP_SPAN", 1);
+    const int  g_sweepStep  = envInt("GDRL_SWEEP_STEP", 1);
+    const int  g_sweepHold  = envInt("GDRL_SWEEP_HOLD", envInt("GDRL_INJECT_HOLD", 8));
+    const int  g_perturbIdx = envInt("GDRL_PERTURB_IDX", -1);
+
+    // Adaptive dt: run coarse between events, land exactly on each event tick.
+    //
+    // Tick-exact injection needs the frame boundary to coincide with the target
+    // tick, which at a fixed dt means dt = 1/240 -- and a 700-tick attempt then
+    // costs 700 rendered frames. Since the event ticks are known in advance, the
+    // frame size can instead be chosen per frame as the distance to the next
+    // event, capped at GDRL_DELTA_TICKS. Every frame still consumes an exact
+    // whole number of 1/240 steps, and every event still lands on a frame
+    // boundary. Whether that is *equivalent* to a uniform 1/240 is an empirical
+    // question and is checked against the known single-jump outcome, not assumed.
+    const bool g_adaptive = envInt("GDRL_ADAPTIVE", 0) == 1;
+
+    std::vector<int> g_perturbDeltas;
+
+    std::vector<long> parseLongList(const char* env) {
+        std::vector<long> out;
+        const char* v = std::getenv(env);
+        if (!v || !*v) return out;
+        const char* p = v;
+        while (*p) {
+            char* end = nullptr;
+            const long n = std::strtol(p, &end, 10);
+            if (end == p) { p++; continue; }
+            out.push_back(n);
+            p = end;
+        }
+        return out;
+    }
+
+    // "325,410:12,455" -> {{325,333},{410,422},{455,463}} with hold 8.
+    void parseSeq() {
+        const char* v = std::getenv("GDRL_INJECT_SEQ");
+        if (!v || !*v) return;
+        const char* p = v;
+        while (*p) {
+            char* end = nullptr;
+            const long push = std::strtol(p, &end, 10);
+            if (end == p) { p++; continue; }
+            p = end;
+            long hold = g_injectHold;
+            if (*p == ':') {
+                p++;
+                char* e2 = nullptr;
+                const long h = std::strtol(p, &e2, 10);
+                if (e2 != p) { hold = h; p = e2; }
+            }
+            g_seqBase.push_back({push, push + hold});
+        }
+    }
+
+    const bool g_seqMode = [] {
+        parseSeq();
+        g_perturbDeltas = [] {
+            auto v = parseLongList("GDRL_PERTURB_DELTAS");
+            std::vector<int> out;
+            for (long n : v) out.push_back((int)n);
+            if (out.empty()) out = {-1, 0, 1};
+            return out;
+        }();
+        return !g_seqBase.empty() || envInt("GDRL_SWEEP_START", -1) >= 0;
+    }();
+
+    std::string seqToString(const std::vector<SeqItem>& s) {
+        std::string out;
+        for (size_t i = 0; i < s.size(); i++) {
+            if (i) out += ",";
+            out += fmt::format("{}:{}", s[i].push, s[i].release - s[i].push);
+        }
+        return out;
+    }
+
+    // Build the sequence for the attempt about to start. Called at the attempt
+    // boundary so the whole attempt uses one fixed plan -- deciding per frame
+    // would make the plan a function of the frame rate.
+    void buildSeqForAttempt(long attempt) {
+        g_seq       = g_seqBase;
+        g_seqSwept  = -1;
+
+        if (g_perturbIdx >= 0 && g_perturbIdx < (int)g_seq.size()
+            && !g_perturbDeltas.empty()) {
+            const int d = g_perturbDeltas[attempt % (long)g_perturbDeltas.size()];
+            g_seq[g_perturbIdx].push    += d;
+            g_seq[g_perturbIdx].release += d;
+        }
+
+        if (g_sweepStart >= 0) {
+            const long span = g_sweepSpan > 0 ? g_sweepSpan : 1;
+            g_seqSwept = g_sweepStart + (attempt % span) * g_sweepStep;
+            g_seq.push_back({g_seqSwept, g_seqSwept + g_sweepHold});
+        }
+
+        g_seqFired.assign(g_seq.size(), 0);
+        g_seqReleased.assign(g_seq.size(), 0);
+        g_seqPushes = 0;
+        g_seqRels   = 0;
+    }
+
+    // Next tick at which anything must happen, or LONG_MAX when the sequence is
+    // exhausted. Drives the adaptive frame size.
+    long nextEventTick() {
+        long best = LONG_MAX;
+        for (size_t i = 0; i < g_seq.size(); i++) {
+            if (!g_seqFired[i])         best = std::min(best, g_seq[i].push);
+            else if (!g_seqReleased[i]) best = std::min(best, g_seq[i].release);
+        }
+        return best;
+    }
+
     void resetInjectState() {
         g_injPushed   = false;
         g_injReleased = false;
@@ -213,6 +373,29 @@ class $modify(GDRLExpBaseGameLayer, GJBaseGameLayer) {
         // Inject before delegating: queueButton only enqueues, and the queue is
         // drained by processQueuedButtons inside update(). Queuing after the
         // original would push the input a whole frame late.
+        long curTick = -1;
+        if (g_seqMode) {
+            if (auto* pl = PlayLayer::get()) {
+                curTick = std::lround(pl->m_attemptTime * kTicksPerSec);
+                for (size_t i = 0; i < g_seq.size(); i++) {
+                    if (!g_seqFired[i] && curTick >= g_seq[i].push) {
+                        g_gdrlInjecting = true;
+                        this->queueButton(1, true, false, pl->m_attemptTime);
+                        g_gdrlInjecting = false;
+                        g_seqFired[i] = 1;
+                        g_seqPushes++;
+                    } else if (g_seqFired[i] && !g_seqReleased[i]
+                               && curTick >= g_seq[i].release) {
+                        g_gdrlInjecting = true;
+                        this->queueButton(1, false, false, pl->m_attemptTime);
+                        g_gdrlInjecting = false;
+                        g_seqReleased[i] = 1;
+                        g_seqRels++;
+                    }
+                }
+            }
+        }
+
         if (g_injectTick >= 0) {
             if (auto* pl = PlayLayer::get()) {
                 const long tick   = std::lround(pl->m_attemptTime * kTicksPerSec);
@@ -235,10 +418,22 @@ class $modify(GDRLExpBaseGameLayer, GJBaseGameLayer) {
             }
         }
 
-        const int   before = m_currentStep;
-        const float useDt  = g_deltaTicks > 0
-                                 ? static_cast<float>(g_deltaTicks * kTimestep)
-                                 : dt;
+        const int before = m_currentStep;
+
+        // Frame size. Adaptive mode shrinks it to land exactly on the next event
+        // tick; between events it runs at the full GDRL_DELTA_TICKS.
+        int ticksThisFrame = g_deltaTicks;
+        if (g_adaptive && g_deltaTicks > 0 && curTick >= 0) {
+            const long ev = nextEventTick();
+            if (ev != LONG_MAX) {
+                const long gap = ev - curTick;
+                ticksThisFrame = gap <= 0 ? 1
+                                          : (int)std::min<long>(gap, g_deltaTicks);
+            }
+        }
+        const float useDt = ticksThisFrame > 0
+                                ? static_cast<float>(ticksThisFrame * kTimestep)
+                                : dt;
 
         GJBaseGameLayer::update(useDt);
 
@@ -318,6 +513,25 @@ class $modify(GDRLExpPlayLayer, PlayLayer) {
                       g_injTickUsed, g_injectHold, (int)g_injPushed,
                       (int)g_injReleased, g_gdrlInjectPending);
         }
+
+        // The sequence outcome, as ONE self-contained record: what was played,
+        // where it ended, and whether the attempt is admissible at all. Printed
+        // at full precision because the claim under test is bit-identity, not
+        // proximity. leaked>0 voids the attempt exactly as it does for the
+        // null-input measurements.
+        if (g_expOn && g_seqMode && g_updCalls > 0) {
+            gdrlSnapshotMaxX();
+            const double t     = this->m_attemptTime;
+            const long   dtick = std::lround(t * kTicksPerSec);
+            log::info("[gdrl] SEQ a={:<4} lvl={} n={} swept={:<5} maxX={:.9f} "
+                      "deathTick={:<6} t={:.9f} push={} rel={} "
+                      "input[{} blocked={} leaked={} ui={} uiTot={}] seq=[{}]",
+                      g_expAttempt, g_gdrlLevelID, (int)g_seq.size(), g_seqSwept,
+                      g_gdrlMaxX, dtick, t, g_seqPushes, g_seqRels,
+                      g_gdrlLeaked > 0 ? "INVALID" : "clean",
+                      g_gdrlBlocked, g_gdrlLeaked, g_gdrlUiEvents, g_gdrlUiTotal,
+                      seqToString(g_seq));
+        }
         g_expAttempt++;
 
         if (g_expOn && g_clkFrames > 0) {
@@ -335,12 +549,20 @@ class $modify(GDRLExpPlayLayer, PlayLayer) {
         resetExpStats();
         resetClockStats();
         resetInjectState();
+        if (g_seqMode) buildSeqForAttempt(g_expAttempt);
     }
 };
 
 $execute {
     if (g_expOn) {
         log::info("[gdrl] EXP instrumentation ON (GDRL_DELTA_TICKS={} "
-                  "GDRL_FAST_RESET={})", g_deltaTicks, (int)g_fastReset);
+                  "GDRL_FAST_RESET={} GDRL_ADAPTIVE={})",
+                  g_deltaTicks, (int)g_fastReset, (int)g_adaptive);
+    }
+    if (g_expOn && g_seqMode) {
+        log::info("[gdrl] SEQCFG base=[{}] sweep[start={} span={} step={} hold={}] "
+                  "perturbIdx={} adaptive={}",
+                  seqToString(g_seqBase), g_sweepStart, g_sweepSpan, g_sweepStep,
+                  g_sweepHold, g_perturbIdx, (int)g_adaptive);
     }
 }

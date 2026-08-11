@@ -815,6 +815,182 @@ artifact of injecting on frame boundaries, not a limit of GD.
 `dt` = 1/240 and `dt` = 8/240 produce identical outcomes for the same injection
 tick, so small-`dt` physics agrees with large-`dt` physics.
 
+## Multi-input sequences replay bit-identically (n = 12)
+
+One injected jump proves placement is tick-exact. It does not prove GD is a
+forward model over a *sequence*, which is what search-and-replay needs: with a
+single input there is nothing for error to compound across. The test only starts
+being informative at n ≥ 2.
+
+`GDRL_INJECT_SEQ="325,712,1074,…"` plays a whole list; each entry is a jump tick
+with an optional `:hold` in ticks (default 8). The deepest sequence found by
+greedy search on Stereo Madness is **twelve jumps**:
+
+```
+325,712,1074,1162,1266,1798,1934,2154,2318,2482,2686,2878
+```
+
+**Replayed 80 consecutive times, every attempt bit-identical:**
+
+```
+maxX      = 3959.183837891     80/80
+deathTick = 3048               80/80
+t         = 12.700000662       80/80   (= 3048/240, with the known float32 drift)
+input[clean blocked=0 leaked=0 ui=0]    80/80, all on lvl=1
+```
+
+That is 7.80× the null-input `maxX` of `507.615234375` and 4.13× the
+single-jump `958.117858887`, or ~14.8 % of the level by `m_levelLength`.
+
+**Determinism does not degrade with sequence length.** Across every clean run —
+**1473 admissible attempts covering 631 distinct sequences of length 1 to 12** —
+not one sequence produced more than one outcome. Grouping is by the exact
+sequence played, printed on each attempt's own line, so the check is an assertion
+of identity rather than an eyeball:
+
+| sequence length | attempts | distinct sequences | divergent |
+|---|---|---|---|
+| 1 | 44 | 1 | 0 |
+| 2 | 252 | 48 | 0 |
+| 3 | 222 | 80 | 0 |
+| 5 | 123 | 44 | 0 |
+| 6 | 100 | 82 | 0 |
+| 7 | 86 | 49 | 0 |
+| 8 | 106 | 72 | 0 |
+| 9 | 90 | 53 | 0 |
+| 10 | 84 | 57 | 0 |
+| 11 | 78 | 63 | 0 |
+| 12 | 288 | 82 | 0 |
+
+The greedy path itself, each step the plateau centre of a 4-tick sweep of the
+next jump against a fixed prefix:
+
+| jumps | added tick | death tick | maxX |
+|---|---|---|---|
+| 1 | 325 | 738 | `958.117858887` |
+| 2 | 712 | 1107 | `1437.163330078` |
+| 3 | 1074 | 1221 | `1585.160156250` |
+| 4 | 1162 | 1328 | `1725.069458008` |
+| 5 | 1266 | 1822 | `2367.419189453` |
+| 6 | 1798 | 1983 | `2576.451904297` |
+| 7 | 1934 | 2213 | `2875.070068359` |
+| 8 | 2154 | 2354 | `3058.135986328` |
+| 9 | 2318 | 2536 | `3294.433837891` |
+| 10 | 2482 | 2723 | `3537.223388672` |
+| 11 | 2686 | 2945 | `3825.454833984` |
+| 12 | 2878 | 3048 | `3959.183837891` |
+
+### Sensitivity survives length, but the landscape is a step function
+
+This is the important negative result, and it is not a determinism failure.
+
+Perturbing the **first** jump of the twelve by −1 tick destroys everything
+downstream, exactly as at n = 1 — the run dies at the first spike and only one
+of the twelve jumps ever fires:
+
+| jump 1 | maxX | death tick | pushes fired |
+|---|---|---|---|
+| 324 | `542.668640137` | 418 | 1 / 12 |
+| **325** | `3959.183837891` | 3048 | 12 / 12 |
+| 326 | `3959.183837891` | 3048 | 12 / 12 |
+
+Perturbing the **last** jump by ±1 changes **nothing**:
+
+| jump 12 | maxX | death tick |
+|---|---|---|
+| 2850 | `3835.841552734` | 2953 |
+| **2851 … 2898** | `3959.183837891` | 3048 |
+| 2899 | `3825.454833984` | 2945 |
+
+`2877`, `2878`, `2879` are indistinguishable, and so is every value in a
+**48-tick-wide plateau**. Outside it, a *single* tick flips the outcome:
+2850 → 2851 and 2898 → 2899 both change `maxX` and death tick. Measured at
+1-tick resolution, 21 perturbations × ~4 repeats, every group bit-identical.
+
+So the outcome is **piecewise constant** in each jump tick, with sharp edges.
+That follows from the geometry rather than from anything numerical: x advances
+`1.298250437` per tick regardless of what the player does vertically, so death
+`x` can only ever land on an obstacle's x — the outcome space is discrete, and
+between edges the map is flat. Jump 1's plateau happens to start at 325, which
+is why ±1 there looks maximally sensitive; it sits on an edge.
+
+**Consequences for search.** A ±1 perturbation is *not* a valid determinism
+probe at depth — "outcome unchanged" is the expected answer almost everywhere,
+and reading it as a broken replay would be wrong. It also means gradient-like
+local search over jump ticks is mostly climbing flat ground; the useful signal
+is at plateau edges, which is why the search here sweeps a window rather than
+stepping. Conversely the plateaus are why a 4-tick sweep grid found every
+obstacle. Over the clean runs (jumps 5-12) the narrowest plateau was 29 ticks
+and the widest 81; jump 12's, the only one resolved to 1 tick rather than 4, was
+48.
+
+### Adaptive `dt`: tick-exact placement without paying 1 frame per tick
+
+Tick-exact injection needs the frame boundary to coincide with the target tick,
+which at fixed `dt` means `dt` = 1/240 — and a 3048-tick attempt then costs 3048
+rendered frames. Since the event ticks are known in advance, `GDRL_ADAPTIVE=1`
+instead picks the frame size per frame as `min(GDRL_DELTA_TICKS, nextEvent −
+now)`. Every frame still consumes a whole number of 1/240 steps and every event
+still lands on a frame boundary.
+
+Equivalence is measured, not assumed. The single jump at tick 325 gives the same
+outcome under all three regimes:
+
+```
+dt = 1/240  (README, earlier)         maxX = 958.117858887  tick 738
+adaptive, cap 8/240   44 attempts     maxX = 958.117858887  tick 738
+adaptive, cap 32/240  (control)       maxX = 958.117858887  tick 738
+```
+
+The cap-32 control is free: any swept jump scheduled past the death tick never
+fires, so those attempts *are* the single-jump sequence. A 3048-tick attempt
+costs ~95 frames instead of 3048, ~1.6 s wall clock.
+
+### The level pin: `input[clean]` was not enough
+
+A search run silently left Stereo Madness. Reconstructed from the log: GD called
+`PlayLayer::pauseGame(unfocused=true)` on a window-focus change, the run sat in
+the pause menu for eight seconds, and stray `ESC` keypresses (key `27`, observed
+directly once the dispatcher was hooked) walked it out to the level select and
+into **Back On Track** — where it happily kept producing attempts reading
+`input[clean blocked=0 leaked=0]`, because no *button* had leaked. Two of them
+landed in the same sweep group as real attempts and looked exactly like
+nondeterminism:
+
+```
+swept=1182  maxX=1725.069458008  tick=1328   <- real
+swept=1182  maxX= 688.075866699  tick= 530   <- a truncated attempt on another level
+```
+
+`GDRL_BLOCK_INPUT` covers the button. It does not cover the *session*. So
+`GDRL_PIN_LEVEL=1` now also swallows keyboard and touch events wholesale (the
+harness needs neither — all its input goes through `queueButton`), suppresses
+`onQuit` and `pauseGame`, re-enters the pinned level if the menu is ever
+reached, and — the part that actually matters — stamps `lvl=` and `ui=` on every
+`ATTEMPT` and `SEQ` line. A blocked exit that quietly failed would leave no
+trace; a level id on every line cannot. Attempts are admissible only when
+`lvl=1 leaked=0 ui=0 deathTick>0`; 22 of 977 attempts were rejected by that rule
+and none of the reported numbers include them.
+
+The general shape of this is the same trap as `maxX`-per-frame and
+`m_currentStep`: **the measurement was clean about the thing it checked and
+silent about the thing that had changed.**
+
+### What this does not establish
+
+- **Only cube, only Stereo Madness, only 1× speed.** The 12-jump sequence never
+  leaves cube; no portal, no ship, no mini, no gravity flip has been replayed.
+- **Not across processes.** Every repeat above is within a single GD launch.
+  Cross-process determinism (needed for parallel workers) is still unverified,
+  as is anything about `m_randomSeed` / `m_replayRandSeed`.
+- **Not to level completion.** 3048 ticks is ~15 % of Stereo Madness. Greedy
+  search stalls where it needs two coordinated jumps rather than one; the search
+  here only ever appends a single jump per step, and only ever with `hold=8`.
+- **Hold duration is untested.** Every jump used an 8-tick hold. Whether a
+  longer hold changes cube behaviour (it should, on landing) was not measured.
+- **The plateau widths are from a 4-tick grid** except jump 12, which was
+  resolved to 1 tick. The others could be off by up to 3 ticks at each edge.
+
 ## Conditioning state: the eight vehicles and their modifiers
 
 GD is eight games sharing a renderer. The same geometry is lethal in cube and
