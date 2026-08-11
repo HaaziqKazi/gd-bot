@@ -841,6 +841,45 @@ emits from `prepareMoveActions`, and an attempt ending at `endTick=3048` served
 `steps=3054` — 1:1 with ticks to within six boundary steps. The static analysis
 said it should; this is the first runtime evidence that it does.
 
+## Synthetic levels (partly working)
+
+`mod/src/synth.cpp` builds a level string in memory and hands it to PlayLayer,
+because the main levels contain no reachable move trigger and no speed portals at
+all. `GDRL_SYNTH=1` loads it instead of main level 1.
+
+**What works.** The level constructs, loads and is playable: `levelLength=6340`,
+13 objects, and the player runs normally (`f=180 pos=(148.0,105.0) ground=1`).
+Every portal lands at exactly the requested x:
+
+```
+id=202 (2x) @1200   id=203 (3x) @1800   id=1334 (4x) @2400
+id=200 (0.5x) @3000 id=201 (1x) @3600   id=13 (ship) @4500
+```
+
+Raw and gzip+base64 forms both load identically, so GD passes an uncompressed
+level string through unchanged. `GDRL_SYNTH_COMPRESS=1` selects the compressed
+form; neither is required.
+
+That is enough to unblock the speed-bucket measurement and a vehicle-portal
+crossing, neither of which was reachable in any main level.
+
+**What does not work.** The move trigger (id 901) is rejected — it never appears
+in the census while every other object does. Two hypotheses were tested and both
+falsified:
+
+- *Compression*: raw and compressed give byte-identical censuses, so the encoding
+  is not the cause.
+- *First-object-after-header being consumed*: a sacrificial block emitted first
+  loaded fine (`id=1 n=3 firstX=50.0`) and 901 was still missing, so the
+  header/object boundary is not the cause either.
+
+What remains is the trigger's own property encoding. The property numbers in
+`synth.cpp` were written from memory, which is precisely the "half-remembered
+table" this repo has already been burned by. **The fix is to stop guessing and
+derive the encoding from real data** — dump an actual level string containing a
+move trigger (Fingerdash has four) and read the property IDs off it, rather than
+iterating on guesses. Everything else in the file is verified by the census.
+
 ## What still needs runtime verification
 
 None of this was measured on a running game — another agent held exclusive use

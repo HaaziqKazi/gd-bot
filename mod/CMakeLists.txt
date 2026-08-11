@@ -23,6 +23,7 @@ add_library(${PROJECT_NAME} SHARED
     src/experiments.cpp
     src/telemetry.cpp
     src/probes.cpp
+    src/synth.cpp
     src/nonap.mm
 )
 

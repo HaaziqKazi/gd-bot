@@ -28,6 +28,7 @@
 #include <Geode/modify/CCTouchDispatcher.hpp>
 
 #include "nonap.hpp"
+#include "synth.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -368,9 +369,15 @@ class $modify(GDRLMenuLayer, MenuLayer) {
                     // nothing to collide with. It still loads and still "runs",
                     // so every measurement taken against it looks plausible and
                     // is meaningless. Must be false.
-                    auto* level = GameLevelManager::sharedState()->getMainLevel(1, false);
+                    // GDRL_SYNTH swaps in a generated level. The main levels
+                    // contain no reachable move trigger and no speed portals at
+                    // all, so the remaining trigger measurements cannot be taken
+                    // on them -- see synth.hpp.
+                    GJGameLevel* level = envOn("GDRL_SYNTH")
+                        ? gdrl::makeSyntheticLevel()
+                        : GameLevelManager::sharedState()->getMainLevel(1, false);
                     if (!level) {
-                        log::error("[gdrl] getMainLevel(1) returned null");
+                        log::error("[gdrl] level construction returned null");
                         return;
                     }
                     log::info("[gdrl] autoplay -> '{}'", level->m_levelName.c_str());
