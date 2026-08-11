@@ -787,6 +787,60 @@ constant in jump tick with plateaus 29-81 ticks wide, per-tick decisions are not
 needed: deciding every 8 ticks is ~380 round-trips instead of 3054, for the same
 trajectory.
 
+## The main levels cannot serve the remaining trigger work
+
+Censused all 21 main levels in one launch (`GDRL_CENSUS=1 GDRL_CENSUS_SWEEP=21`).
+The content needed to close the trigger measurements is not reachable:
+
+| needed for | what exists | reachable? |
+|---|---|---|
+| live `GroupCommandObject2` (Probe A) | **4** move triggers total, all in lvl 21 (Fingerdash) at x=7813–8455, all `touch=1` | no — best sequence reaches x=3959 on lvl 1 |
+| a vehicle portal by input (lvl 1) | ship at x=7995, cube at x=12555 | no — ~2× current reach |
+| speed portals (lvl 1) | none at all | n/a |
+
+These are pre-2.0 levels; they barely use triggers. And the four that exist are
+touch-triggered, which forward projection classifies as *not* computable anyway.
+
+**So the trigger measurements need synthetic levels** — a generated level string
+with a spawn-triggered move trigger near x≈300, speed portals at known x, and
+vehicle portals near the start. That is the unblock for Probe A, the four
+unmeasured speed buckets, and `m_deltaTimeInFloat` against the tick clock.
+
+The census cross-check earns its place here: every level reported a consistent
+1–3% shortfall against `m_objects` (2384/2399 … 19217/19684), which is the
+not-yet-sectioned tail rather than a traversal fault. A silent traversal bug
+across 21 levels would otherwise have been invisible.
+
+## Vehicle decode: all seven paths validated
+
+`GDRL_FORCE_VEHICLE=<n>` calls the mode togglers on the live `PlayerObject`,
+which reaches every vehicle without solving a level. All seven, `overlap=0`
+throughout, `deriveVehicle` labelling each correctly:
+
+```
+ship 0b0000001   ball  0b0000010   ufo    0b0000100   wave 0b0001000
+robot 0b0010000  spider 0b0100000  swing  0b1000000
+```
+
+`overlap=0` everywhere answers an open question: GD does **not** leave a parent
+flag set while a child mode is active, so `deriveVehicle`'s derived-first ordering
+is defensive rather than load-bearing.
+
+Scope, from the probe's own banner: this validates the **flag decode and read
+path only**. A real portal also sets size, gravity and speed and may run further
+setup, so forcing a mode is not crossing one. `conditioning.py` is no longer
+unexecuted design, but portal transitions remain unvalidated.
+
+Correction while measuring: normal gravity reads **`0.9582`**, not the `0.96`
+recorded earlier.
+
+## `prepareMoveActions` fires once per physics step
+
+Not a dedicated test, but the env validation answers it in passing. Telemetry
+emits from `prepareMoveActions`, and an attempt ending at `endTick=3048` served
+`steps=3054` — 1:1 with ticks to within six boundary steps. The static analysis
+said it should; this is the first runtime evidence that it does.
+
 ## What still needs runtime verification
 
 None of this was measured on a running game — another agent held exclusive use
