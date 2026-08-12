@@ -1,4 +1,4 @@
-// Three diagnostic probes, all default OFF and both required to add ZERO
+// Four diagnostic probes, all default OFF and all required to add ZERO
 // behaviour in that state -- ~550 attempts of determinism evidence (see
 // README, "Physics is fixed-step at 240Hz") depend on the mod being
 // bit-identical when its new features are disabled. Every hook below either
@@ -161,6 +161,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <map>
 #include <vector>
 
@@ -199,6 +200,87 @@ namespace {
     // Probe A: GDRL_PROBE_CMDVEC
     // =======================================================================
     const bool g_probeCmdVec = envOn("GDRL_PROBE_CMDVEC");
+
+    // Probe D shares Probe A's prepareMoveActions emission point and gameplay
+    // discriminator. Sampling here is per physics step, not per frame -- a
+    // per-frame sample of a per-tick quantity is a measurement of the frame
+    // rate (README, "Two probe bugs worth not repeating").
+    const bool g_probeMove = envOn("GDRL_PROBE_MOVE");
+
+    struct MovePosition {
+        float x;
+        float y;
+    };
+    std::map<GameObject*, MovePosition> g_movePrevious;
+    bool g_moveTriggerLogged = false;
+
+    void resetMoveAttempt() {
+        g_movePrevious.clear();
+        g_moveTriggerLogged = false;
+    }
+
+    void logMoveTriggerOnce(GJBaseGameLayer* layer, long tick) {
+        if (g_moveTriggerLogged) return;
+        g_moveTriggerLogged = true;
+
+        // The synthetic fixture has one known Move trigger (object 901). The
+        // moved-object scan below is deliberately generic; identifying this
+        // authored source by id is only for reporting the source parameters GD
+        // actually parsed, rather than silently comparing against synth.cpp's
+        // constants.
+        EffectGameObject* trigger = nullptr;
+        if (layer && layer->m_objects) {
+            const unsigned n = layer->m_objects->count();
+            for (unsigned i = 0; i < n; i++) {
+                auto* obj = static_cast<GameObject*>(layer->m_objects->objectAtIndex(i));
+                if (obj && obj->m_objectID == 901) {
+                    trigger = dynamic_cast<EffectGameObject*>(obj);
+                    if (trigger) break;
+                }
+            }
+        }
+
+        if (trigger) {
+            log::info(
+                "[gdrl] MOVE-TRIGGER tick={} id={} target={} offX={:.9f} "
+                "offY={:.9f} duration={:.9f} easing={}",
+                tick, (int)trigger->m_objectID, trigger->m_targetGroupID,
+                trigger->m_moveOffset.x, trigger->m_moveOffset.y,
+                trigger->m_duration, (int)trigger->m_easingType);
+        } else {
+            // Still emit exactly one machine-readable parameter record for the
+            // attempt. NaNs prevent a missing/wrongly-typed trigger from being
+            // mistaken for a valid zero-valued trigger by the Python parser.
+            const float nan = std::numeric_limits<float>::quiet_NaN();
+            log::error(
+                "[gdrl] MOVE-TRIGGER tick={} id=901 target=-1 offX={:.9f} "
+                "offY={:.9f} duration={:.9f} easing=-1",
+                tick, nan, nan, nan);
+        }
+    }
+
+    void sampleMovedObjects(GJBaseGameLayer* layer, long tick) {
+        if (!layer || !layer->m_objects) return;
+        const unsigned n = layer->m_objects->count();
+        for (unsigned i = 0; i < n; i++) {
+            auto* obj = static_cast<GameObject*>(layer->m_objects->objectAtIndex(i));
+            if (!obj) continue;
+
+            const MovePosition now{obj->getPositionX(), obj->getPositionY()};
+            auto [it, inserted] = g_movePrevious.emplace(obj, now);
+            if (inserted) continue;  // per-attempt baseline, not movement
+
+            const float dx = now.x - it->second.x;
+            const float dy = now.y - it->second.y;
+            if (dx != 0.f || dy != 0.f) {
+                log::info(
+                    "[gdrl] MOVE tick={} id={} x={:.9f} y={:.9f} "
+                    "dx={:.9f} dy={:.9f}",
+                    tick, (int)obj->m_objectID, now.x, now.y, dx, dy);
+            }
+            it->second = now;
+        }
+    }
 
     // True from just before this file's own GJBaseGameLayer::update hook
     // delegates to the real update() until just after it returns. Real
@@ -324,7 +406,7 @@ namespace {
 // point of this probe.
 class $modify(GDRLProbeEffectManager, GJEffectManager) {
     void prepareMoveActions(float dt, bool intermediate) {
-        if (!g_probeCmdVec) {
+        if (!g_probeCmdVec && !g_probeMove) {
             GJEffectManager::prepareMoveActions(dt, intermediate);
             return;
         }
@@ -340,6 +422,13 @@ class $modify(GDRLProbeEffectManager, GJEffectManager) {
         if (!pl) return;   // guard: g_inGameplayUpdate implies a live PlayLayer, but never trust that
 
         const long tick = std::lround(pl->m_attemptTime * kTicksPerSec);
+
+        if (g_probeMove) {
+            logMoveTriggerOnce(pl, tick);
+            sampleMovedObjects(pl, tick);
+        }
+
+        if (!g_probeCmdVec) return;
 
         long sz[kNumCmdVecs];
         sz[0] = (long)m_unkVector518.size();
@@ -389,14 +478,14 @@ class $modify(GDRLProbeEffectManager, GJEffectManager) {
 // installing its own on the same function.
 class $modify(GDRLProbeBaseGameLayer, GJBaseGameLayer) {
     void update(float dt) {
-        if (!g_probeCmdVec && !g_probeForceVehicle) {
+        if (!g_probeCmdVec && !g_probeMove && !g_probeForceVehicle) {
             GJBaseGameLayer::update(dt);
             return;
         }
 
-        if (g_probeCmdVec) g_inGameplayUpdate = true;
+        if (g_probeCmdVec || g_probeMove) g_inGameplayUpdate = true;
         GJBaseGameLayer::update(dt);
-        if (g_probeCmdVec) g_inGameplayUpdate = false;
+        if (g_probeCmdVec || g_probeMove) g_inGameplayUpdate = false;
 
         if (!g_probeForceVehicle) return;
 
@@ -487,6 +576,7 @@ class $modify(GDRLProbePlayLayer, PlayLayer) {
         PlayLayer::resetLevel();
 
         if (g_probeCmdVec)      resetCmdVecAttempt();
+        if (g_probeMove)        resetMoveAttempt();
         if (g_probeForceVehicle) resetForceVehicleAttempt();
     }
 };
@@ -502,6 +592,10 @@ $execute {
                    "(NOT equivalent to a portal transition -- validates flag "
                    "decode + read path only, see probes.cpp header)",
                    g_forceVehicle, vehicleNameFor(g_forceVehicle), g_forceVehicleTick);
+    }
+    if (g_probeMove) {
+        log::info("[gdrl] PROBE_MOVE on -- sampling m_objects after each gameplay "
+                  "physics-step prepareMoveActions call");
     }
 }
 

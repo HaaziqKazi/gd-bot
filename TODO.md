@@ -58,7 +58,32 @@ x-activated move trigger therefore already exists in the synth level, at x=300,
 well inside the proven reach of x=3959.
 
 - [x] Unblock a reachable move trigger — done, see 1.1a.
-- [ ] Capture per-tick ground truth: object position each tick from telemetry.
+- [x] **Probe built** (`GDRL_PROBE_MOVE=1`, Codex): samples per physics step off
+      `prepareMoveActions`, diffs every object's position against the previous
+      step, emits `MOVE tick= id= x= y= dx= dy=` at full precision. Tick from
+      `lround(m_attemptTime*240)`.
+- [x] **The trigger fires and the command goes live.** With
+      `GDRL_PROBE_CMDVEC=1` on the synth level:
+      ```
+      CMDVEC tick=1    v560=0
+      CMDVEC tick=233  v560=1     <- move command live
+      CMDVEC tick=481  v560=1
+      CMDVEC tick=715  v560=0     <- completed
+      ```
+      GD loaded the trigger with exactly the authored parameters:
+      `MOVE-TRIGGER target=1 offX=0 offY=90 duration=2.0 easing=0`.
+- [ ] **BLOCKER (new, real this time): `MOVE` count is ZERO for the whole run.**
+      The command is live for ~480 ticks and no object's `getPositionX/Y` ever
+      changes. So the position we sample immediately after `prepareMoveActions`
+      is **not** the position the move command writes.
+      Hypothesis to test first: `prepareMoveActions` *prepares* the actions and a
+      later phase of the same physics step applies them, so the sample is taken
+      pre-application — an off-by-phase error, the frame-ordering failure mode.
+      Find the apply phase (candidates: `processMoveActions`,
+      `processMoveActionsStep`, `GJBaseGameLayer::updateMoveObjectsLastPosition`)
+      and sample after it, or read the group transform rather than the object's
+      own position. **Until this is resolved, forward projection cannot be
+      compared against observed positions at all.**
 - [ ] Compare predicted position at player-arrival tick vs observed position.
 - [ ] Quantify: mean error, max error, does error grow with horizon, does it
       change near trajectory reversals, does it lead or lag.
@@ -281,7 +306,9 @@ Decisions).
 
 ## Runtime-verification backlog (from README, verbatim priority)
 
-1. [ ] **Which `GJEffectManager` vector holds live `GroupCommandObject2`.**
+1. [x] **RESOLVED — it is `m_unkVector560`.** Measured 0 -> 1 -> 0 across the
+       trigger's lifetime while the other six stayed 0. Note it is
+       `gd::vector<GroupCommandObject2>` **by value**, not by pointer.
        Candidates: `m_unkVector518`, `530`, `560`, `5b0`, `600`, `m_unkMap5c8`,
        `m_unkMap770`. Log all seven sizes per step with one known move trigger;
        exactly one should go 0 → 1 → 0. *Everything in the telemetry spec depends
