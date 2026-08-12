@@ -72,7 +72,17 @@ well inside the proven reach of x=3959.
       ```
       GD loaded the trigger with exactly the authored parameters:
       `MOVE-TRIGGER target=1 offX=0 offY=90 duration=2.0 easing=0`.
-- [ ] **BLOCKER (new, real this time): `MOVE` count is ZERO for the whole run.**
+- [x] **RESOLVED — it was a wrong-field error, not frame ordering.** The move
+      pipeline writes `m_positionX`/`m_positionY` (doubles at +0x3b0/+0x3b8) and
+      never calls `CCNode::setPosition`, so `getPositionX/Y()` never changes.
+      Probe now reads the right field and emits 480 records; see README,
+      "Moving geometry: the move pipeline does not write the CCNode position".
+      **Ground truth for forward-projection validation now exists.**
+- [x] **Measured, twice, from separate GD launches (byte-identical):** 480
+      records, ticks 234→713, displacement exactly 90.0, per-tick
+      dy=0.187501179, linear to 4.4 ppm.
+- [ ] ~~old blocker text below, retained for the reasoning trail~~
+      **`MOVE` count is ZERO for the whole run.**
       The command is live for ~480 ticks and no object's `getPositionX/Y` ever
       changes. So the position we sample immediately after `prepareMoveActions`
       is **not** the position the move command writes.
@@ -328,6 +338,43 @@ Decisions).
        Log `dtPerStep`, `numSteps`, per-step x advance before trusting either.
 8. [ ] **Does `m_attemptTime` survive a checkpoint restore?** Load-bearing for
        both the input clock and the projection. → folds into Track 2.1.
+
+---
+
+## NEXT SESSION — start here
+
+Ground truth for forward projection now **exists** and is committed. The
+comparison itself has **not been run** — that is the immediate next task.
+
+- [ ] **Compare `trajectory.py`'s prediction against the recorded data.**
+      Two agents were spawned for this and stopped before writing any files, so
+      there is nothing half-finished to clean up. Recreate as:
+      - `trainer/validate_projection.py` — parse `MOVE`/`MOVE-TRIGGER`/`MOVE-OBJ`
+        records from a Geode log, build the equivalent `GroupCommand` /
+        `ObjectSnapshot`, drive `ForwardProjector`, and report mean error, max
+        error, error vs prediction horizon, and lead/lag. Report position error
+        in **units** and timing error in **ticks separately** — a one-tick
+        offset and a genuine position error are different defects.
+      - `trainer/test_projection_groundtruth.py` — a regression test carrying a
+        dozen recorded tick/position pairs inline. This would be the repo's
+        **first tier-(iii) test**: validated against recorded game data rather
+        than against itself.
+      - Reference log: `sandbox/Geometry Dash.app/Contents/geode/logs/Geode 2026-08-11 18.41.23.log`
+        (480 MOVE records). Note `sandbox/` is gitignored — re-capture with
+        `GDRL_SYNTH=1 GDRL_AUTOPLAY=1 GDRL_PROBE_MOVE=1 GDRL_BLOCK_INPUT=1 ./scripts/run_sandbox.sh`
+        if the log is gone.
+      - **First thing to check:** the one-tick activation dead time. Motion
+        starts at tick 234, not the activation tick 233. If the projector
+        assumes displacement begins at activation it leads by exactly one tick.
+
+- [ ] **Track 0.2 is untouched.** No `predictor_spec.md`, no test-evidentiary
+      audit, no independent validation of `SpeedProfile`/`UNITS_PER_TICK` was
+      written. The one real datum: at x=300 the predictor says arrival at tick
+      `300/1.298250437 = 231.08`; the trigger fired at 233. That 1.92-tick gap
+      is an **upper bound** on predictor error — it has not been decomposed into
+      predictor error vs GD's trigger-activation tick vs the newly-measured
+      one-tick activation dead time, and the dead time alone could account for
+      half of it.
 
 ---
 

@@ -951,6 +951,65 @@ Also settled: all 177 Fingerdash move triggers are touch-triggered, so none
 fire on the player crossing their x. Fingerdash cannot serve as the natural
 forward-projection test; synthetic levels remain the route.
 
+## Moving geometry: the move pipeline does not write the CCNode position
+
+**Validated against the running game.** `GDRL_PROBE_MOVE=1` on the synth level
+records a move trigger's effect per physics step.
+
+`GJBaseGameLayer::processMoveActions` → `moveObjects` (m1 `0x11acb0`) does, per
+object:
+
+```
+[obj + 0x3b0] += dx      ; double, m_positionX
+[obj + 0x3b8] += dy      ; double, m_positionY
+dirtifyObjectPos() / dirtifyObjectRect()
+```
+
+It **never calls `CCNode::setPosition`**. So `m_obPosition` — what
+`getPositionX/Y()` return — is untouched by the move pipeline. Anything reading
+object positions for telemetry must read `m_positionX`/`m_positionY`, as
+doubles, or it will observe moving geometry standing still.
+
+This is not adjacency reasoning. `GameObject::getRealPosition()` (m1 `0x4ecfc4`)
+is literally `ccp((float)*(double*)(this+0x3b0), (float)*(double*)(this+0x3b8))`
+— GD's own "where is this object really" accessor reads the same two fields. The
+probe also prints the runtime offset (`posOff=0x3b0`) rather than trusting the
+disassembly, and logs `cx`/`cy` (the CCNode shadow) alongside so the claim stays
+checkable: `cy` stayed pinned at `435.000000000` for all 480 ticks while `y`
+ramped to 525.
+
+### Measured motion
+
+Trigger `target=1 offX=0 offY=90 duration=2.0 easing=0`, block starting at
+y=435. Two independent GD launches, both giving:
+
+| quantity | measured |
+|---|---|
+| records | **480**, ticks **234 → 713**, 0 gaps, 0 duplicates |
+| displacement | 435 → 525 = **90.000000000** exactly |
+| per-tick `dy` | mean `0.187501179` (= 90/480), max deviation `7.63e-6` |
+| linearity | max residual `3.99e-4` units (4.4 ppm), rms `9.2e-5` |
+
+The residual is float32 accumulation in `m_deltaTimeInFloat`, not curvature —
+genuine easing would swing per-step `dy` by tens of percent. The final step is
+short (`0.186935425`) because `p = clamp(elapsed/duration, 0, 1)` lands the
+endpoint exactly on 90.0.
+
+**One tick of dead time at activation.** The command goes live at tick 233
+(`m_unkVector560` 0→1) but the first nonzero displacement is at tick **234**,
+and the last at **713 = 233 + 480**. The activation step itself produces zero
+displacement. A predictor that assumes motion begins on the activation tick will
+lead the game by exactly one tick.
+
+Scope: only `ActionType` 2 (y-move, linear easing) has been exercised.
+Rotation/transform and non-zero easing are unmeasured.
+
+### The live command container is `m_unkVector560`
+
+Measured 0 → 1 → 0 across the trigger's lifetime while the other six candidates
+stayed 0 throughout. It is `gd::vector<GroupCommandObject2>` **by value**, not
+by pointer.
+
 ## What still needs runtime verification
 
 None of this was measured on a running game — another agent held exclusive use
