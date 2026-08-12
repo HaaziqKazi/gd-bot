@@ -163,6 +163,7 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <string>
 #include <vector>
 
 using namespace geode::prelude;
@@ -201,22 +202,65 @@ namespace {
     // =======================================================================
     const bool g_probeCmdVec = envOn("GDRL_PROBE_CMDVEC");
 
-    // Probe D shares Probe A's prepareMoveActions emission point and gameplay
-    // discriminator. Sampling here is per physics step, not per frame -- a
-    // per-frame sample of a per-tick quantity is a measurement of the frame
-    // rate (README, "Two probe bugs worth not repeating").
+    // Probe D shares Probe A's gameplay discriminator (g_inGameplayUpdate) but
+    // NOT its emission point. It samples after GJBaseGameLayer::processMoveActions,
+    // which is where the displacement is actually written -- see the
+    // "WHAT ACTUALLY MOVES A BLOCK" note above the hook. Sampling is still per
+    // physics step, not per frame: processMoveActions' gameplay call site is
+    // inside update's fixed-step loop at update+0xa70, and a per-frame sample of
+    // a per-tick quantity is a measurement of the frame rate (README, "Two probe
+    // bugs worth not repeating").
     const bool g_probeMove = envOn("GDRL_PROBE_MOVE");
 
+    // Doubles, and specifically GameObject::m_positionX / m_positionY -- NOT
+    // CCNode::getPositionX()/getPositionY().
+    //
+    // This is the fix for the measured "MOVE count is ZERO for a whole run in
+    // which the move command was live for ~480 ticks" (TODO 0.1). The recorded
+    // hypothesis was a frame-ordering error (sample taken before the apply
+    // phase); that hypothesis is WRONG, and would not have explained the
+    // symptom anyway -- the probe diffs against the PREVIOUS step, so a
+    // one-phase lag would still have shown the ramp, merely shifted by a step.
+    //
+    // The real cause is a wrong-field error. GJBaseGameLayer::moveObjects
+    // (m1 0x11acb0, the only thing that applies a move command's displacement)
+    // does, per object, exactly:
+    //     [obj + 0x3b0] += dx      ; double, m_positionX
+    //     [obj + 0x3b8] += dy      ; double, m_positionY
+    //     GameObject::dirtifyObjectPos()   (m1 0x4eca14)
+    //     GameObject::dirtifyObjectRect()  (m1 0x4eca08)
+    // and nothing else -- it never calls CCNode::setPosition, so m_obPosition
+    // (what getPositionX/Y read) is untouched by the move pipeline. That those
+    // two offsets are m_positionX/m_positionY rather than something adjacent is
+    // not adjacency reasoning: GameObject::getRealPosition (m1 0x4ecfc4) is
+    // *literally* `return ccp((float)*(double*)(this+0x3b0),
+    // (float)*(double*)(this+0x3b8))`, i.e. GD's own accessor for "where is this
+    // object really" reads the same two fields the move writes.
+    // GameObject::quickUpdatePosition (m1 0x4ecfdc) is the one that pushes them
+    // into the CCNode, and it has 5 bl call sites, none of them per-object in
+    // the gameplay step loop.
+    //
+    // So m_positionX/m_positionY IS the observable quantity, and the CCNode
+    // position is a rendering shadow of it. Both are logged below so that
+    // claim is checkable from the log rather than taken on trust.
     struct MovePosition {
-        float x;
-        float y;
+        double x;    // GameObject::m_positionX
+        double y;    // GameObject::m_positionY
     };
     std::map<GameObject*, MovePosition> g_movePrevious;
     bool g_moveTriggerLogged = false;
 
+    // Per-attempt accounting, so "no MOVE lines" is distinguishable from "the
+    // hook never fired". A silent zero that could mean either is precisely the
+    // clean-looking negative this repo keeps paying for.
+    long g_moveSteps   = 0;
+    long g_moveRecords = 0;
+
     void resetMoveAttempt() {
         g_movePrevious.clear();
         g_moveTriggerLogged = false;
+        g_moveSteps   = 0;
+        g_moveRecords = 0;
     }
 
     void logMoveTriggerOnce(GJBaseGameLayer* layer, long tick) {
@@ -237,6 +281,46 @@ namespace {
                     trigger = dynamic_cast<EffectGameObject*>(obj);
                     if (trigger) break;
                 }
+            }
+        }
+
+        // Every object's group membership and BOTH position representations,
+        // once. Three things this makes checkable instead of assumed:
+        //  * that the intended target actually joined the trigger's group -- a
+        //    move command can go live (CMDVEC 0->1->0) against an EMPTY group
+        //    and produce exactly the same zero-MOVE-records symptom as reading
+        //    the wrong field, so the two have to be separable;
+        //  * that m_positionX/m_positionY sit at this build's +0x3b0/+0x3b8,
+        //    printed as a runtime byte offset rather than trusted from the
+        //    disassembly (the binding's field order is the only thing making
+        //    the mapping hold, and field adjacency has produced a wrong claim
+        //    in this repo before -- README, "Correction: m_currentStep");
+        //  * that the CCNode position (cx/cy) starts out agreeing with
+        //    m_positionX/Y, so a later divergence is attributable to the move
+        //    rather than to them never having agreed.
+        if (layer && layer->m_objects) {
+            const unsigned n = layer->m_objects->count();
+            for (unsigned i = 0; i < n; i++) {
+                auto* obj = static_cast<GameObject*>(layer->m_objects->objectAtIndex(i));
+                if (!obj) continue;
+
+                const long posOff =
+                    (long)((const char*)&obj->m_positionX - (const char*)obj);
+
+                std::string groups;
+                const int gc = (int)obj->m_groupCount;
+                for (int g = 0; g < gc && g < 10; g++) {
+                    if (!obj->m_groups) break;
+                    if (!groups.empty()) groups += '.';
+                    groups += std::to_string((int)(*obj->m_groups)[g]);
+                }
+                if (groups.empty()) groups = "-";
+
+                log::info(
+                    "[gdrl] MOVE-OBJ tick={} idx={} id={} x={:.9f} y={:.9f} "
+                    "cx={:.9f} cy={:.9f} groupCount={} groups={} posOff=0x{:x}",
+                    tick, i, (int)obj->m_objectID, obj->m_positionX, obj->m_positionY,
+                    obj->getPositionX(), obj->getPositionY(), gc, groups, posOff);
             }
         }
 
@@ -266,17 +350,22 @@ namespace {
             auto* obj = static_cast<GameObject*>(layer->m_objects->objectAtIndex(i));
             if (!obj) continue;
 
-            const MovePosition now{obj->getPositionX(), obj->getPositionY()};
+            const MovePosition now{obj->m_positionX, obj->m_positionY};
             auto [it, inserted] = g_movePrevious.emplace(obj, now);
             if (inserted) continue;  // per-attempt baseline, not movement
 
-            const float dx = now.x - it->second.x;
-            const float dy = now.y - it->second.y;
-            if (dx != 0.f || dy != 0.f) {
+            const double dx = now.x - it->second.x;
+            const double dy = now.y - it->second.y;
+            if (dx != 0.0 || dy != 0.0) {
+                // cx/cy are the CCNode position, carried alongside so the log
+                // itself shows whether the rendering shadow tracks the field
+                // the move pipeline writes. It is not the measurement.
                 log::info(
                     "[gdrl] MOVE tick={} id={} x={:.9f} y={:.9f} "
-                    "dx={:.9f} dy={:.9f}",
-                    tick, (int)obj->m_objectID, now.x, now.y, dx, dy);
+                    "dx={:.9f} dy={:.9f} cx={:.9f} cy={:.9f}",
+                    tick, (int)obj->m_objectID, now.x, now.y, dx, dy,
+                    obj->getPositionX(), obj->getPositionY());
+                g_moveRecords++;
             }
             it->second = now;
         }
@@ -406,7 +495,7 @@ namespace {
 // point of this probe.
 class $modify(GDRLProbeEffectManager, GJEffectManager) {
     void prepareMoveActions(float dt, bool intermediate) {
-        if (!g_probeCmdVec && !g_probeMove) {
+        if (!g_probeCmdVec) {
             GJEffectManager::prepareMoveActions(dt, intermediate);
             return;
         }
@@ -422,13 +511,6 @@ class $modify(GDRLProbeEffectManager, GJEffectManager) {
         if (!pl) return;   // guard: g_inGameplayUpdate implies a live PlayLayer, but never trust that
 
         const long tick = std::lround(pl->m_attemptTime * kTicksPerSec);
-
-        if (g_probeMove) {
-            logMoveTriggerOnce(pl, tick);
-            sampleMovedObjects(pl, tick);
-        }
-
-        if (!g_probeCmdVec) return;
 
         long sz[kNumCmdVecs];
         sz[0] = (long)m_unkVector518.size();
@@ -476,7 +558,66 @@ class $modify(GDRLProbeEffectManager, GJEffectManager) {
 // need the same per-tick vantage point -- pl->m_attemptTime, sampled inside
 // GJBaseGameLayer::update -- so they share this one hook rather than each
 // installing its own on the same function.
+// ---------------------------------------------------------------------------
+// WHAT ACTUALLY MOVES A BLOCK, and why Probe D samples here rather than after
+// prepareMoveActions.
+//
+// The motion pipeline inside update's fixed-step loop (README, "The motion
+// pipeline") splits into a prepare phase and an apply phase:
+//
+//   GJEffectManager::prepareMoveActions(dt, interm.)   update+0x9f8  (0x1233e0)
+//   ...
+//   GJBaseGameLayer::processMoveActions()              update+0xa70  (0x123458)
+//
+// prepareMoveActions steps the GroupCommandObject2s (that is the 0->1->0 on
+// m_unkVector560 the CMDVEC probe measured); it does not touch any GameObject.
+// processMoveActions is the apply phase: it walks the live command vector,
+// resolves each command's target group to a CCArray through the layer's group
+// table, and calls GJBaseGameLayer::moveObjects (m1 0x11acb0) with the
+// per-step delta, which is what writes m_positionX / m_positionY. See the
+// MovePosition comment for the field-level evidence.
+//
+// Hookability, re-measured against the cached arm64 disassembly rather than
+// inferred from the binding having an address (README, "an address is not a
+// call site"):
+//
+//   grep -cP '\tbl\t0x119c0c$' gd_arm64.asm   -> 2   processMoveActions
+//   grep -cP '\tb\t0x119c0c$'  gd_arm64.asm   -> 0
+//
+// and the two call sites are
+//   0x11840c  inside GJBaseGameLayer::processMoveActionsStep (0x118368), whose
+//             own single caller is loadUpToPosition -- the level-SEEK path, as
+//             already established; NOT gameplay.
+//   0x123458  inside GJBaseGameLayer::update, == update+0xa70, exactly the
+//             pipeline slot above.
+// So the gameplay call is a direct `bl` to a non-inlined function: live, and a
+// Geode entry hook on it fires. g_inGameplayUpdate separates the two call
+// sites for the same reason it does for prepareMoveActions.
+//
+// Sampling here rather than after prepareMoveActions also removes a one-step
+// phase lag: the value read is the one this step's apply phase just wrote, so
+// a MOVE record's tick is the tick the displacement happened on rather than
+// the tick after.
 class $modify(GDRLProbeBaseGameLayer, GJBaseGameLayer) {
+    void processMoveActions() {
+        GJBaseGameLayer::processMoveActions();
+
+        if (!g_probeMove) return;
+
+        // Seek-path call (loadUpToPosition -> processMoveActionsStep) -- not
+        // gameplay.
+        if (!g_inGameplayUpdate) return;
+
+        auto* pl = PlayLayer::get();
+        if (!pl) return;
+
+        const long tick = std::lround(pl->m_attemptTime * kTicksPerSec);
+        g_moveSteps++;
+
+        logMoveTriggerOnce(pl, tick);
+        sampleMovedObjects(pl, tick);
+    }
+
     void update(float dt) {
         if (!g_probeCmdVec && !g_probeMove && !g_probeForceVehicle) {
             GJBaseGameLayer::update(dt);
@@ -573,6 +714,15 @@ class $modify(GDRLProbePlayLayer, PlayLayer) {
                 g_cvMax[3], g_cvMax[4], g_cvMax[5], g_cvMax[6]);
         }
 
+        // Emitted even when steps==0, unlike CMDVEC-SUM: for Probe D the
+        // interesting failure is precisely "the hook never fired", and a
+        // summary suppressed in that case cannot report it.
+        if (g_probeMove) {
+            log::info("[gdrl] MOVE-SUM lvl={} steps={} records={} tracked={}",
+                      g_gdrlLevelID, g_moveSteps, g_moveRecords,
+                      (long)g_movePrevious.size());
+        }
+
         PlayLayer::resetLevel();
 
         if (g_probeCmdVec)      resetCmdVecAttempt();
@@ -594,8 +744,9 @@ $execute {
                    g_forceVehicle, vehicleNameFor(g_forceVehicle), g_forceVehicleTick);
     }
     if (g_probeMove) {
-        log::info("[gdrl] PROBE_MOVE on -- sampling m_objects after each gameplay "
-                  "physics-step prepareMoveActions call");
+        log::info("[gdrl] PROBE_MOVE on -- sampling GameObject::m_positionX/Y "
+                  "(NOT CCNode getPositionX/Y) over m_objects after each "
+                  "gameplay physics-step processMoveActions call");
     }
 }
 
