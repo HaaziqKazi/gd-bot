@@ -3,7 +3,7 @@
 Single place for what is left. Companion to `README.md`, which records what has
 been **established**; this file records what has **not**.
 
-Status as of commit `05dbf85`.
+Status as of commit `fc28dbd` + the 901 resolution below.
 
 ---
 
@@ -51,12 +51,13 @@ evidentiary value. Both need external, game-grounded ground truth.
 arrives. The maths is implemented and `test_trajectory.py` passes 48 tests — all
 of which compare the predictor against Python fixtures, **none against GD**.
 
-Blocker: there is no reachable move trigger. The census found exactly four in
-all 21 main levels (Fingerdash, x=7813–8455, all touch-triggered) against a best
-reach of x=3959. Synth would create one, but object 901 is rejected (→ 1.1).
+**The blocker is GONE.** It rested on the census, which walks the section grid
+and cannot see triggers at all. Measured directly off `m_objects`, the synthetic
+move trigger loads fine — `OBJLIST-ID id=901 n=1 firstX=300.0`. A reachable,
+x-activated move trigger therefore already exists in the synth level, at x=300,
+well inside the proven reach of x=3959.
 
-- [ ] Unblock a reachable move trigger (via 1.1, or find another route:
-      checkpoint/`loadUpToPosition` seek, spawn near Fingerdash's triggers).
+- [x] Unblock a reachable move trigger — done, see 1.1a.
 - [ ] Capture per-tick ground truth: object position each tick from telemetry.
 - [ ] Compare predicted position at player-arrival tick vs observed position.
 - [ ] Quantify: mean error, max error, does error grow with horizon, does it
@@ -97,15 +98,17 @@ position even if the object model is perfect.
 
 Highest unblock-per-hour. Two of these are available right now with no new work.
 
-### 1.1 Fix the synth move trigger (object id 901)  — BLOCKER
+### 1.1 Synth move trigger (object id 901)  — RESOLVED, was never broken
 
-Object 901 is rejected by the level parser; every other object loads. Two
-hypotheses already tested and **falsified**: compression is not the cause (raw
-and compressed censuses are identical), and the header/object boundary is not
-the cause (a sacrificial first block loaded fine while 901 still did not).
+**Object 901 was never rejected.** It loads at exactly the requested x. Three
+hypotheses were tested against it over two sessions — compression, the
+header/object boundary, and the property encoding — and all three were
+falsified, because the symptom being explained was an artifact of the measuring
+instrument rather than a real defect.
 
-What is left is the trigger's **property encoding, which was written from
-memory** — the half-remembered-table failure this repo has already paid for.
+The lesson is the repo's own rule applied one level up: *the census answers "is
+this object in the section grid", which is not the same question as "did this
+object load", and the two only coincide for collision geometry.*
 
 - [x] **Build the dumper.** `mod/src/level_dump.cpp` + `.hpp`, gated on
       `GDRL_DUMP_LEVEL=<id>`, default off. Decompresses `m_levelString` (falls
@@ -146,20 +149,17 @@ wrong too (real range is x = 1 … 24993).
 
 So "901 is absent from the census" was never evidence that 901 failed to load.
 
-- [ ] **Determine whether 901 actually loads**, using an instrument that is not
-      the section grid. Current synth run (`GDRL_SYNTH=1 GDRL_CENSUS=1`) gives:
-      `11 objects declared, m_objects=13, section-walk=14, distinctIds=11`,
-      and 901 appears in **neither** `CENSUS-ID` nor `CENSUS-EFFECT` (8 effects
-      listed, none 901). But `m_objects=13` is consistent with all 11 declared
-      objects loading plus 2 GD-added — so the count says loaded and the
-      enumerations say not. **This ambiguity is the actual open question.**
-      Resolve it by iterating `m_objects` directly and printing every
-      `m_objectID`, rather than by any section-grid walk.
-- [ ] If 901 does load, the whole "blocked on content" framing dissolves and
-      Track 0.1 is unblocked immediately.
-- [ ] If it genuinely does not load, suspect something other than the property
-      keys — a missing group definition for target group 1, or the trigger
-      needing an object in its target group to exist first.
+- [x] **901 LOADS. Measured, not inferred.** Added `runObjectListCensus`
+      (`probes.cpp`), which walks `m_objects` directly and prints every
+      `m_objectID`. Under `GDRL_SYNTH=1 GDRL_CENSUS=1`:
+      ```
+      OBJLIST m_objects=13 distinctIds=11
+      OBJLIST-ID id=901   n=1    firstX=300.0
+      ```
+      The move trigger is present at exactly the requested x. It was never
+      rejected by the parser; it is simply absent from the section grid, which
+      is what the census walks. **The "blocked on content" framing is dissolved
+      and Track 0.1 is unblocked.**
 
 ### 1.1b Fingerdash is not a usable natural test after all
 

@@ -934,8 +934,18 @@ encoding in `synth.cpp` was also suspected of being wrong "because it was
 written from memory"; comparing it against the dump above shows its keys
 (`1, 2, 3, 51, 10, 28, 29, 30`) are all correct.
 
-Whether 901 loads is therefore **still open**, and needs an instrument that
-iterates `m_objects` directly. See TODO 1.1a.
+`runObjectListCensus` (`probes.cpp`, runs with `GDRL_CENSUS=1`) walks
+`m_objects` directly and settles it:
+
+```
+OBJLIST m_objects=13 distinctIds=11
+OBJLIST-ID id=901   n=1    firstX=300.0
+```
+
+**The synthetic move trigger loads correctly, at exactly the requested x.** It
+was never rejected. Use `OBJLIST-ID` rather than `CENSUS-ID` to ask whether an
+object loaded; the latter answers a different question (is it in the section
+grid) that happens to coincide for collision geometry and not for triggers.
 
 Also settled: all 177 Fingerdash move triggers are touch-triggered, so none
 fire on the player crossing their x. Fingerdash cannot serve as the natural

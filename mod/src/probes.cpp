@@ -161,6 +161,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <map>
 #include <vector>
 
 using namespace geode::prelude;
@@ -573,8 +574,45 @@ namespace {
         float minX    = 0.f;
     };
 
+    // Walk m_objects directly, not the section grid.
+    //
+    // The section walk below is not a valid instrument for triggers. It reported
+    // 4 move triggers across all 21 main levels while Fingerdash's level string
+    // alone holds 177 -- a 44x undercount -- because triggers are not collision
+    // geometry and are not reliably bucketed into m_sections. Every conclusion
+    // about whether a synthetic object "loaded" that rested on the section walk
+    // is therefore unfounded, including the recorded claim that object 901 is
+    // rejected by the parser.
+    //
+    // m_objects is the array GD itself builds from the level string, so it
+    // answers the loading question directly.
+    void runObjectListCensus(GJBaseGameLayer* layer) {
+        if (!layer || !layer->m_objects) {
+            log::error("[gdrl] OBJLIST no m_objects");
+            return;
+        }
+
+        std::map<int, std::pair<int, float>> byId;   // id -> (count, first x)
+        const unsigned n = layer->m_objects->count();
+        for (unsigned i = 0; i < n; i++) {
+            auto* obj = static_cast<GameObject*>(layer->m_objects->objectAtIndex(i));
+            if (!obj) continue;
+            const int id = obj->m_objectID;
+            auto it = byId.find(id);
+            if (it == byId.end()) byId.emplace(id, std::make_pair(1, obj->getPositionX()));
+            else                  it->second.first++;
+        }
+
+        log::info("[gdrl] OBJLIST m_objects={} distinctIds={}", n, byId.size());
+        for (auto const& [id, v] : byId) {
+            log::info("[gdrl] OBJLIST-ID id={:<5} n={:<4} firstX={:.1f}",
+                      id, v.first, v.second);
+        }
+    }
+
     void runCensus(GJBaseGameLayer* layer) {
         if (!layer) return;
+        runObjectListCensus(layer);
 
         // objectID is a short in the bindings; 4096 covers every id GD 2.2
         // ships and the bound below is checked rather than assumed, so an id
