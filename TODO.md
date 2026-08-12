@@ -331,6 +331,40 @@ Decisions).
 
 ---
 
+## Corrections from independent validation (2026-08-11)
+
+- [ ] **There is NO automated test asserting the mod's defaults are inert.**
+      This claim has been repeated in commit messages, agent briefs and code
+      comments, and it is false. The Python suite (`test_env`,
+      `test_conditioning`, `test_trajectory`, `test_schema`) is pure Python and
+      reads nothing from `mod/`. The only evidence that `GDRL_*` switches
+      default to off is the README's 29-attempt run. **Stop citing a guard that
+      does not exist** — either write one, or describe the evidence accurately.
+      Writing one is not trivial: it means launching GD twice and diffing an
+      attempt trace, so it belongs with the cross-process work in 2.3.
+- [ ] **`MOVE-SUM` has never been observed with non-zero counters.** The synth
+      level has no hazard, so autoplay never dies, so `resetLevel` never runs
+      during gameplay — the only `MOVE-SUM` emitted is the pre-gameplay
+      `steps=0 records=0 tracked=0`. The accounting exists precisely to
+      distinguish "hook never fired" from "nothing moved" and is itself
+      untested at runtime. Add a hazard to the synth level, or force a reset.
+- [ ] **The `processMoveActions` detour is now installed unconditionally.** Its
+      body early-returns on `!g_probeMove`, so behaviour is inert, but it is a
+      new always-present trampoline where there was none. Offsetting: the
+      `prepareMoveActions` hook became *less* eager (now gated on
+      `g_probeCmdVec` alone).
+- [ ] `MOVE-OBJ` dumps every object once per attempt — 13 lines on synth, but
+      ~2400 on Stereo Madness. Cap it before running there.
+
+### Partial evidence toward Track 2.3 (cross-process determinism)
+
+Two **separate GD launches** produced **byte-identical** 480-line MOVE traces
+(`diff` clean). That is the first cross-process determinism evidence in the
+repo. It covers a *moving-object* trace, not a player trajectory, so it is
+suggestive rather than closing 2.3 — but it is real, and it was free.
+
+---
+
 ## Known gaps and hygiene
 
 - [ ] **Dual mode conditioning.** Schema now carries player 2, but confirm
