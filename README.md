@@ -987,8 +987,17 @@ y=435. Two independent GD launches, both giving:
 |---|---|
 | records | **480**, ticks **234 → 713**, 0 gaps, 0 duplicates |
 | displacement | 435 → 525 = **90.000000000** exactly |
-| per-tick `dy` | mean `0.187501179` (= 90/480), max deviation `7.63e-6` |
-| linearity | max residual `3.99e-4` units (4.4 ppm), rms `9.2e-5` |
+| per-tick `dy` | mean `0.187500000` over all 480; `0.187501179` over the 479 **non-final** steps. Logged dy sum to `89.999999990`. Max deviation `7.63e-6` |
+| linearity, vs the **least-squares** fit | max residual `3.99e-4` units, rms `9.2e-5` |
+| linearity, vs the **theoretical** line `435 + 90(t−233)/480` | max residual `5.646e-4` units, rms `2.224e-4` |
+
+Two corrections to earlier revisions of this table, both from
+`trainer/validate_projection.py` (see TODO.md, session 2026-08-12). This table
+once annotated `0.187501179` as `(= 90/480)`; `90/480` is `0.1875` exactly, and
+the two are different quantities. And it quoted only the least-squares residual
+without saying so — that figure is ~4× smaller than the theoretical-line one
+purely because the fit absorbs the constant part of the float32 drift. Both fits
+are legitimate; which one is meant has to be stated.
 
 The residual is float32 accumulation in `m_deltaTimeInFloat`, not curvature —
 genuine easing would swing per-step `dy` by tens of percent. The final step is
@@ -1003,6 +1012,14 @@ lead the game by exactly one tick.
 
 Scope: only `ActionType` 2 (y-move, linear easing) has been exercised.
 Rotation/transform and non-zero easing are unmeasured.
+
+**This dataset has since been used to validate `trainer/trajectory.py` against
+the game** — the repo's first tier-(iii) validation. The motion model is exact;
+the predictor's *fire tick* was 1.9198 ticks early, and that gap decomposes with
+no residual into a `U·t` vs `U·(t−1)` origin convention error plus the
+continuous-vs-integer tick gap. Crossing-to-activation latency is **0**, and the
+one tick of dead time above is a separate, downstream effect on object
+displacement. See TODO.md, session 2026-08-12, sections A–C.
 
 ### The live command container is `m_unkVector560`
 

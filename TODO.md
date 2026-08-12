@@ -3,7 +3,11 @@
 Single place for what is left. Companion to `README.md`, which records what has
 been **established**; this file records what has **not**.
 
-Status as of commit `fc28dbd` + the 901 resolution below.
+Status as of commit `41b5eb7` + the 2026-08-12 session below.
+
+> **Read "Session 2026-08-12" first.** It closes Track 0.1, and it invalidates
+> the "READY NOW" labels on Tracks 1.2 and 1.3 — the synth portals have never
+> fired, on any run, ever.
 
 ---
 
@@ -24,7 +28,7 @@ decided yet.
 | Throughput | **~11.5×** baseline (0.35 → 3.9 attempts/sec) |
 | Unattended running | **Proven** — `GDRL_WINDOWED`, 0.41/s unfocused |
 | Binary env transport | **Built + validated** — defaults clean, observation passive |
-| Forward projection (Objective B) | **Built, untested against a real moving object** |
+| Forward projection (Objective B) | **Validated against recorded game data** — motion model exact, fire tick was 1.9198 ticks early; see 2026-08-12 |
 | Conditioning (Objective A) | **Built; only flag-decode validated, never a real portal crossing** |
 | Hold duration (Objective C) | **Untouched** |
 | In-context failure memory (Objective D) | **Nothing** |
@@ -212,7 +216,12 @@ needs. Synth remains the route.
 **Unblocks:** items 1, 4, 5, 6, 7 of the runtime-verification backlog below, and
 all validation of `trainer/trajectory.py` against a real moving object.
 
-### 1.2 Measure the four unmeasured speed buckets  — READY NOW
+### 1.2 Measure the four unmeasured speed buckets  — **BLOCKED** (was "READY NOW")
+
+**The portals have never fired.** See 2026-08-12; blocked on the synth portal y
+fix. The claim below that "synth's speed portals already land at exactly the
+requested x" is true as a *placement* claim and was doing silent duty as a
+*functional* one.
 
 Synth's speed portals already land at exactly the requested x. Only 1×
 (`1.298250437` units/tick) is this repo's own measurement; 0.5×/2×/3×/4× are
@@ -224,7 +233,10 @@ horizon is a third of a tile.
 - [ ] `dx = x[t+1] - x[t]` on the tick after the portal.
 - [ ] Replace the four unverified constants in `UNITS_PER_TICK`.
 
-### 1.3 Cross a real vehicle portal  — READY NOW
+### 1.3 Cross a real vehicle portal  — **BLOCKED** (was "READY NOW")
+
+The ship portal at x=4500 was crossed at x-level on 2026-08-12 and produced no
+`MODE` line and no `COND` edge. Same root cause as 1.2.
 
 Synth's ship portal lands correctly. Objective A is currently validated only at
 the **flag-decode** level via `GDRL_FORCE_VEHICLE`. A real portal also sets
@@ -341,7 +353,233 @@ Decisions).
 
 ---
 
-## NEXT SESSION — start here
+## Session 2026-08-12 — Track 0.1 closed, two new bugs found
+
+Run under an orchestrator + implementer/tester split (`.claude/agents/`). Two
+long measurement runs; the two most valuable results came from an agent
+reporting its assigned task was *impossible*, and from an agent flagging a hole
+in its own headline finding.
+
+### A. Forward projection is validated. The defect is timing, not position.
+
+`trainer/validate_projection.py` drives `ForwardProjector` against the 480
+recorded `MOVE` records. The predictor **led the game by 1.9198 ticks =
+0.35998 units**, constant across all 463 observation ticks.
+
+| constant delay applied | mean abs error (units) | in ticks |
+|---|---|---|
+| none | 3.5998e-01 | 1.9199 |
+| 1 tick | 1.7248e-01 | 0.9199 |
+| 2 ticks | 1.5022e-02 | 0.0801 |
+| 1.91970 ticks | **3.433e-05** | 0.0002 |
+
+One constant shift collapses the residual **below the game's own float32 noise
+floor** (1.393e-4 mean / 5.646e-4 max vs the theoretical line). Error vs horizon
+is **flat, not a ramp** — the signature of a fixed activation offset, where an
+accumulating integration error would ramp. The live-command path is clean:
+1.555e-4 units mean over 3843 (T,h) pairs, lagging ~6 ppm because GD accumulates
+elapsed time in float32 and the predictor uses float64.
+
+**So the motion model and the shape of the motion are right.** Only the fire
+tick was wrong. For this linear trigger the two error kinds are not independent
+(lead × 0.1875 units/tick); they would decouple on an eased trigger.
+
+Activation tick re-derived **from the displacement record alone**, with no splice
+from the other launch: inverting the linear law at each of the 480 records gives
+`a = 232.99934`, range [232.99699, 233.00020], sd 9.85e-4 — agreeing with the
+`GDRL_PROBE_CMDVEC` value of 233 to 0.00066 ticks.
+
+- [x] Compare predicted vs observed position. Done.
+- [x] Quantify mean/max error, error vs horizon, lead/lag. Done, above.
+- [x] Land a deterministic regression test carrying the recorded dataset —
+      `trainer/test_projection_groundtruth.py`, 40 tests, the repo's **first
+      tier-(iii) test**, with the data in `trainer/groundtruth_move_synth.py`
+      as plain Python (a `.log` fixture would be silently untracked by
+      `.gitignore`'s bare `*.log` rule).
+- [ ] **Audit of that test was stopped mid-run.** Its last unresolved concern,
+      verbatim: the headline test "interpolates truth across a 73-tick gap"
+      between recorded fixture points. Resolve before trusting the tolerance.
+
+### B. The 1.9198 ticks decompose exactly. Crossing-to-activation latency is 0.
+
+Measured off the `GDRL_ENV` channel, 57,009 observations, one attempt to level
+completion (x=0 → 6041, tick 1 → 4653):
+
+- **Start x is 0.0 exactly.** The alternative explanation — a player starting at
+  x = −2.492 would reach x=300 at exactly tick 233, making the predictor right
+  and the defect a coordinate-origin error — is **falsified**. No spin-up ramp
+  either: dx is `1.298250436782837` from the very first step.
+- **The origin convention is `x(t) = U·(t−1)`, not `U·t`.**
+  `max|x − U·(t−1)| = 0.2597` vs `max|x − U·t| = 1.3135` (a whole tick).
+- **The crossing:** tick 232 → x=299.8955078125 (short); tick 233 →
+  x=301.1937561035156. GD activates on the **first integer tick at which the
+  player's own sampled x ≥ the trigger x**.
+
+`233 − 231.08022266 = 1.91977734` = **1.0000** tick of origin convention +
+**0.91978** of continuous-vs-integer. No residual. Correct rule:
+`fire_tick = 1 + ceil(x_target / U)`.
+
+**`CROSSING_TO_ACTIVATION_TICKS_UNVERIFIED = 1` in the fixture should become 0** —
+that 1 was the origin error double-counted as latency. The separate one-tick
+*object-displacement* dead time (activation 233, first displacement 234) is
+downstream and unaffected.
+
+**This corrects TODO's own prior claim** that the dead time "could account for
+half" the gap. It accounts for **none** of it: the dead time is already
+structurally present in the predictor's pending path (`elapsed = max(0, ...)`
+yields p=0 on the fire tick), so subtracting a tick for it would double-count
+and overshoot.
+
+### C. Player x is float32-accumulated — tier (iv)
+
+`x[n+1] = float32(x[n] + float32(U))` reproduces **all 4,653 samples
+bit-exactly**; a double accumulator with a float32 store does not. So per-tick
+dx is piecewise constant *per float32 binade* — it takes 9 distinct values across
+the run, spread 1.2207e-4 (9.4e-5 relative). **That is the instrument, not
+variable speed.** Rounding is upward-biased, so real x runs ahead of `U·t` by
++0.2597 units after 4,652 ticks (+6.9e-5/tick above x=4096) — deterministic
+drift, not noise, and ~0.03 units at a 400-tick horizon.
+
+1× reproduced as `1.298250436782837` = `float32(1.298250437)` bit-for-bit, and
+cross-checked **bit-identical** against README's Stereo Madness null-input
+`maxX = 507.615234375` — different level, different probe, ~550 attempts old. So
+player-x motion is not perturbed by the telemetry pass, and the method that
+returned the negative result below is sound.
+
+### D. BUG: every synth portal is 90 units too high and has never fired
+
+Every synth object's runtime `m_positionY` is its level-string y **+ 90**,
+confirmed 4-for-4 across distinct values, read at `m_positionX/Y`:
+
+| synth level-string y | runtime y |
+|---|---|
+| 585 (`kGroundY+480`) | 675 |
+| 345 (`kGroundY+240`) | 435 |
+| 105 (`kGroundY` — all 5 speed portals + the ship portal) | **195** |
+| 45 (`kGroundY-60`) | 135 |
+
+`synth.hpp`'s `kGroundY = 105.f` is written as if the level string were runtime
+coordinates. The player runs at runtime y=105 (measured constant, 4,653 ticks,
+`onGround=1` for 4,652, never jumped). Portal centre is therefore 90 units above
+player centre; cube half-height 15 puts the player rect at y ∈ [90,120], so
+overlap needs portal half-height > 75. Speed portals are nowhere near 150 tall.
+
+Consequence: `m_playerSpeed = 0.8999999761581421` on **all 57,009 observations**,
+past every speed portal (1200/1800/2400/3000/3600) and the ship portal (4500),
+out to x=6041. Zero `COND` edges after step 0, zero `MODE` lines.
+
+- [ ] **Fix: place the five speed portals and the ship portal at level-string
+      y = 15** so runtime y = 105. Do **not** blanket-shift `kGroundY` — the move
+      trigger's x-crossing activation at tick 233 is the one measurement that
+      currently works end to end and its y must not be disturbed.
+- [ ] The y-misplacement is *sufficient* and quantitatively established; that it
+      is the *only* cause is only decidable by the rerun. Do not claim the
+      portals work until one has fired.
+- [ ] `synth.hpp`'s header comment still cites the falsified "four move triggers
+      across 21 levels" census number as justification for generating content.
+      Correct or remove it.
+
+### E. BUG: `m_sectionXFactor` is inverted, collapsing the ENV object window to 0.64 units
+
+`mod/src/telemetry.cpp:591-606` treats `m_sectionXFactor` as a **divisor**. The
+live value is **0.01** — a multiplier, i.e. `1/width`. Section index is
+`floor(x · sxf)`, not `floor(x / sxf)`. With `col1` clamped to `col0 + 63`,
+`maxX` becomes `64 × 0.01 = 0.64`, so the advertised window is `[px − 400, 0.64]`.
+
+Evidence: `objectCount = 0` on **4,344 of 4,653** gameplay ticks; max ever 3;
+only 3 distinct objects ever entered, all at x=0.0 — on a 13-object level
+spanning x=0–6340. Objects at x=0 stayed visible for exactly 309 ticks, and
+`400 / 1.298250437 = 308.1`. `telemetry.cpp`'s own UNVERIFIED note (5) posed
+this exact question; the answer had been in the logs since 2026-08-11.
+
+**This blocks every object-window consumer** — Objective A conditioning and all
+`trajectory.py` validation against real geometry — not just the speed work.
+
+- [ ] Do not blind-flip the operators. Measure `m_sectionXFactor` directly and
+      **also `m_sectionYFactor`** — if y is inverted too, the vertical window has
+      the same defect and nobody has looked.
+- [ ] Cross-check the arithmetic two independent ways: against the documented
+      `section index = floor(x/100)`, and against `m_sections.size()` vs level
+      length.
+- [ ] **The `100.f` fallback only makes sense under the divisor reading** and is
+      wrong by 10,000× under the multiplier one. Prefer failing loudly to a new
+      magic constant: a column the coverage mask cannot speak for must not sit
+      inside the region Python is told was scanned, or "unknown" silently
+      becomes "empty".
+- [ ] Check whether `trainer/schema.py` / `env.py` read the header's
+      `sectionXFactor` and would be affected.
+
+### F. The `GDRL_ENV` transport had never been run against the live game
+
+Zero `[gdrl] ENV` lines exist in any of the 52 surviving logs (26,932 lines)
+before today. It works: 57,009 published steps, and on all rows
+`timeouts=0 leaked=0 uiEvents=0 blocked=0 status=OK inputVerdict=CLEAN`, with
+`obs.problems()` empty on the first frame.
+
+### G. Further corrections to README / TODO
+
+1. **README ~993 annotates `0.187501179` as `(= 90/480)`.** `90/480 = 0.1875`
+   exactly. `0.187501179` is the mean over the **479 non-final** steps; over all
+   480 it is `0.187500000`, and the logged dy sum to `89.999999990`. *Confirmed
+   independently.*
+2. **README's linearity residual (3.99e-4 max / 9.2e-5 rms) is a least-squares
+   fit.** Against the *theoretical* line `435 + 90(t−233)/480` it is
+   **5.646e-4 max / 2.224e-4 rms**. Both are real; README does not say which fit
+   it used, and the lsq figure is ~4× smaller only because the fit absorbs the
+   constant part of the float32 drift. Both are in the fixture under distinct
+   names.
+3. **`trajectory.py:409` encodes `311.58 / TICK_HZ = 1.298250000` under a comment
+   citing "measured: 1.298250437".** The code does not carry the number it
+   cites — 0.34 ppm, 1e-4 units over 231 ticks. Named so it is not rediscovered
+   as a bug. *Confirmed independently.*
+4. **A trailing dead step.** CMDVEC removes the command at 715 while the last
+   displacement is 713, so tick 714 was also live-but-zero. README records
+   `713 = 233 + 480` but not the trailing idle step.
+5. **`ForwardProjector`'s default `horizon_ticks=240` is only 311.6 units** —
+   less than the reference target's x=600. At the default the arrival tick clamps
+   and the projection silently answers a different question. Not a bug; a trap.
+6. **README's null-input death pair `maxX=507.615234375, tick 391`** is one tick
+   off the ENV channel's convention — that x is the ENV run's tick-**392**
+   sample, bit-identical. Both are right in their own frame (post-physics x at
+   tick n = pre-physics x at tick n+1), but nothing states which frame `maxX` is
+   in.
+7. **The census has only ever been run on the synth level.** `CENSUS lvl=0` is
+   the only census line in all 52 logs, so the "censusing all 21 levels" results
+   quoted in `synth.hpp` and README are not reproducible from surviving evidence.
+
+### Still UNVERIFIED after this session
+
+`UNITS_PER_TICK` indices 0/2/3/4; telemetry passivity for anything other than
+player x; whether the observation is pre- or post- the player's *own*
+integration (the fixed sample point makes dx correct either way, but
+portal-crossing attribution will need it once portals fire); whether the mod's
+defaults are inert (still no automated test — see "Corrections from independent
+validation"); non-zero easing; rotation/transform (`ActionType` 3/4); non-unit
+`m_moveMod*`; lock flags; spawn delays; multiple commands on one group;
+multi-group `MOVE-OBJ` parsing (the log only ever has groupCount 0 or 1);
+whether `m_alreadyUpdated` (+0x1b0) is the dead-time mechanism.
+
+### Queue for next session, in order
+
+1. **Fix D and E** (both C++, one agent — concurrent `geode build`s race).
+   D unblocks Tracks 1.2 and 1.3; E unblocks every object-window consumer.
+2. **Finish the stopped audit of `test_projection_groundtruth.py`** — the
+   73-tick-interpolation concern in A.
+3. **Correct `trajectory.py`'s arrival-tick model** per B and C: `(t−1)` origin,
+   float32 accumulation, zero crossing latency. Not before 2, since the audit
+   owns those files.
+4. **Rerun the speed measurement** once D lands — the tester's method reproduces
+   all four buckets in one ~20s attempt with no further work.
+5. Then Track 0.2 (predictor spec + test-tier audit), which A and B now feed.
+
+Task #8 (a synth trigger at x=300.65, arrival 231.5809, frac 0.58) is **largely
+superseded**: the activation mechanism is now measured directly rather than
+inferred, so no rule-guessing is needed. Residual value only if the float32
+crossing model in 3 leaves the `ceil`-vs-`round` question open.
+
+---
+
+## Previous session's next-step notes (superseded by the above)
 
 Ground truth for forward projection now **exists** and is committed. The
 comparison itself has **not been run** — that is the immediate next task.
