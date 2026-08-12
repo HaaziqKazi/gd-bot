@@ -904,11 +904,42 @@ Defaults are inert: with the variable unset the mod behaves exactly as before.
 It refuses to write when fewer than 10 objects decode, so a
 `dontGetLevelString=true` level cannot produce authoritative-looking evidence.
 
-**Status: implemented and compiling, never executed.** These are assumptions
-nobody has checked against a real level yet — the `;` heuristic used to decide
-whether the string is already decompressed, the
-`ZipUtils::decompressString(s, false, 0)` argument choice, and that property key
-`1` carries the object id.
+**Status: validated against a real level.** `GDRL_DUMP_LEVEL=21` decoded
+Fingerdash — 27283 objects, 177 move triggers. Every assumption held: the `;`
+heuristic, the `ZipUtils::decompressString` call, and property key `1` as the
+object id.
+
+A real move trigger, verbatim:
+
+```
+1,901,2,15,3,135,36,1,51,4,28,-60,29,0,10,4,30,0,85,2
+```
+
+key 1 = object id, 2 = x, 3 = y, 36 = touch, 51 = target group, 28 = moveX,
+29 = moveY, 10 = duration, 30 = easing, 85 = easing rate.
+
+## The census undercounts triggers by 44x — do not use it to detect them
+
+`runCensus` walks `layer->m_sections`, the section grid (`probes.cpp:541`).
+Triggers are not collision geometry and are not reliably in it.
+
+Measured: the census reported **4** move triggers across all 21 main levels. The
+level string for Fingerdash **alone** contains **177**, spanning x = 1 … 24993
+rather than the census's 7813–8455.
+
+This matters beyond bookkeeping. The recorded blocker "synthetic object 901 is
+rejected by the parser" rested entirely on 901 being absent from the census —
+and absence from the section grid is not evidence about loading. The property
+encoding in `synth.cpp` was also suspected of being wrong "because it was
+written from memory"; comparing it against the dump above shows its keys
+(`1, 2, 3, 51, 10, 28, 29, 30`) are all correct.
+
+Whether 901 loads is therefore **still open**, and needs an instrument that
+iterates `m_objects` directly. See TODO 1.1a.
+
+Also settled: all 177 Fingerdash move triggers are touch-triggered, so none
+fire on the player crossing their x. Fingerdash cannot serve as the natural
+forward-projection test; synthetic levels remain the route.
 
 ## What still needs runtime verification
 

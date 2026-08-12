@@ -115,16 +115,64 @@ memory** — the half-remembered-table failure this repo has already paid for.
       write if fewer than 10 objects decode, so a `dontGetLevelString=true`
       level cannot produce authoritative-looking evidence. Builds green and
       universal (`x86_64 arm64`).
-- [ ] **NEXT STEP — run it.** It has never been executed. Invocation:
-      `GDRL_DUMP_LEVEL=21 ./scripts/run_sandbox.sh` (21 = Fingerdash), then read
-      `sandbox/home/Library/Application Support/GeometryDash/geode/mods/gdrl.probe/level-21-move-901.txt`.
-      Expect four move triggers at x = 7813–8455. **UNVALIDATED**: the `;`
-      heuristic for detecting already-decompressed strings, the
-      `ZipUtils::decompressString(s, false, 0)` argument choice, and whether
-      property key `1` is really the object id in this format are all
-      assumptions Codex made and nobody has checked against a real level.
-- [ ] Read the actual property IDs off it; do not reconstruct from memory.
-- [ ] Re-encode 901 in `mod/src/synth.cpp` and confirm it appears in the census.
+- [x] **Ran it.** `GDRL_DUMP_LEVEL=21 ./scripts/run_sandbox.sh` → **27283 objects,
+      177 move triggers**, written to `level-21.txt` and `level-21-move-901.txt`.
+      All of Codex's assumptions held: the `;` heuristic, the
+      `ZipUtils::decompressString` call, and property key `1` as the object id.
+- [x] **Read the real property IDs.** A real Fingerdash move trigger:
+      ```
+      1,901,2,15,3,135,36,1,51,4,28,-60,29,0,10,4,30,0,85,2
+      ```
+      key 1=id, 2=x, 3=y, 36=touch, 51=target group, 28=moveX, 29=moveY,
+      10=duration, 30=easing, 85=easing rate. Also seen: 20 (103×), 61 (68×),
+      57, 62, 58, 59.
+
+### 1.1a THE BLOCKER'S PREMISE IS WRONG — re-diagnose before re-encoding
+
+Two measurements taken this session contradict the recorded diagnosis.
+
+**(a) `synth.cpp`'s property encoding is CORRECT.** It writes keys
+`1, 2, 3, 51, 10, 28, 29, 30` — every one matches the real Fingerdash encoding
+above. The "written from memory, therefore suspect" hypothesis is falsified. The
+only keys synth omits are `85` (easing rate, irrelevant at easing=0), `20`
+(editor layer), and `61`. **Do not "fix" the encoding; it is not broken.**
+
+**(b) The census is not a valid instrument for detecting triggers.** It walks
+`layer->m_sections` (the section grid; `probes.cpp:541,598`), and triggers are
+not collision geometry. Direct evidence of the undercount: the census reported
+**4** move triggers across all 21 main levels, while Fingerdash's level string
+alone contains **177** — a 44× miss, and the census's x-range (7813–8455) is
+wrong too (real range is x = 1 … 24993).
+
+So "901 is absent from the census" was never evidence that 901 failed to load.
+
+- [ ] **Determine whether 901 actually loads**, using an instrument that is not
+      the section grid. Current synth run (`GDRL_SYNTH=1 GDRL_CENSUS=1`) gives:
+      `11 objects declared, m_objects=13, section-walk=14, distinctIds=11`,
+      and 901 appears in **neither** `CENSUS-ID` nor `CENSUS-EFFECT` (8 effects
+      listed, none 901). But `m_objects=13` is consistent with all 11 declared
+      objects loading plus 2 GD-added — so the count says loaded and the
+      enumerations say not. **This ambiguity is the actual open question.**
+      Resolve it by iterating `m_objects` directly and printing every
+      `m_objectID`, rather than by any section-grid walk.
+- [ ] If 901 does load, the whole "blocked on content" framing dissolves and
+      Track 0.1 is unblocked immediately.
+- [ ] If it genuinely does not load, suspect something other than the property
+      keys — a missing group definition for target group 1, or the trigger
+      needing an object in its target group to exist first.
+
+### 1.1b Fingerdash is not a usable natural test after all
+
+All **177** move triggers are touch-triggered (`36=1`) — zero are x-activated.
+The recorded claim that they are all touch-triggered was right in character even
+though its count was wrong by 44×. So Fingerdash cannot supply a trigger that
+fires simply by the player crossing its x, which is the case forward projection
+needs. Synth remains the route.
+
+- [ ] Confirm what key `36` means. It is assumed to be "touch triggered" from
+      GD community tables — **the same class of assumption that just failed**.
+      Verify against `EffectGameObject::m_isTouchTriggered` in the bindings
+      before relying on it.
 
 **Unblocks:** items 1, 4, 5, 6, 7 of the runtime-verification backlog below, and
 all validation of `trainer/trajectory.py` against a real moving object.
