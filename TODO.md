@@ -28,7 +28,7 @@ decided yet.
 | Throughput | **~11.5×** baseline (0.35 → 3.9 attempts/sec) |
 | Unattended running | **Proven** — `GDRL_WINDOWED`, 0.41/s unfocused |
 | Binary env transport | **Built + validated** — defaults clean, observation passive |
-| Forward projection (Objective B) | **Validated against recorded game data** — motion model exact, fire tick was 1.9198 ticks early; see 2026-08-12 |
+| Forward projection (Objective B) | **Validated against recorded game data** — motion model exact; the 1.9198-tick fire-tick lead is **corrected and independently re-validated** 2026-08-12. Residual is the game's own float32 drift (max `5.6457e-04` units, `0.0031` ticks) |
 | Conditioning (Objective A) | **Built; only flag-decode validated, never a real portal crossing** |
 | Hold duration (Objective C) | **Untouched** |
 | In-context failure memory (Objective D) | **Nothing** |
@@ -396,9 +396,52 @@ from the other launch: inverting the linear law at each of the 480 records gives
       tier-(iii) test**, with the data in `trainer/groundtruth_move_synth.py`
       as plain Python (a `.log` fixture would be silently untracked by
       `.gitignore`'s bare `*.log` rule).
-- [ ] **Audit of that test was stopped mid-run.** Its last unresolved concern,
-      verbatim: the headline test "interpolates truth across a 73-tick gap"
-      between recorded fixture points. Resolve before trusting the tolerance.
+- [x] **Audit of that test, resumed and closed 2026-08-12.** The concern was
+      **real, not a false alarm.** `test_pending_path_leads_the_game_by_the_
+      measured_amount` computed arrival tick `462.1606008087811`; the helper
+      `_recorded_or_interpolated` was asked for ticks 462 and 463, and
+      **neither was in the fixture** — both fell in the 73-tick hole between
+      `SAMPLES` at tick 400 and tick 473. Both ends of the bracket, and so the
+      `truth` the tolerance was measured against, were produced by the linear
+      motion law, which is `trajectory.py`'s own model. The headline claim was
+      a tier-(ii) claim wearing a tier-(iii) label.
+
+      **The number survived; the evidence did not.** Against the real records
+      at 462/463 the lead is `0.359978006` units / `1.919883` ticks, versus
+      `0.359972776` / `1.919855` from the interpolant — `5.230e-06` units
+      apart, 5% of the assertion's own `abs=1e-4`. Worst case anywhere in the
+      gap is `8.4129e-06` units (`4.49e-5` ticks). So `MEASURED_LEAD_UNITS =
+      0.35998` and the tolerance were *not* propped up by the interpolation —
+      but that could only be established by going back to the log, which is
+      what the fixture exists to avoid.
+
+      The helper's own docstring claimed "every sample in that span is on the
+      same line" as verification. That check was **vacuous**: there are no
+      samples strictly inside 400..473, so it compared the two endpoints of the
+      gap against the line drawn through those same two endpoints.
+
+      **Fix, per the "carry more points rather than interpolate" reading:** all
+      480 records are now in `groundtruth_move_synth.py` as `RECORDS` /
+      `RECORDS_BY_TICK`, re-extracted from the surviving reference log (which
+      is still on disk, 480 `MOVE` lines; the 15 existing `SAMPLES` verified
+      byte-identical against it, 0 mismatches). `_recorded_or_interpolated` is
+      replaced by `_recorded` (exact lookup, never interpolates) plus
+      `_truth_at_fractional_tick` (adjacent recorded pair only, with an
+      assertion that both bracketing ticks are recorded).
+
+      **Falsification power, measured.** Inject a 0.05-unit non-linearity into
+      the game's motion inside the gap, leaving all 15 `SAMPLES` byte
+      identical: the old helper's truth moves `0.000e+00` — perfectly blind —
+      while the new one moves `2.248e-02` and fails the assertion by 225x.
+
+      **Tier after the fix: (iii)**, with exactly two modelled inputs, both
+      named in the module docstring — the still-UNVERIFIED `_assumed_player_x`,
+      and one unavoidable sub-tick interpolation across a single 0.1875-unit
+      step between two adjacent *recorded* records. The headline test also now
+      carries an interpolation-free bracket assertion alongside the precise one.
+      Suite: 40 → 45 tests in that file, `trainer/` 167 → 172, all passing.
+      (Superseded by the arrival-tick correction later the same day: that file
+      is now **50** tests and `trainer/` is **182**.)
 
 ### B. The 1.9198 ticks decompose exactly. Crossing-to-activation latency is 0.
 
@@ -528,6 +571,20 @@ before today. It works: 57,009 published steps, and on all rows
    it used, and the lsq figure is ~4× smaller only because the fit absorbs the
    constant part of the float32 drift. Both are in the fixture under distinct
    names.
+   **CLOSED 2026-08-12, and it was worse than stated.** Both figures are in the
+   fixture under distinct names, each labelled with its fit — verified — and
+   `test_the_two_linearity_residuals_are_against_the_two_stated_fits` now
+   recomputes each from the 480 `RECORDS` against the fit its name claims, so
+   the labels can no longer drift from the numbers. Recomputed:
+   theoretical `5.6457e-4` max / `2.2239e-4` rms, lsq `3.9875e-4` / `9.3951e-5`,
+   lsq slope `0.187501148182` — all matching the fixture.
+   **But README's least-squares pair `3.99e-4 max / 9.2e-5 rms` was not one
+   fit's output at all**: no single fit produces both. `9.2e-5` is the fit over
+   the **479 non-final** steps (`9.2252e-5`, whose max is `1.6364e-4`);
+   `3.99e-4` is the fit over **all 480** (whose rms is `9.3951e-5`). Pairing
+   them overstated the max and understated the rms simultaneously — the same
+   final-short-step exclusion that already bites the `dy` row. README's table
+   and its correction note are fixed; the fixture was right all along.
 3. **`trajectory.py:409` encodes `311.58 / TICK_HZ = 1.298250000` under a comment
    citing "measured: 1.298250437".** The code does not carry the number it
    cites — 0.34 ppm, 1e-4 units over 231 ticks. Named so it is not rediscovered
@@ -538,6 +595,38 @@ before today. It works: 57,009 published steps, and on all rows
 5. **`ForwardProjector`'s default `horizon_ticks=240` is only 311.6 units** —
    less than the reference target's x=600. At the default the arrival tick clamps
    and the projection silently answers a different question. Not a bug; a trap.
+   **Confirmed 2026-08-12, with the count.** The clamp is `trajectory.py:919`
+   and `:923`, `tick = max(0.0, min(float(self.horizon_ticks), tick))`. Every
+   `ForwardProjector` call site was instrumented and the arrival ticks compared
+   against the horizon. **Six tests in `test_trajectory.py` run at the default
+   horizon and silently receive a clamped arrival tick:**
+
+   | test | obj.x | arrival returned | unclamped would be |
+   |---|---|---|---|
+   | `test_static_object_projects_to_itself` | 600 | 240.0 | 462.161 |
+   | `test_only_the_targeted_group_moves` | 600 | 240.0 | 462.161 |
+   | `test_two_commands_on_one_group_compose_additively` | 600 | 240.0 | 462.161 |
+   | `test_unmodellable_command_leaves_the_object_put_and_says_so` | 600 | 240.0 | 462.161 |
+   | `test_render_batch_is_per_sample_independent` | 500 | 240.0 | 385.134 |
+   | `test_raster_feeds_the_conditioned_trunk_unchanged` | 320 | 240.0 | 246.486 |
+
+   (`test_objects_outside_the_window_are_clipped_not_wrapped` also clamps at
+   x=100000, but there the clamp is the point. `test_horizon_caps_the_lookahead`
+   and `test_an_object_outrunning_the_player_is_flagged_unknown` clamp against
+   explicit horizons.)
+
+   **None of the six currently produces a wrong pass** — none asserts on
+   `arrival_tick`, and the three with a `duration` ≤ 240 ticks have `p` clamped
+   to 1 at both the clamped and unclamped tick, so `y` is unchanged either way.
+   The cost is coverage, not correctness: at the default these tests never
+   exercise the arrival-tick fixpoint they appear to be about.
+   **This matters to the queued arrival-tick correction.** That task changes
+   the fire tick, i.e. exactly the quantity these six tests are blind to, so
+   they will not move when it lands and must not be read as evidence it is
+   inert. `test_projection_groundtruth.py` passes `horizon_ticks=900`
+   explicitly and does exercise it. Left unfixed deliberately: raising the
+   horizons changes what six tests cover and is a scoping decision, not a
+   trivial edit.
 6. **README's null-input death pair `maxX=507.615234375, tick 391`** is one tick
    off the ENV channel's convention — that x is the ENV run's tick-**392**
    sample, bit-identical. Both are right in their own frame (post-physics x at
@@ -559,23 +648,142 @@ validation"); non-zero easing; rotation/transform (`ActionType` 3/4); non-unit
 multi-group `MOVE-OBJ` parsing (the log only ever has groupCount 0 or 1);
 whether `m_alreadyUpdated` (+0x1b0) is the dead-time mechanism.
 
+### Independent validation of the arrival-tick correction (2026-08-12, tester)
+
+The correction from queue item 3 below landed and was checked by an agent that
+did not write it, `trainer/` only, no GD launch. Suite `182 passed`
+(`test_trajectory.py` 53, `test_projection_groundtruth.py` 50, `test_env.py` 39,
+`test_conditioning.py` 25, `test_schema.py` 15). **All five claims survive.**
+Two carry evidence weaker than their write-ups assert, and those two are the
+resumable work.
+
+**Confirmed, independently re-derived without importing `trajectory.py`'s
+logic:**
+
+* Crossing at `232.080223` → `ceil` = 233 (matches the measurement), `round` =
+  232 (**falsified**). Under the old `U·t` origin the crossing is `231.080223`
+  and `ceil+1` / `round+2` / `floor+2` **all** give 233 — so the earlier "not
+  decidable" verdict genuinely was an origin artifact, exactly as claimed.
+* Stronger than the `ceil`/`round` framing: the rule need not be inferred. First
+  integer tick with **accumulated** x ≥ 300 is 233 by direct read; with the
+  line, also 233. Feeding the real float32 x rather than the line at every
+  observation tick 1..259, `ticks_to_activation` returns fire tick 233 at **all
+  259, zero failures**. Margin is `0.0802` ticks to the boundary against an
+  accum-vs-line drift at tick 232 of `−0.000264` ticks — ~300×.
+* `maxX = 507.615234375` reproduced **bit-exactly**; five rival models miss by
+  ≥ 22 float32 ulps. This independently validates the `UNITS_PER_TICK[1]` →
+  `1.2982504367828369` change as a side effect (the old `311.58/240` fails it).
+* Drift bound reproduced to every digit: 240-tick window `0.021458` units /
+  `0.016528` ticks; 400-tick `0.035763` / `0.027547`. Also `max|x − U(t−1)| =
+  0.2597` and `max|x − U·t| = 1.3135`.
+
+**Resume here — three defects in the evidence, not in the code:**
+
+1. **The "residual equals `LINEARITY_RESIDUAL_*_THEORETICAL` to 1e-12,
+   sign-flipped" claim is circular.** In
+   `test_residual_against_every_one_of_the_480_records`, the assertion
+   `err == approx(-(recorded_y - line), abs=1e-12)` is an identity in which
+   `recorded_y` cancels algebraically. Demonstrated: replacing every recorded
+   value with `rec + uniform(-500, 500)` leaves the assertion passing with
+   **max violation `0.000e+00`**. What it actually asserts is `out.y == line`,
+   which is true and in fact *exact* (`max |out.y − line| = 0.000e+00` over 480
+   ticks), but it is a tier-(i) regression on the predictor and carries **zero**
+   information about GD. Same issue with `CORRECTED_RESIDUAL_BOUND_UNITS =
+   gt.LINEARITY_RESIDUAL_MAX_THEORETICAL` and the `worst == approx(...)` check:
+   a fixture constant compared against a recomputation from the same records.
+   The *conclusion* ("the leftover is GD's float32 drift at ~6.1 ppm") is
+   supported — but by the separate `LSQ_SLOPE = 0.187501148182` measurement, not
+   by this equality. **To do: relabel these as tier (i) in the docstrings.** Do
+   not delete them; they do have falsification power on the predictor.
+
+2. **The "corrected model hits exactly the audit's fitted-shift figure
+   `3.4332e-05`" agreement is a construction artifact — this repo's
+   piecewise-constant trap in a new costume.** Both figures are bit-identical
+   (`3.433199998426062e-05`, delta exactly `0.0`), but only because the
+   record-minus-line residual sits on a **flat float32 plateau** there: ticks
+   462, 463 and 464 all have `record − line = −3.433200e-05`. The old fit's
+   arrival was `462.1606`, the corrected one is `463.1604`; both land inside the
+   same plateau, so the figure is invariant to the one tick they disagree about.
+   It is **not** the corrected model rediscovering a fitted value. The
+   defensible statement is "same noise floor, **zero** free parameters instead
+   of one." **To do: restate it that way in `validate_projection.py`.**
+   Related: the section-4 sweep's `n=464` is `n_effective=1` — the reconciliation
+   offered is **real** and visible in the tool's own output (`predicted arrival
+   463.160445 .. 463.160445 (distinct: 1)`, and `mean == rms == max`, which is
+   only possible if all 464 values are identical). For the record, `3.4332e-05`
+   sits at the **55.8th percentile** of the 480 per-record `|err|` (median
+   `3.0518e-05`, mean `1.3932e-04`, max `5.6457e-04`) — a near-median single
+   sample of a right-skewed distribution, so neither a cherry-pick nor a floor.
+
+3. **The float32 bias direction is stated as universal and is ~79/21.**
+   `trajectory.py` says "the rounding is upward-biased, so the real player
+   arrives fractionally EARLY, which means the error direction is the predictor
+   firing a trigger one tick LATE (the dangerous direction)." Measured over the
+   window that actually governs a lookahead: at 240 ticks, **913 of 4413
+   (20.7%)** windows are signed-negative — the real player is *behind* the line,
+   so the predictor fires **early**, not late. At 400 ticks, 730 of 4253 (17.2%).
+   Worst negative `−0.007839` units (`−0.006038` ticks) vs worst positive
+   `+0.021458` (`+0.016528`). And the sign is negative **precisely where the
+   recorded trigger lives**: at tick 232 the drift is `−0.000343` units, the
+   opposite of the stated bias. The `+0.2597` figure is an end-of-run number
+   that only builds past x≈2000 (at tick 1000 it is `+0.003624`). The safety
+   *conclusion* holds — bounded, sub-0.03-tick, dominant risk is firing late —
+   but a reader taking the phrasing as a guarantee would wrongly conclude the
+   early-fire direction is impossible. **To do: reword to "predominantly", with
+   the 20.7% figure.**
+
+**Tier mismatch to fix while there:**
+`test_the_documented_float32_drift_bound_is_the_measured_one` labels itself
+**"Tier (ii)"** and says it is "recomputed over the full 4,653-tick recorded
+run". No recorded data enters it — it *simulates* 4,653 ticks. That is tier (i),
+a regression on a documented constant. `trajectory.py`'s own docstring states
+this honestly ("arithmetic on the measured accumulator, not an observation");
+the two docstrings disagree about the tier of the same number.
+
+**The provenance gap that is still open, and it is the real one.** The
+`ceil`-vs-`round` conclusion survives the weak provenance of the two transcribed
+player-x values — they are corroborated by the bit-exact accumulator, by the
+Stereo Madness anchor on a *different level*, and by activation tick 233 being
+re-derivable from the 480 MOVE records alone (`232.999340 ± 9.854e-04`) off a
+log that *is* on disk. But the argument **splices runs**: the player-x law is
+from the 2026-08-12 `GDRL_ENV` run, while activation tick 233 is from a
+2026-08-11 CMDVEC launch plus the 2026-08-11 MOVE record, and **nothing asserts
+the ENV run was on the same synth level.** That is the `input[clean]` failure
+mode verbatim — an assertion whose name does not cover the level-identity
+question. If it were a different level the crossing argument dissolves.
+
+* To reach durable tier (iii): log the ENV player-x stream to disk **with a
+  level-identity assertion**, and re-extract the 232/233 values from the file.
+* To reach tier (iv): one launch, one level, `GDRL_PROBE_CMDVEC` **and** player
+  `m_positionX` in the same stream, so crossing and activation come from one run.
+
 ### Queue for next session, in order
 
 1. **Fix D and E** (both C++, one agent — concurrent `geode build`s race).
    D unblocks Tracks 1.2 and 1.3; E unblocks every object-window consumer.
-2. **Finish the stopped audit of `test_projection_groundtruth.py`** — the
-   73-tick-interpolation concern in A.
-3. **Correct `trajectory.py`'s arrival-tick model** per B and C: `(t−1)` origin,
-   float32 accumulation, zero crossing latency. Not before 2, since the audit
-   owns those files.
+2. ~~**Finish the stopped audit of `test_projection_groundtruth.py`**~~ — done,
+   see A.
+3. **Correct `trajectory.py`'s arrival-tick model** per B and C — **landed and
+   independently validated**, but only **partially**: the `(t−1)` origin and
+   zero crossing latency are in; **float32 accumulation is deliberately NOT** in
+   `SpeedProfile`, which still models x as the continuous line. That is a
+   defensible call (O(1) closed form vs O(horizon); only bucket 1 has a
+   float32-exact `U`) and is documented with a measured bound in
+   `trajectory.py`'s "PLAYER X IS FLOAT32-ACCUMULATED" section. Recorded here so
+   the item is not read as fully closed.
 4. **Rerun the speed measurement** once D lands — the tester's method reproduces
    all four buckets in one ~20s attempt with no further work.
 5. Then Track 0.2 (predictor spec + test-tier audit), which A and B now feed.
+6. **The three evidence-labelling fixes above.** `trainer/` only, no GD needed.
 
 Task #8 (a synth trigger at x=300.65, arrival 231.5809, frac 0.58) is **largely
 superseded**: the activation mechanism is now measured directly rather than
-inferred, so no rule-guessing is needed. Residual value only if the float32
-crossing model in 3 leaves the `ceil`-vs-`round` question open.
+inferred, so no rule-guessing is needed. **Correction 2026-08-12:** it is
+superseded outright, not "residual value only if `ceil`-vs-`round` stays open" —
+that question is now *closed*, and the two questions still open (`>=` vs `>`;
+whether GD quantises against the float32 x or the line) need a crossing landing
+within **~0.03 ticks of an integer**, which `frac = 0.58` does not provide. A
+**new** trigger x is required; x=300.65 would answer neither.
 
 ---
 

@@ -109,6 +109,95 @@ Nothing here was inferred from a field name.
        and therefore so is how long the trigger will have been running by the
        time the player arrives anywhere further along.
 
+  (E7) MEASURED, not decompiled -- the activation rule. Everything above is
+       static analysis; this one came out of the running game, and it is the
+       only entry here that ever contradicted the code.
+
+       GD activates an x-triggered trigger on the FIRST INTEGER TICK at which
+       the player's own sampled x is >= the trigger's x. It does not activate
+       at the continuous crossing time, because nothing in GD ever computes a
+       continuous crossing time: the check runs once per physics step against
+       whatever x the player happens to hold at that step.
+
+       Evidence (README / TODO "Session 2026-08-12", GDRL_ENV channel, 57,009
+       observations, one attempt to level completion, ticks 1..4653):
+
+           tick 232  ->  x = 299.8955078125       (short of the trigger)
+           tick 233  ->  x = 301.1937561035156    (past it)
+           activation tick, GDRL_PROBE_CMDVEC     = 233
+
+       and the same 233 falls out of the displacement record alone, with no
+       reference to the CMDVEC run, at 232.99934 +/- 0.001 ticks.
+
+       Two separate corrections came out of that, and this module had BOTH of
+       them wrong in the same direction, which is why they read as one
+       1.9198-tick lead:
+
+         * The crossing is quantised UP to the next integer tick: 0.91978 of
+           the 1.9198. That is fixed here, in
+           ``SpeedProfile.ticks_to_activation``.
+         * The player's x-vs-tick origin is ``x(t) = U * (t - 1)``, not
+           ``U * t``: the remaining 1.0000 tick. Measured:
+           ``max|x - U*(t-1)| = 0.2597`` against ``max|x - U*t| = 1.3135``.
+           That one was NEVER IN THIS MODULE -- the projector works entirely in
+           ticks relative to the observation, so an absolute-tick origin cannot
+           appear in it. It lived in the callers that convert a tick number
+           into a player x (``test_projection_groundtruth``'s
+           ``_assumed_player_x``, now ``_player_x_at_tick``, and
+           ``validate_projection``'s open-coded ``upt * tick``), and it is
+           fixed there rather than here. The convention
+           is nevertheless written down here, as ``PLAYER_X_TICK_ORIGIN`` and
+           ``player_x_at_tick``, because this is the module that owns the
+           player-motion model and a convention that lives only in its callers
+           is a convention waiting to be re-derived wrongly.
+
+       Still UNVERIFIED after the correction: whether the comparison is `>=` or
+       `>` (the recorded crossing never lands on equality, so a trigger whose x
+       the player hits exactly is undecided), and whether the quantisation is
+       done against the float32-accumulated x or -- as modelled here -- against
+       the continuous line. See "PLAYER X IS FLOAT32-ACCUMULATED" below.
+
+--------------------------------------------------------------------------
+PLAYER X IS FLOAT32-ACCUMULATED, AND THIS MODULE DOES NOT REPRODUCE IT
+--------------------------------------------------------------------------
+
+MEASURED (tier iv, same session as (E7)): the game advances the player with
+
+    x[n+1] = float32(x[n] + float32(U))          x = 0.0 at tick 1
+
+which reproduces all 4,653 recorded samples of that run bit-exactly. A float64
+accumulator with a float32 store does not. ``player_x_at_tick_float32`` below
+is that accumulator, and it reproduces the two crossing samples in (E7) bit for
+bit -- that is a tier-(iii) check and ``test_projection_groundtruth`` asserts it.
+
+``SpeedProfile`` deliberately does NOT use it. It models x as the continuous
+line ``player_x + U * k``, for three reasons:
+
+  1. The projector is relative. It starts from a player x the mod MEASURED, so
+     the accumulated drift up to the observation is already inside that number
+     and cancels; only the drift accrued over the lookahead itself is missed.
+  2. The exact accumulator needs the game's float32 U for the bucket in play,
+     and four of the five entries in ``UNITS_PER_TICK`` are unverified
+     community constants (see below). Reproducing a float32 rounding pattern on
+     top of a rate that is wrong by 4% would be precision theatre.
+  3. It is O(horizon) per query where the closed form is O(1), inside the
+     fixpoint, per object, per tick.
+
+The cost is bounded and measured rather than assumed. Over the recorded 4,653
+ticks the divergence between the accumulator and the line, evaluated over a
+sliding window, is at most:
+
+    240-tick lookahead   0.0215 units   0.0165 ticks
+    400-tick lookahead   0.0358 units   0.0275 ticks
+
+so ``ticks_to_activation`` can name a fire tick one step off the game's, but
+only when the continuous crossing lands within ~0.03 ticks of an integer -- and
+the rounding is upward-biased, so the real player arrives fractionally EARLY,
+which means the error direction is the predictor firing a trigger one tick LATE
+(the dangerous direction: a hazard seen late). UNVERIFIED: no recorded crossing
+sits near a boundary, so this bound is arithmetic on the measured accumulator,
+not an observation of a mis-predicted trigger.
+
 --------------------------------------------------------------------------
 WHAT IS AND IS NOT PROJECTABLE
 --------------------------------------------------------------------------
@@ -172,32 +261,46 @@ derivable from the other, and collapsing them would lose one of the two.
 NEEDS-RUNTIME-VERIFICATION
 --------------------------------------------------------------------------
 
-Everything above is static analysis. GD was not run during this work. The
-measurements that would close the gaps, in order of how much rests on them
-(full protocol in README, "What still needs runtime verification"):
+(E1)-(E6) are static analysis; (E7) and the float32 section above are the only
+parts of this module measured against a running game. The measurements that
+would close the remaining gaps, in order of how much rests on them (full
+protocol in README, "What still needs runtime verification"):
 
-  1. Which GJEffectManager vector actually holds live GroupCommandObject2.
-     The whole telemetry path depends on it and nothing else does.
+  1. [DONE] Which GJEffectManager vector actually holds live
+     GroupCommandObject2. It is m_unkVector560, measured 0 -> 1 -> 0 across one
+     trigger's lifetime while the other six stayed 0.
   2. Per-tick advance for the four unmeasured speed buckets in UNITS_PER_TICK.
      Currently community values; a 4% error is a third of a tile at horizon.
-  3. That GJEffectManager::prepareMoveActions really fires once per physics
-     step. Static analysis says yes; processCommands is why that is not enough.
+     Note this now also bounds ``player_x_at_tick_float32``, which can only be
+     exact for a bucket whose float32 U is known.
+  3. [DONE] That GJEffectManager::prepareMoveActions really fires once per
+     physics step. Confirmed: endTick=3048 served steps=3054.
   4. m_deltaTimeInFloat against lround(m_attemptTime * 240), to confirm this
-     module's time base end to end.
+     module's time base end to end. Still unread; the recorded residual after
+     the (E7) correction is consistent with GD accumulating it in float32 (see
+     test_projection_groundtruth) but that is inference, not a reading.
   5. Whether EnterEffectInstance perturbs the collision rect or only the
      sprite. Decides whether area effects belong in the projection.
   6. Which of ActionType.ANGULAR_A / ANGULAR_B is rotation and which is
      transform -- they run identical code.
   7. Timewarp behaviour at timeWarp != 1; see (E2).
+  8. Whether the activation comparison is `>=` or `>`, and whether GD quantises
+     the crossing against the float32-accumulated x rather than the line. Needs
+     one trigger whose continuous crossing lands within ~0.03 ticks of an
+     integer; the recorded one lands at frac 0.08.
 
-Until (1) and (2) land, this module is exercised only on synthetic state by
-test_trajectory.py, which is a test of the interpolator and the bookkeeping,
-not of the numbers coming out of the game.
+The y-offset path at easing 0, 1x speed, single group, no locks is now checked
+against recorded game data by test_projection_groundtruth.py. Everything else
+in here -- rotation, transform, easing, locks, follows, non-1x buckets -- is
+still exercised only on synthetic state by test_trajectory.py, which is a test
+of the interpolator and the bookkeeping, not of the numbers coming out of the
+game.
 """
 
 from __future__ import annotations
 
 import math
+import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
 
@@ -390,12 +493,23 @@ def ease(t: float, easing: int, rate: float) -> float:
 # Player horizon
 # --------------------------------------------------------------------------
 
+# The measured 1x advance, as the game itself holds it. The repo's measurement
+# is 1.298250437 units/tick at m_playerSpeed 0.90 (README, "Physics is
+# fixed-step at 240Hz"); the game adds the float32 of that number, and
+# float32(1.298250437) == 1.2982504367828369 exactly, which is the literal
+# below. Reproducing the game's accumulator from x = 0 at tick 1 with this
+# increment lands on the two recorded crossing samples in (E7) bit for bit.
+#
+# It replaces `311.58 / TICK_HZ` == 1.298250000, which was the *rounded*
+# units-per-second figure quoted back in and did not carry the number its own
+# comment cited: 0.34 ppm, 1.0e-4 units over the 231 ticks that matter to the
+# recorded trigger. Small, and named so it is not rediscovered as a bug.
+UNITS_PER_TICK_1X = 1.2982504367828369      # == float32(1.298250437), MEASURED
+
 # Horizontal advance per physics tick, indexed by speed bucket, matching
 # conditioning.SPEED_MULTIPLIERS = (0.7, 0.9, 1.1, 1.3, 1.6).
 #
-# ONLY INDEX 1 IS MEASURED. 1.298250437 units/tick at m_playerSpeed 0.90 is
-# from this repo's own per-tick data (README, "Physics is fixed-step at
-# 240Hz"), and 1.298250437 * 240 = 311.58 units/s.
+# ONLY INDEX 1 IS MEASURED.
 #
 # The other four are the widely quoted community values (251.16, 387.42,
 # 468.00, 576.00 units/s) divided by 240. They are NOT verified here and they
@@ -406,12 +520,70 @@ def ease(t: float, easing: int, rate: float) -> float:
 # the player. Measure them before trusting them.
 UNITS_PER_TICK = (
     251.16 / TICK_HZ,   # 0.5x   UNVERIFIED
-    311.58 / TICK_HZ,   # 1x     measured: 1.298250437
+    UNITS_PER_TICK_1X,  # 1x     MEASURED
     387.42 / TICK_HZ,   # 2x     UNVERIFIED
     468.00 / TICK_HZ,   # 3x     UNVERIFIED
     576.00 / TICK_HZ,   # 4x     UNVERIFIED
 )
 SPEED_VERIFIED = (False, True, False, False, False)
+
+
+# The player's x-vs-tick origin: x(t) = UNITS_PER_TICK * (t - 1), i.e. x is 0.0
+# on tick 1, not on tick 0. MEASURED, see (E7): over 4,653 ticks
+# max|x - U*(t-1)| = 0.2597 against max|x - U*t| = 1.3135, a whole tick. There
+# is no spin-up ramp either -- dx is the full 1.29825 from the very first step.
+#
+# Nothing inside this module consumes it, and that is the point: the projector
+# is expressed entirely in ticks relative to the observation, so it cannot get
+# the origin wrong. Anything that maps an ABSOLUTE tick number to a player x
+# must, and this is the constant it must use.
+PLAYER_X_TICK_ORIGIN = 1
+
+# Divergence between the float32 accumulator and the continuous line over a
+# lookahead window, worst case over the recorded 4,653-tick run. See "PLAYER X
+# IS FLOAT32-ACCUMULATED" in the module docstring: this is the bounded error
+# accepted in exchange for an O(1) closed form.
+PLAYER_X_FLOAT32_DRIFT_UNITS_PER_240_TICKS = 0.0215
+PLAYER_X_FLOAT32_DRIFT_UNITS_PER_400_TICKS = 0.0358
+
+
+def player_x_at_tick(tick: float, bucket: int = 1) -> float:
+    """Player x at an ABSOLUTE tick, continuous form. See PLAYER_X_TICK_ORIGIN.
+
+    This is the closed-form line the projector's arithmetic assumes. It differs
+    from the game by the float32 accumulation bounded above; for the exact
+    accumulator use ``player_x_at_tick_float32``.
+    """
+    return UNITS_PER_TICK[bucket] * (tick - PLAYER_X_TICK_ORIGIN)
+
+
+def _f32(value: float) -> float:
+    """Round a float64 to the nearest float32, as a store to a C ``float`` does."""
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def player_x_at_tick_float32(tick: int, bucket: int = 1) -> float:
+    """The game's own accumulator: ``x[n+1] = float32(x[n] + float32(U))``.
+
+    MEASURED (tier iv): reproduces all 4,653 player-x samples of the reference
+    run bit-exactly, and ``test_projection_groundtruth`` pins it against the two
+    crossing samples carried in the fixture.
+
+    Not used by ``SpeedProfile`` -- it is O(tick) and needs a float32-exact U,
+    which only bucket 1 has. Provided so that callers holding an absolute tick
+    (telemetry cross-checks, validation tooling) can reproduce the game rather
+    than the line, and so that the size of the difference stays measurable.
+    """
+    if tick < PLAYER_X_TICK_ORIGIN:
+        raise ValueError(
+            f"tick {tick} is before the origin tick {PLAYER_X_TICK_ORIGIN}; the "
+            "accumulator has no state to run backwards from"
+        )
+    step = _f32(UNITS_PER_TICK[bucket])
+    x = _f32(0.0)
+    for _ in range(int(tick) - PLAYER_X_TICK_ORIGIN):
+        x = _f32(x + step)
+    return x
 
 
 @dataclass(frozen=True)
@@ -471,6 +643,9 @@ class SpeedProfile:
         Fractional on purpose. Rounding to an integer tick here would quantise
         every arrival time to the same 1.3-unit grid the player moves on, which
         is exactly the resolution the projection is trying to resolve below.
+
+        This is NOT the trigger-activation tick. GD quantises that one, because
+        GD evaluates it on its own step grid; see ``ticks_to_activation``.
         """
         if x <= self.player_x:
             return (x - self.player_x) / UNITS_PER_TICK[self._bucket_at(self.player_x)]
@@ -492,6 +667,39 @@ class SpeedProfile:
         if cursor < x:                       # past the last known portal
             ticks += (x - cursor) / self.segments[-1].units_per_tick
         return ticks
+
+    def ticks_to_activation(self, x: float) -> float:
+        """Ticks from now until GD fires an x-activated trigger sitting at ``x``.
+
+        NOT ``ticks_to_reach``. GD checks the trigger once per physics step
+        against the player's x at that step, so activation lands on the first
+        INTEGER tick at which the player is at or past the trigger -- see (E7),
+        where the player is at 299.8955 on tick 232 and 301.1938 on tick 233
+        and the command appears on 233. Using the continuous crossing time here
+        is what made this module fire triggers 0.91978 ticks early; combined
+        with the ``x(t) = U*t`` origin error in its callers, the projection led
+        the game by 1.9198 ticks = 0.35998 units on the recorded trigger.
+
+        Returns a float, not an int, because the value is consumed as a tick
+        offset alongside fractional arrival ticks and because it may be
+        negative -- a trigger the player has already passed fired in the past,
+        and the projection needs to know how long ago rather than that it fired.
+
+        The player's arrival tick at an OBJECT is deliberately NOT quantised
+        this way (see ``ticks_to_reach``). The two are different questions: the
+        activation tick is something GD itself evaluates, on its own step grid,
+        and quantising it reproduces the game; an arrival tick is a question
+        only this module asks, and quantising it would throw away resolution
+        that nothing in the game discards.
+        """
+        # The epsilon guards float64 noise at an exact hit -- 1e-9 ticks is
+        # 1.3e-9 units, four orders of magnitude below the float32 quantum of
+        # the player's own x near x=300 (3.05e-5 units), so it cannot move a
+        # crossing the game is able to resolve. UNVERIFIED which way GD breaks
+        # an exact tie: the recorded crossing never lands on equality. This
+        # follows (E7)'s "x >= trigger x" reading, under which an exact hit
+        # activates on that same tick.
+        return float(math.ceil(self.ticks_to_reach(x) - 1e-9))
 
     def x_at_tick(self, tick: float) -> float:
         """Forward map, for tests and for sanity-checking ticks_to_reach."""
@@ -884,7 +1092,9 @@ class ForwardProjector:
                 certainty = min(certainty, cmd.certainty)
 
             for trig in by_group_pending.get(gid, ()):
-                fire_tick = self.speed.ticks_to_reach(trig.activation_x)
+                # (E7): the first integer tick at which the player is past the
+                # trigger, not the continuous crossing time.
+                fire_tick = self.speed.ticks_to_activation(trig.activation_x)
                 if fire_tick > tick:
                     continue                      # not fired by then
                 if trig.certainty == CERTAINTY_UNKNOWN:

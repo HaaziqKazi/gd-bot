@@ -988,7 +988,7 @@ y=435. Two independent GD launches, both giving:
 | records | **480**, ticks **234 → 713**, 0 gaps, 0 duplicates |
 | displacement | 435 → 525 = **90.000000000** exactly |
 | per-tick `dy` | mean `0.187500000` over all 480; `0.187501179` over the 479 **non-final** steps. Logged dy sum to `89.999999990`. Max deviation `7.63e-6` |
-| linearity, vs the **least-squares** fit | max residual `3.99e-4` units, rms `9.2e-5` |
+| linearity, vs the **least-squares** fit, over all 480 | max residual `3.9875e-4` units, rms `9.395e-5` |
 | linearity, vs the **theoretical** line `435 + 90(t−233)/480` | max residual `5.646e-4` units, rms `2.224e-4` |
 
 Two corrections to earlier revisions of this table, both from
@@ -998,6 +998,23 @@ the two are different quantities. And it quoted only the least-squares residual
 without saying so — that figure is ~4× smaller than the theoretical-line one
 purely because the fit absorbs the constant part of the float32 drift. Both fits
 are legitimate; which one is meant has to be stated.
+
+A **third** correction, 2026-08-12, from the audit of
+`trainer/test_projection_groundtruth.py`. The least-squares row previously read
+`max 3.99e-4, rms 9.2e-5`. Those two numbers come from **different record
+sets** and no single fit produces both. Recomputed from all 480 records now
+carried in `trainer/groundtruth_move_synth.py:RECORDS`:
+
+| least-squares fit over | max residual | rms |
+|---|---|---|
+| all 480 records | `3.9875e-4` | `9.3951e-5` |
+| the 479 **non-final** steps | `1.6364e-4` | `9.2252e-5` |
+
+The old `9.2e-5` is the 479-step figure; the old `3.99e-4` is the 480-record
+one. Pairing them overstated the max and understated the rms at the same time.
+The same final-short-step exclusion that bites `dy` in the row above bites this
+row too. Both rows are now derived from the records by
+`test_the_two_linearity_residuals_are_against_the_two_stated_fits`.
 
 The residual is float32 accumulation in `m_deltaTimeInFloat`, not curvature —
 genuine easing would swing per-step `dy` by tens of percent. The final step is
@@ -1020,6 +1037,32 @@ no residual into a `U·t` vs `U·(t−1)` origin convention error plus the
 continuous-vs-integer tick gap. Crossing-to-activation latency is **0**, and the
 one tick of dead time above is a separate, downstream effect on object
 displacement. See TODO.md, session 2026-08-12, sections A–C.
+
+**The correction landed and was independently validated 2026-08-12.**
+`SpeedProfile.ticks_to_activation` quantises the crossing up to the next integer
+tick; the origin error was fixed in the *callers*, not in `trajectory.py`. After
+it, the predictor's output is **bit-identical to the theoretical line**
+(`max |out.y − line|` over all 480 recorded ticks = `0.000e+00` exactly), and
+the whole remaining disagreement with the game is the record's own float32
+deviation from that line: mean `1.3932e-04`, rms `2.2239e-04`, max `5.6457e-04`
+units, i.e. under `0.0031` ticks.
+
+Two cautions carried forward from the independent check, because both are easy
+to over-read (details in TODO.md, "Independent validation"):
+
+* That residual is **not** independent corroboration of the correction. It is
+  the same quantity as the `LINEARITY_RESIDUAL_*_THEORETICAL` row above,
+  sign-flipped. The equality asserting it is an algebraic identity in which the
+  recorded value cancels — it is a tier-(i) regression on the predictor, not
+  evidence about GD.
+* The `x(t) = U·(t−1)` origin and the float32 accumulator are corroborated on a
+  **second level**: `391` accumulated `float32` steps of `float32(1.298250437)`
+  from `x = 0` reproduce Stereo Madness's null-input `maxX = 507.615234375`
+  **bit-exactly**, and five rival accumulator models all miss it by ≥ 22 float32
+  ulps — including one using the old rounded `311.58/240`. State this as *391
+  steps of travel*, not as an absolute tick: README records this datum as
+  `t = 1.629166752 = 391/240` (tick 391) while the ENV channel would call it
+  tick 392, and which frame `maxX` is sampled in is still unresolved (TODO G6).
 
 ### The live command container is `m_unkVector560`
 

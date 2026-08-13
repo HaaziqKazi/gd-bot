@@ -19,6 +19,7 @@ Run: python3 -m pytest trainer/test_trajectory.py -q
 from __future__ import annotations
 
 import math
+import struct
 
 import pytest
 import torch
@@ -29,6 +30,9 @@ from trajectory import (
     CERTAINTY_EXACT,
     CERTAINTY_UNKNOWN,
     NUM_KINDS,
+    PLAYER_X_FLOAT32_DRIFT_UNITS_PER_240_TICKS,
+    PLAYER_X_FLOAT32_DRIFT_UNITS_PER_400_TICKS,
+    PLAYER_X_TICK_ORIGIN,
     TICK_HZ,
     TICK_SECONDS,
     UNITS_PER_TICK,
@@ -43,6 +47,8 @@ from trajectory import (
     SpeedSegment,
     TrajectoryRaster,
     ease,
+    player_x_at_tick,
+    player_x_at_tick_float32,
 )
 
 # The 1x per-tick advance, measured over 175 bit-identical attempts
@@ -285,11 +291,108 @@ def test_one_tick_at_1x_advances_the_measured_distance():
     assert UNITS_PER_TICK[1] == pytest.approx(UNITS_PER_TICK_1X, abs=1e-6)
 
 
-def test_stereo_madness_first_spike_is_391_ticks_away():
+def test_the_1x_constant_is_the_float32_the_game_actually_adds():
+    """Tier (ii): reconstructed independently, not copied from the module.
+
+    The module used to carry 311.58/240 = 1.298250000 under a comment citing
+    the measured 1.298250437 -- the code did not hold the number it cited. It
+    now holds float32(1.298250437), which is what the game adds, and this
+    rebuilds that value from the decimal rather than trusting the literal.
+    """
+    reconstructed = struct.unpack("<f", struct.pack("<f", UNITS_PER_TICK_1X))[0]
+    assert UNITS_PER_TICK[1] == reconstructed
+    assert UNITS_PER_TICK[1] != 311.58 / TICK_HZ        # the old, rounded value
+
+
+def test_stereo_madness_first_spike_is_391_ticks_of_travel_away():
     """A real anchor rather than a synthetic one: no-input Stereo Madness dies
-    at maxX = 507.615234375 on tick 391, bit-identical over 175 attempts."""
+    at maxX = 507.615234375, bit-identical over 175 attempts.
+
+    Note the frames, since this is exactly the confusion the 2026-08-12 origin
+    correction was about. 391 is the number of TICKS OF TRAVEL from x = 0. The
+    ABSOLUTE tick is 392, because x = 0 at tick 1 -- README's "tick 391" is one
+    off in the ENV channel's own convention, which TODO G6 records.
+    """
     profile = SpeedProfile(player_x=0.0)
     assert profile.ticks_to_reach(507.615234375) == pytest.approx(391.0, abs=0.01)
+
+
+def test_the_float32_accumulator_reproduces_the_stereo_madness_death_x():
+    """Tier (iii), and from a level this module was never fitted to.
+
+    README's null-input death x on Stereo Madness is reproduced BIT-EXACTLY at
+    absolute tick 392 by the game's own accumulator, which was characterised on
+    the synth level from a different probe. Different level, different probe,
+    ~550 attempts apart, no free parameters. It is corroboration of both the
+    origin convention and the float32 accumulation at once.
+    """
+    assert player_x_at_tick_float32(392) == 507.615234375
+    assert player_x_at_tick_float32(391) != 507.615234375
+
+
+def test_the_player_x_origin_is_tick_one():
+    """x(t) = U*(t-1). Regression (tier i) on the convention constant itself."""
+    assert PLAYER_X_TICK_ORIGIN == 1
+    assert player_x_at_tick(1) == 0.0
+    assert player_x_at_tick_float32(1) == 0.0
+    assert player_x_at_tick(2) == UNITS_PER_TICK[1]
+    with pytest.raises(ValueError):
+        player_x_at_tick_float32(0)
+
+
+def test_the_documented_float32_drift_bound_is_the_measured_one():
+    """Tier (ii): the bound the module trades away is recomputed, not asserted.
+
+    SpeedProfile models player x as a line; the game accumulates in float32.
+    The module documents the resulting divergence over a lookahead window as a
+    bounded known error, so the bound has to stay honest. This recomputes it
+    over the full 4,653-tick recorded run, the same span the accumulator was
+    measured over.
+    """
+    u = UNITS_PER_TICK[1]
+    xs = []
+    x = 0.0
+    step = struct.unpack("<f", struct.pack("<f", u))[0]
+    for t in range(1, 4654):
+        xs.append(x)
+        x = struct.unpack("<f", struct.pack("<f", x + step))[0]
+    drift = [xs[i] - u * i for i in range(len(xs))]
+
+    for window, bound in ((240, PLAYER_X_FLOAT32_DRIFT_UNITS_PER_240_TICKS),
+                          (400, PLAYER_X_FLOAT32_DRIFT_UNITS_PER_400_TICKS)):
+        worst = max(abs(drift[i + window] - drift[i])
+                    for i in range(len(drift) - window))
+        assert worst == pytest.approx(bound, rel=0.02), (
+            f"{window}-tick drift is {worst:.4f} units, module documents "
+            f"{bound}")
+        # In ticks, reported separately from units on purpose.
+        assert worst / u < 0.03
+
+
+def test_activation_is_quantised_to_the_next_integer_tick():
+    """Regression (tier i) on the (E7) rule; the game-grounded check for it
+    lives in test_projection_groundtruth.
+
+    ticks_to_reach is continuous and ticks_to_activation is not, and the two
+    must not be quietly interchangeable: GD evaluates the trigger once per
+    physics step, so activation lands on a whole tick.
+    """
+    profile = SpeedProfile(player_x=0.0)
+    for x in (10.0, 300.0, 1234.5):
+        cont = profile.ticks_to_reach(x)
+        fire = profile.ticks_to_activation(x)
+        assert fire == math.ceil(cont)
+        assert 0.0 <= fire - cont < 1.0
+        assert float(fire).is_integer()
+
+    # An exact hit activates on that same tick rather than the next one -- the
+    # `>=` reading of (E7). UNVERIFIED: no recorded crossing lands on equality.
+    assert profile.ticks_to_activation(UNITS_PER_TICK[1] * 5.0) == 5.0
+
+    # A trigger already behind the player fired in the past, and how far in the
+    # past is information the projection needs; it must not clamp to zero.
+    behind = SpeedProfile(player_x=500.0)
+    assert behind.ticks_to_activation(100.0) < 0.0
 
 
 def test_ticks_to_reach_and_x_at_tick_are_inverses():
@@ -427,6 +530,15 @@ def test_a_pending_trigger_fires_only_once_the_player_crosses_it():
 
 
 def test_a_pending_trigger_is_partially_applied_mid_flight():
+    """Regression only (tier i): the expectation uses the module's own clocks.
+
+    It moved with the 2026-08-12 arrival-tick correction and is kept because it
+    pins the *relationship* the correction changed. The elapsed time runs from
+    the ACTIVATION tick -- the first integer tick past the trigger, which is
+    what GD fires on -- not from the continuous crossing. Written against
+    ticks_to_reach for both ends, as it was, it silently asserted the old
+    behaviour and would have gone on doing so.
+    """
     trig = PendingTrigger(
         activation_x=300.0, target_group_id=9, duration=2.0,
         action_type_1=int(ActionType.OFFSET_Y), action_value_1=480.0,
@@ -435,9 +547,11 @@ def test_a_pending_trigger_is_partially_applied_mid_flight():
     proj = ForwardProjector(profile, horizon_ticks=2000)
     out = proj.project([_block(600.0, 0.0, groups=(9,))], pending=[trig])[0]
 
-    elapsed = (profile.ticks_to_reach(600.0) - profile.ticks_to_reach(300.0)) * TICK_SECONDS
+    fire = profile.ticks_to_activation(300.0)
+    assert fire == math.ceil(profile.ticks_to_reach(300.0))    # 232, not 231.08
+    elapsed = (profile.ticks_to_reach(600.0) - fire) * TICK_SECONDS
     assert 0.0 < out.y < 480.0
-    assert out.y == pytest.approx(480.0 * elapsed / 2.0, rel=1e-3)
+    assert out.y == pytest.approx(480.0 * elapsed / 2.0, rel=1e-9)
 
 
 def test_spawn_delay_pushes_the_start_back():
