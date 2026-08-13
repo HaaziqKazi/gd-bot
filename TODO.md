@@ -3,11 +3,17 @@
 Single place for what is left. Companion to `README.md`, which records what has
 been **established**; this file records what has **not**.
 
-Status as of commit `41b5eb7` + the 2026-08-12 session below.
+Status as of commit `7fb0c7d` + the 2026-08-12 session below.
 
-> **Read "Session 2026-08-12" first.** It closes Track 0.1, and it invalidates
-> the "READY NOW" labels on Tracks 1.2 and 1.3 — the synth portals have never
-> fired, on any run, ever.
+> **Read "Session 2026-08-12" first**, and its sections **H–K** before anything
+> else. Track 0.1 is closed; the arrival-tick defect is corrected and
+> independently validated; both C++ bugs are fixed and confirmed against the
+> running game, so Track 1.2 is genuinely unblocked for the first time. Three
+> new open items came out of it — an unfinished `test_env.py` (I), a phantom
+> SOLID object glued to the player (J), and two dead instruments (K).
+>
+> **Start at "Queue for next session".** Nothing is blocked on a build or a
+> measurement; the tree is green at 182 tests.
 
 ---
 
@@ -29,7 +35,8 @@ decided yet.
 | Unattended running | **Proven** — `GDRL_WINDOWED`, 0.41/s unfocused |
 | Binary env transport | **Built + validated** — defaults clean, observation passive |
 | Forward projection (Objective B) | **Validated against recorded game data** — motion model exact; the 1.9198-tick fire-tick lead is **corrected and independently re-validated** 2026-08-12. Residual is the game's own float32 drift (max `5.6457e-04` units, `0.0031` ticks) |
-| Conditioning (Objective A) | **Built; only flag-decode validated, never a real portal crossing** |
+| Conditioning (Objective A) | **A real portal crossing finally happened** 2026-08-12 (H): six synth portals fire, incl. `cube -> ship`. But `MODE` never fires (K), and the object window it feeds carries a phantom SOLID glued to the player (J) — so the *regime* is evidenced, the *geometry* is not yet trustworthy |
+| Object observation window | **Fixed and confirmed live** (H/E): `objectCount == 0` on 0 of 3,722 ticks, was 4,344 of 4,653. Trust it only after J |
 | Hold duration (Objective C) | **Untouched** |
 | In-context failure memory (Objective D) | **Nothing** |
 | Uncertainty policy (Objective E) | **Substrate only** (coverage mask + certainty channel) |
@@ -216,12 +223,25 @@ needs. Synth remains the route.
 **Unblocks:** items 1, 4, 5, 6, 7 of the runtime-verification backlog below, and
 all validation of `trainer/trajectory.py` against a real moving object.
 
-### 1.2 Measure the four unmeasured speed buckets  — **BLOCKED** (was "READY NOW")
+### 1.2 Measure the four unmeasured speed buckets  — **UNBLOCKED** (see H)
 
-**The portals have never fired.** See 2026-08-12; blocked on the synth portal y
-fix. The claim below that "synth's speed portals already land at exactly the
-requested x" is true as a *placement* claim and was doing silent duty as a
-*functional* one.
+**The portals now fire.** The y fix landed and was confirmed live; all five speed
+portals produce a real `m_playerSpeed` change. The blocker below is resolved and
+the measurement is the next thing to run.
+
+**Do not use H's by-product table as the answer.** Player x is float32-accumulated,
+so per-tick dx is piecewise constant *per binade* and each of those rows was
+sampled at a different x magnitude — they are ±1 ulp, not constants. Measure
+where the quantisation is smallest, or by a method robust to it, and deliver the
+exact float32 increment per bucket in the form
+`1.2982504367828369 == float32(1.298250437)`.
+
+Also re-test the premise: the non-proportionality below was computed from the
+*community* values, so if those are wrong the premise may be too.
+
+**Historical note.** The claim that "synth's speed portals already land at
+exactly the requested x" was true as a *placement* claim and was doing silent
+duty as a *functional* one for the whole life of this item.
 
 Synth's speed portals already land at exactly the requested x. Only 1×
 (`1.298250437` units/tick) is this repo's own measurement; 0.5×/2×/3×/4× are
@@ -233,10 +253,12 @@ horizon is a third of a tile.
 - [ ] `dx = x[t+1] - x[t]` on the tick after the portal.
 - [ ] Replace the four unverified constants in `UNITS_PER_TICK`.
 
-### 1.3 Cross a real vehicle portal  — **BLOCKED** (was "READY NOW")
+### 1.3 Cross a real vehicle portal  — **HALF DONE** (see H and K)
 
-The ship portal at x=4500 was crossed at x-level on 2026-08-12 and produced no
-`MODE` line and no `COND` edge. Same root cause as 1.2.
+The ship portal now fires: `cube -> ship` at x=4468.861, a real `COND` edge. But
+**zero `MODE` lines**, in any run — so the acceptance criterion below is only
+half met, and the ship-entry path is not evidenced by the hook written to
+evidence it. See K before calling this done.
 
 Synth's ship portal lands correctly. Objective A is currently validated only at
 the **flag-decode** level via `GDRL_FORCE_VEHICLE`. A real portal also sets
@@ -757,10 +779,187 @@ question. If it were a different level the crossing argument dissolves.
 * To reach tier (iv): one launch, one level, `GDRL_PROBE_CMDVEC` **and** player
   `m_positionX` in the same stream, so crossing and activation come from one run.
 
+### H. D and E are FIXED and confirmed against the live game
+
+Both landed this session. `mod/src/{synth.hpp,synth.cpp,telemetry.cpp,probes.cpp}`.
+Build green and universal; every change sits behind `GDRL_SYNTH` / `GDRL_ENV` /
+`GDRL_CENSUS`, all still defaulting to off.
+
+**A portal fired — the first one ever.** From `Geode 2026-08-12 17.15.38.log`,
+reproduced byte-identically in two further launches (17.23.09, 17.25.07):
+
+```
+[gdrl] COND step=0  x=1163.871 cube grav=dn size=1.00 spd=1.10 gmul=0.96 warp=1.00 dual=0 sideways=0
+```
+
+`spd` had been `0.90` on all 57,009 prior observations. All six now fire — 1.10 @
+x=1163.871, 1.30 @ 1758.925, 1.60 @ 2361.310, 0.70 @ 2971.625, 0.90 @ 3570.410,
+and `cube -> ship` @ 4468.861. Activation x sits ~36 units before each portal's
+centre, which is rect overlap (2× portal rect starts at 1174.5; player
+half-width 15 → contact at 1163.87 + 15 = 1178.87).
+
+The fix restates `synth.hpp`'s layout constants in **runtime** y with a measured
+`kLevelStringYOffset = 90.f` and a `levelStringY()` converter; `kGroundY` is
+deleted, because it was a runtime coordinate being written into a level string.
+
+**The move trigger is provably undisturbed** — verified three ways rather than
+assumed, since the forward-projection ground truth depends on it: its
+level-string bytes are unchanged (`1,901,2,300,3,45,51,1,10,2,28,0,29,90,30,0`),
+its runtime position is `OBJLIST-OBJ i=1 id=901 x=300.0000 y=135.0000`, and
+`GDRL_PROBE_CMDVEC` still gives `tick=233 v560=1 … tick=715 v560=0`, identical
+to the 2026-08-11 run the ground truth was recorded against.
+
+**Speed table, as a by-product — `±1 ulp`, NOT final constants.** Null-input run,
+4,242 ticks, segmented by `m_playerSpeed`:
+
+| `m_playerSpeed` | dx/tick (median) | ×240 |
+|---|---|---|
+| 0.8999999761581421 | 1.298248291015625 | 311.580 |
+| 1.100000023841858 | 1.6142578125 | 387.422 |
+| 1.2999999523162842 | 1.949951171875 | 467.988 |
+| 1.600000023841858 | 2.39990234375 | 575.977 |
+| 0.699999988079071 | 1.04638671875 | 251.133 |
+
+Player x is float32-accumulated (see C), so per-tick dx is piecewise constant
+**per float32 binade** and each row above was sampled at a different x magnitude.
+Track 1.2's dedicated measurement is still required; do not paste these into
+`UNITS_PER_TICK`.
+
+**Section factors, measured:**
+
+- **`m_sectionXFactor = 0.01`** (on the wire as float `0.009999999776482582`) — a
+  multiplier, 1/width.
+- **`m_sectionYFactor = 0`**, and this is the measurement, not a hole. It is
+  **not** a second inversion. GD's grid is effectively 1-D: `m_sections`' middle
+  vector is 1 deep on every level dumped (max y column = 1 on Stereo Madness's
+  2,399 objects and on synth's 13), and `scanObjects` never used it — the
+  vertical filter is a direct `m_positionY` compare. **Nothing may "fix" y by
+  symmetry with x, and nothing may divide by it.**
+
+Two cross-checks, independent of each other and of the code: `1/0.01 = 100`, so
+`floor(x·sxf) == floor(x/100)`, README's documented rule; and
+`m_sections.size() == floor(levelLength·sxf) + 1`, exact on both levels (Stereo
+Madness 26724 → 268 columns measured 268; synth 6340 → 64 measured 64). The
+divisor reading would need 2,672,400.
+
+**Result:** `objectCount == 0` on **0** of 3,722 gameplay ticks, against 4,344 of
+4,653 before. Window width a constant 1800.0 tracking the player at exactly
+−400/+1400; 19 columns described per step (= 1800/100 + 1), `objectsDropped = 0`,
+`obs.problems()` empty throughout.
+
+The `100.f` fallback was **removed, not replaced**. A non-positive or non-finite
+factor now yields a zero-area window, all 64 columns `UNKNOWN`, `objectCount = 0`
+with `OBJECTS_UNAVAILABLE` set (which `env.py` already decodes as "did not
+look"), and one `log::error`.
+
+- [ ] **UNVERIFIED:** that GD's own column index is `floor(x·sxf)` *in float*
+      rather than some other rounding. The two cross-checks pin the factor, not
+      the rounding mode; a boundary object could still be one column out.
+- [ ] **UNVERIFIED:** that the +90 level-string→runtime y offset is universal
+      rather than a property of these object classes. 4-for-4 from the prior
+      session plus 13-for-13 from this one, **all on synth**. No main level
+      checked.
+- [ ] Inertness after these edits is by construction (all behind `GDRL_*`
+      gates), **not** by test — the repo still has no automated inertness test
+      and no no-switch baseline diff was run.
+
+### I. `env.py` carried the SAME inversion — fixed, but `test_env.py` was never reached
+
+The C++ fix would have been silently defeated on the Python side. `column_span()`
+and `known_mask()` both divided by `sectionXFactor`; with `sxf = 0.01` the index
+landed ~10⁴ out of range, `valid` was False everywhere, and **the coverage mask
+was incapable of reporting anything as known.** The loopback fixture also
+fabricated `sectionXFactor = 100.0, sectionYFactor = 100.0` — values the game
+produces neither of.
+
+Fixed in `trainer/env.py`: `section_factor()` / `section_width()` / `column_span()`
+now return `None` rather than substituting a constant, `known_mask()` multiplies
+and refuses whole-frame on `OBJECTS_UNAVAILABLE` or an unusable factor, and the
+fixture publishes `MEASURED_SECTION_X_FACTOR` / `_Y_FACTOR` / `_LEVEL_LENGTH` /
+`_COLUMNS` carrying the measured values and their provenance.
+
+**This work was interrupted by a session limit mid-edit**, leaving a missing
+`import math` — 27 `test_env.py` failures from one absent line. Added; suite is
+**182 passing**.
+
+- [ ] **`trainer/test_env.py` was never touched.** Two things remain:
+      - **No test exercises the new refusal path.** `publish()` takes
+        `section_x_factor` precisely so a test can inject an unusable value and
+        assert the decoder *refuses* rather than substitutes. Nothing does. The
+        most valuable branch of this fix is currently unexercised.
+      - **The three `known_mask` tests were never graded.** They now run against
+        the measured 0.01 only because the fixture's default changed underneath
+        them. They pass, but nobody has checked *what they would still catch* —
+        and they are exactly the tests that passed happily against a fabricated
+        header for the whole life of the file.
+
+### J. BUG (open, uninvestigated): a phantom object is glued to the player
+
+Revealed — **not caused** — by the section-factor fix; the old 0.64-unit window
+saw nothing at all. Every `GDRL_ENV` step carries **five entries with
+`objectID=1816, objectType=39, kind=1 (SOLID), uniqueID=25`** — the *same*
+`uniqueID` five times — at the player's x **lagged one tick**, y=105, 30×30.
+
+**It is not in `m_objects` at all**: the census sees 13 objects on synth and no
+1816. It appears to exist only in the section grid.
+
+Consequences: `objectCount` averaged 7.64 where the true in-window count is 2–3,
+and **any consumer that does not dedupe by `uniqueID` sees a solid block sitting
+on the player.** In neither README nor TODO before now.
+
+- [ ] What is it? Check `objectType=39` / `objectID=1816` **against the
+      bindings**, not a community table — key `36` is still open for exactly
+      this reason.
+- [ ] Why five, with one `uniqueID`? "Spans five columns" does not obviously fit
+      entries pinned to the player's lagged x. Resolve rather than assume.
+- [ ] Does it appear on a real level, or only synth? Decides artifact vs
+      property of the observation path.
+- [ ] **Is the player itself being emitted as geometry?** If so every consumer
+      sees the player as a solid obstacle on top of itself, which poisons
+      Objective A conditioning and all trajectory validation against real
+      geometry.
+- [ ] **Do not fix before identifying.** Dedupe-by-`uniqueID` vs
+      filter-by-object-id is a semantic decision, and filtering by an id whose
+      meaning is unknown is the guess this repo bans.
+
+### K. `MODE` never fires, and `COND step=` is always 0
+
+- [ ] **`MODE` lines never fire, even on a genuine vehicle change.** The ship
+      portal at x=4500 produces a `COND` edge `cube -> ship` and **zero** `MODE`
+      lines in any run. So `PlayerObject::switchedToMode` is either not the
+      mechanism for ship entry or its `before == after` guard always trips.
+      **Track 1.3's acceptance criterion ("confirm `COND`/`MODE` lines fire") is
+      therefore half met**: `COND` is the working instrument, `MODE` is not, and
+      the ship-entry path is not evidenced by the hook written to evidence it.
+- [ ] **`COND step=` is 0 in every log ever**, this session and prior, while x
+      advances to 4468. `main.cpp`'s comment claiming "tick-exact attribution
+      comes from `m_currentStep`, logged alongside" is **false as written** — the
+      field is useless as logged. The x values are still good. (Consistent with
+      the older finding that `m_currentStep` is not the physics-tick counter.)
+
 ### Queue for next session, in order
 
-1. **Fix D and E** (both C++, one agent — concurrent `geode build`s race).
-   D unblocks Tracks 1.2 and 1.3; E unblocks every object-window consumer.
+0. **Nothing is blocked on a build or a measurement right now.** The tree is
+   green at 182 tests and both C++ bugs are fixed and confirmed live. Items 1–3
+   are `trainer/`-only and need no GD; item 4 needs the sandbox.
+1. **Finish `test_env.py`** (I) — the refusal-path test and the three
+   `known_mask` gradings. Small, and it is the branch that keeps "unknown" from
+   silently becoming "empty".
+2. **The three evidence-labelling fixes** from the independent-validation section
+   above, plus the two the validator added (the drift-bound test's tier-(ii)
+   label over data it simulates; the tick-391-vs-392 framing). `trainer/` only.
+3. **Identify the phantom 1816 object** (J). Needs a GD run and possibly a probe.
+   Blocks trusting `objectCount` and every object-window consumer — which is
+   most of what E just unblocked.
+4. **Measure the four speed buckets properly** (Track 1.2) — now genuinely
+   unblocked, portals fire. Beware the float32-binade quantisation: measure
+   where it is smallest, or use a method robust to it. The H table is not it.
+5. **`MODE` / `COND step=`** (K) — instrument defects, cheap, and 1.3 cannot be
+   called done without the first.
+6. Then Track 0.2 (predictor spec + test-tier audit), which A, B and the
+   validation now feed.
+
+~~1. **Fix D and E**~~ — done, see H.
 2. ~~**Finish the stopped audit of `test_projection_groundtruth.py`**~~ — done,
    see A.
 3. **Correct `trajectory.py`'s arrival-tick model** per B and C — **landed and

@@ -584,26 +584,101 @@ uint8_t collapseKind(GameObjectType t, bool slopeIsHazard) {
 // grid: m_objects is every object in the level, and re-filtering ~2400 of them
 // every physics step would put the scan cost on the critical path.
 void scanObjects(GJBaseGameLayer* layer, GdrlObservation* o, double px, double py) {
-    // The divisor is emitted alongside the result (header.sectionXFactor) so
-    // Python can check the column indexing rather than inherit an assumption.
-    // README quotes sectionIndex = floor(x / 100); m_sectionXFactor is the
-    // field GD itself carries, and whether they always agree is UNVERIFIED.
-    const float sxf = layer->m_sectionXFactor > 0.f ? layer->m_sectionXFactor : 100.f;
+    // m_sectionXFactor is a MULTIPLIER (1 / section width), NOT a divisor.
+    // Column index is floor(x * sxf).
+    //
+    // Measured, not assumed -- `[gdrl] sectionXFactor` from the section-grid
+    // dump in main.cpp, identical in all 52 surviving logs and re-measured this
+    // session:  sectionXFactor = 0.01, sectionYFactor = 0.
+    //
+    // Cross-checked two independent ways, as required before touching this:
+    //   (a) against README's documented sectionIndex = floor(x / 100):
+    //       1 / 0.01 = 100, so floor(x * 0.01) == floor(x / 100). Agrees.
+    //   (b) against m_sections.size() vs m_levelLength, per level:
+    //         Stereo Madness  26724 * 0.01 = 267.24  ->  268 columns (measured 268)
+    //         synth            6340 * 0.01 =  63.40  ->   64 columns (measured  64)
+    //       i.e. nCols == floor(levelLength * sxf) + 1, exact on both. Under the
+    //       old divisor reading the same levels would need 2,672,400 and 634,000
+    //       columns, which is off by 1e4.
+    //
+    // The previous code divided. With col1 clamped to col0 + 63 that made the
+    // advertised right edge 64 * 0.01 = 0.64 units, i.e. a window of
+    // [px - 400, 0.64], and objectCount was 0 on 4,344 of 4,653 gameplay ticks
+    // on a level spanning x = 0..6340.
+    //
+    // There is deliberately NO fallback constant. The old `: 100.f` default was
+    // at least the right order of magnitude under the divisor reading; under the
+    // multiplier reading it is wrong by 1e4 and would advertise a 6.4-million-
+    // unit window as scanned. A section factor we cannot use means we did not
+    // look, and saying "did not look" is the whole point of this channel.
+    const float sxf = layer->m_sectionXFactor;
+    if (!(sxf > 0.f) || !std::isfinite(sxf)) {
+        // Fail loudly and claim nothing: zero-area window, every column
+        // UNKNOWN, OBJECTS_UNAVAILABLE set so Python reads objectCount == 0 as
+        // "not looked at" rather than "looked and found none".
+        o->header.sectionXFactor   = layer->m_sectionXFactor;
+        o->header.sectionYFactor   = layer->m_sectionYFactor;
+        o->header.levelLength      = layer->m_levelLength;
+        o->header.coverageStartCol = 0;
+        o->header.sectionColumns   = (int)layer->m_sections.size();
+        o->header.windowMinX = (float)px;
+        o->header.windowMaxX = (float)px;
+        o->header.windowMinY = (float)py;
+        o->header.windowMaxY = (float)py;
+        for (int c = 0; c < GDRL_COVERAGE_COLS; c++) {
+            o->coverage[c] = (uint8_t)GdrlCoverage::UNKNOWN;
+        }
+        for (int i = 0; i < GDRL_MAX_OBJECTS; i++) o->objects[i].known = 0;
+        o->header.objectCount    = 0;
+        o->header.objectsDropped = 0;
+        o->header.flags |= (uint16_t)GdrlHeaderFlag::OBJECTS_UNAVAILABLE;
+        o->validity.objectsTruncated = 0;
+
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            log::error("[gdrl] ENV m_sectionXFactor = {} is unusable (expected a "
+                       "positive multiplier, measured 0.01). The object window is "
+                       "reported as NOT SCANNED for every step of this run rather "
+                       "than guessed at.", sxf);
+        }
+        return;
+    }
+    // Units per section column. Named so the two readings cannot be confused
+    // again: sxf converts x -> column, secW converts column -> x.
+    const double secW = 1.0 / (double)sxf;
 
     const double minX = px - g_winBehind;
     const double maxXRequested = px + g_winAhead;
     const double minY = py - g_winVert;
     const double maxY = py + g_winVert;
 
+    // m_sectionYFactor is measured 0 on every level dumped so far, and the
+    // middle vector of m_sections is 1 deep in every dump ("max column (y) = 1"
+    // on both Stereo Madness's 2399 objects and the synth level's 13). So GD's
+    // grid is effectively 1-D and there is no y index to invert. Nothing here
+    // uses it: the vertical filter below is a direct m_positionY compare
+    // against [minY, maxY], which is correct whatever the y bucketing does. The
+    // raw value still travels in the header so Python can see the 0 too.
     const int nCols = (int)layer->m_sections.size();
-    int col0 = (int)std::floor(minX / sxf);
+    int col0 = (int)std::floor(minX * (double)sxf);
     if (col0 < 0) col0 = 0;
-    int col1 = (int)std::floor(maxXRequested / sxf);
+    int col1 = (int)std::floor(maxXRequested * (double)sxf);
     // Never claim a window wider than the coverage mask can describe. A column
     // the mask cannot speak for must not be inside the region Python is told
     // was scanned, or "unknown" silently becomes "empty".
     col1 = std::min(col1, col0 + GDRL_COVERAGE_COLS - 1);
-    const double maxX = std::min(maxXRequested, (double)(col1 + 1) * (double)sxf);
+
+    // Right edge of column col1 in world x. Computed from secW and then backed
+    // off until it indexes to col1 under the SAME expression used above, so the
+    // advertised window and the coverage mask cannot disagree by a rounding
+    // step at the boundary. (sxf is a float; 1/0.01f is 100.0000022, so the
+    // naive edge can sit a fraction of a unit past the column it names.)
+    double colEdge = (double)(col1 + 1) * secW;
+    for (int i = 0; i < 8 && (int)std::floor(colEdge * (double)sxf) > col1; i++) {
+        colEdge = std::nextafter(colEdge, 0.0);
+    }
+    const double maxX = std::min(maxXRequested, colEdge);
 
     o->header.sectionXFactor   = layer->m_sectionXFactor;
     o->header.sectionYFactor   = layer->m_sectionYFactor;
@@ -1024,12 +1099,16 @@ $execute {
 //     GDRL_ENV=0 baseline. If it does not, the scan is mutating game state and
 //     every observation taken through it is suspect.
 //
-// (5) m_sectionXFactor is the correct divisor for the column index. README
-//     quotes floor(x/100); this uses the field. TEST: log m_sectionXFactor on
-//     Stereo Madness (main.cpp already dumps it once) and confirm it is 100. If
-//     it is not, the coverage mask is describing the wrong columns, which would
-//     mark real geometry ABSENT -- the one direction of error the mask exists
-//     to prevent.
+// (5) RESOLVED 2026-08-12, and it was a real bug. m_sectionXFactor is NOT a
+//     divisor: it is a multiplier, 1/width. Measured 0.01 on Stereo Madness and
+//     on the synth level (main.cpp's section-grid dump), cross-checked against
+//     m_sections.size() == floor(levelLength * sxf) + 1 on both. The old
+//     divisor arithmetic collapsed the advertised window to 0.64 units and
+//     reported objectCount = 0 on 4,344 of 4,653 gameplay ticks. See the
+//     comment in scanObjects. Still UNVERIFIED: that GD's own index expression
+//     is floor(x * sxf) in float rather than some other rounding -- the two
+//     cross-checks constrain the factor, not the rounding mode, so a boundary
+//     object could still be one column out.
 //
 // (6) Hook ordering between translation units. main.cpp, experiments.cpp and
 //     this file all $modify GJBaseGameLayer::update. Geode nests them in an

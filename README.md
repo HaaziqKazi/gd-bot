@@ -951,6 +951,92 @@ Also settled: all 177 Fingerdash move triggers are touch-triggered, so none
 fire on the player crossing their x. Fingerdash cannot serve as the natural
 forward-projection test; synthetic levels remain the route.
 
+## The section grid is 1-D, and `m_sectionXFactor` is a multiplier
+
+**Measured live 2026-08-12**, and cross-checked two ways that do not route
+through the code being checked.
+
+| field | value | meaning |
+|---|---|---|
+| `m_sectionXFactor` | `0.01` (wire float `0.009999999776482582`) | a **multiplier**, 1/width. Column index is `floor(x · sxf)` |
+| `m_sectionYFactor` | `0` | not a hole and **not** a second inversion — see below |
+
+`1/0.01 = 100`, so `floor(x·sxf) == floor(x/100)`, which is the documented
+section rule. Independently: `m_sections.size() == floor(levelLength·sxf) + 1`,
+exact on both levels tested — Stereo Madness `26724 → 268` columns (measured
+268), synth `6340 → 64` (measured 64). Under the divisor reading the same level
+would need 2,672,400 columns.
+
+**`m_sectionYFactor = 0` is the measurement, not a missing value.** GD's grid is
+effectively one-dimensional: the middle vector of `m_sections` is 1 deep on every
+level dumped (max y column = 1 across Stereo Madness's 2,399 objects and synth's
+13), and the vertical filter in `scanObjects` is a direct `m_positionY` compare
+that never used the factor. **Do not "fix" y by symmetry with x, and do not
+divide by it.**
+
+Both `telemetry.cpp` and `trainer/env.py` previously treated the factor as a
+divisor. The cost was not a wrong number but a confident one: with `sxf = 0.01`
+the advertised object window collapsed to `64 × 0.01 = 0.64` units, and
+`objectCount` was **0 on 4,344 of 4,653 gameplay ticks** on a level spanning
+x = 0–6340. After the fix, 0 of 3,722 — window width a constant 1800.0 tracking
+the player at −400/+1400, 19 columns described per step (`1800/100 + 1`).
+
+Neither side has a fallback constant any more. The old `100.f` / `100.0` was the
+right order of magnitude under the divisor reading and wrong by 10,000× under the
+multiplier one. An unusable factor now produces a zero-area window, all columns
+`UNKNOWN`, and `OBJECTS_UNAVAILABLE` — because **a column the coverage mask
+cannot speak for must not sit inside the region the policy is told was scanned,
+or "unknown" silently becomes "empty."**
+
+UNVERIFIED: that GD's own indexing is `floor(x·sxf)` *in float* rather than some
+other rounding. The cross-checks pin the factor, not the rounding mode, so a
+boundary object could still be one column out.
+
+**Do not trust `objectCount` yet.** Fixing the window revealed — it did not cause
+— five entries per step sharing one `uniqueID` (`objectID=1816, objectType=39,
+kind=SOLID`), sitting at the player's x lagged one tick. That object is not in
+`m_objects` at all. `objectCount` averaged 7.64 where the true in-window count is
+2–3, and any consumer that does not dedupe by `uniqueID` sees a solid block
+riding on top of the player. Unidentified; see TODO item J before building on the
+object window.
+
+## Synth level-string y is runtime y − 90, and the portals now fire
+
+**Measured, 4-for-4 across distinct values in one session and 13-for-13 in the
+next**, read at `m_positionX/Y`: every synth object's runtime y is its
+level-string y **+ 90**. `synth.hpp`'s `kGroundY = 105.f` had been written as if
+the level string were runtime coordinates, so every portal sat 90 units above
+the player, whose runtime y is a measured constant 105.
+
+The failure was silent for the life of the file: the portals *placed* correctly
+at the requested x, and "lands at exactly the requested x" was quietly doing duty
+as a functional claim. `m_playerSpeed` read `0.8999999761581421` on all 57,009
+observations of the last measurement run — past five speed portals and a ship
+portal — with zero `COND` edges after step 0.
+
+With the offset applied (`kLevelStringYOffset = 90.f`, `levelStringY()`), all six
+fire:
+
+```
+[gdrl] COND step=0  x=1163.871 cube grav=dn size=1.00 spd=1.10 gmul=0.96 warp=1.00 dual=0 sideways=0
+```
+
+1.10 @ x=1163.871, 1.30 @ 1758.925, 1.60 @ 2361.310, 0.70 @ 2971.625, 0.90 @
+3570.410, and `cube -> ship` @ 4468.861 — reproduced byte-identically across
+three launches. Activation sits ~36 units before each portal's centre, which is
+rect overlap, not a timing offset (the 2× portal's rect starts at x=1174.5;
+player half-width 15 gives contact at 1163.87 + 15 = 1178.87).
+
+The move trigger is **provably undisturbed**, checked three ways rather than
+assumed, because the forward-projection ground truth depends on it: level-string
+bytes unchanged, runtime position `x=300.0000 y=135.0000`, and `CMDVEC` still
+`tick=233 v560=1 … tick=715 v560=0` — identical to the run the ground truth was
+recorded against.
+
+UNVERIFIED: that the +90 offset is universal rather than a property of these
+object classes. Every observation so far is on the synth level; no main level has
+been checked.
+
 ## Moving geometry: the move pipeline does not write the CCNode position
 
 **Validated against the running game.** `GDRL_PROBE_MOVE=1` on the synth level

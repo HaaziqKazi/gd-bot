@@ -41,10 +41,21 @@ constexpr int kIdSpeed3x      = 203;
 constexpr int kIdSpeed4x      = 1334;
 constexpr int kIdShipPortal   = 13;
 
-// Ground level. The player spawns at y=105 and runs along the floor; putting
-// objects there keeps everything in the player's path without needing to model
-// the camera.
-constexpr float kGroundY = 105.f;
+// There is deliberately no kGroundY here any more.
+//
+// It was `constexpr float kGroundY = 105.f`, commented "the player spawns at
+// y=105", and every object's y was written as kGroundY + something. That is a
+// runtime coordinate written straight into the level string, and the level
+// string is NOT in runtime coordinates: runtime m_positionY = level-string y
+// + 90 (measured 4-for-4 on 2026-08-12). So the five speed portals and the ship
+// portal, meant to sit on the player at runtime y=105, were emitted at
+// level-string 105 and landed at runtime 195 -- 90 units above the player, with
+// no overlap possible for anything under 150 units tall. m_playerSpeed stayed
+// 0.8999999761581421 on all 57,009 observations of a full run past all six.
+//
+// Layout now lives in synth.hpp in RUNTIME y and goes through
+// synth::levelStringY() on the way out, so the two coordinate systems cannot be
+// confused in this file again.
 
 struct Prop {
     int         key;
@@ -100,7 +111,7 @@ gd::string syntheticLevelString() {
     objects.push_back(objectString({
         {kPropObjectID, std::to_string(kIdBlock)},
         {kPropX,        "50"},
-        {kPropY,        num(kGroundY + 480.f)},
+        {kPropY,        num(levelStringY(kHighBlockRuntimeY))},
     }));
 
     // The Probe A target: a *plain* move trigger. Neither touch (11) nor spawn
@@ -112,7 +123,7 @@ gd::string syntheticLevelString() {
     objects.push_back(objectString({
         {kPropObjectID,  std::to_string(kIdMoveTrigger)},
         {kPropX,         num(kMoveTriggerX)},
-        {kPropY,         num(kGroundY - 60.f)},
+        {kPropY,         num(levelStringY(kMoveTriggerRuntimeY))},
         {kPropTargetGrp, "1"},
         {kPropDuration,  num(kMoveDuration)},
         {kPropMoveX,     "0"},
@@ -125,7 +136,7 @@ gd::string syntheticLevelString() {
     objects.push_back(objectString({
         {kPropObjectID, std::to_string(kIdBlock)},
         {kPropX,        num(kMovedBlockX)},
-        {kPropY,        num(kGroundY + 240.f)},
+        {kPropY,        num(levelStringY(kMovedBlockRuntimeY))},
         {kPropGroups,   "1"},
     }));
 
@@ -145,7 +156,7 @@ gd::string syntheticLevelString() {
         objects.push_back(objectString({
             {kPropObjectID, std::to_string(p.id)},
             {kPropX,        num(p.x)},
-            {kPropY,        num(kGroundY)},
+            {kPropY,        num(levelStringY(kPortalRuntimeY))},
         }));
     }
 
@@ -155,7 +166,7 @@ gd::string syntheticLevelString() {
     objects.push_back(objectString({
         {kPropObjectID, std::to_string(kIdShipPortal)},
         {kPropX,        num(kShipPortalX)},
-        {kPropY,        num(kGroundY)},
+        {kPropY,        num(levelStringY(kPortalRuntimeY))},
     }));
 
     // Sets the level length. m_levelLength is derived from the furthest object,
@@ -164,7 +175,7 @@ gd::string syntheticLevelString() {
     objects.push_back(objectString({
         {kPropObjectID, std::to_string(kIdBlock)},
         {kPropX,        num(kEndBlockX)},
-        {kPropY,        num(kGroundY + 240.f)},
+        {kPropY,        num(levelStringY(kEndBlockRuntimeY))},
     }));
 
     for (const auto& obj : objects) o << ';' << obj;
@@ -199,6 +210,11 @@ GJGameLevel* makeSyntheticLevel() {
               // one per ';' after the header
               (int)std::count(raw.begin(), raw.end(), ';'),
               (int)raw.size(), compress ? 1 : 0);
+    // The authored string itself, so the level-string y of every object is
+    // checkable from the log against the runtime m_positionY the census prints,
+    // without inferring either from the other. ~300 bytes, and only ever
+    // emitted under GDRL_SYNTH=1.
+    log::info("[gdrl] SYNTH raw={}", raw.c_str());
 
     return level;
 }

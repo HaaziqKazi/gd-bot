@@ -837,21 +837,45 @@ namespace {
             return;
         }
 
-        std::map<int, std::pair<int, float>> byId;   // id -> (count, first x)
+        struct Row { int count; double x; double y; };
+        std::map<int, Row> byId;   // id -> (count, first x, first y)
         const unsigned n = layer->m_objects->count();
         for (unsigned i = 0; i < n; i++) {
             auto* obj = static_cast<GameObject*>(layer->m_objects->objectAtIndex(i));
             if (!obj) continue;
             const int id = obj->m_objectID;
             auto it = byId.find(id);
-            if (it == byId.end()) byId.emplace(id, std::make_pair(1, obj->getPositionX()));
-            else                  it->second.first++;
+            // m_positionX/m_positionY (+0x3b0/+0x3b8), not getPositionX/Y().
+            // Those are the fields the move pipeline writes and the fields the
+            // ENV object channel reports, so this census answers the same
+            // question the rest of the repo asks.
+            if (it == byId.end()) byId.emplace(id, Row{1, obj->m_positionX, obj->m_positionY});
+            else                  it->second.count++;
         }
 
         log::info("[gdrl] OBJLIST m_objects={} distinctIds={}", n, byId.size());
         for (auto const& [id, v] : byId) {
-            log::info("[gdrl] OBJLIST-ID id={:<5} n={:<4} firstX={:.1f}",
-                      id, v.first, v.second);
+            log::info("[gdrl] OBJLIST-ID id={:<5} n={:<4} firstX={:.4f} firstY={:.4f}",
+                      id, v.count, v.x, v.y);
+        }
+
+        // Small levels get a full per-object dump with the collision rect.
+        // The synth level has 13 objects; a main level has ~2400, and dumping
+        // those would bury the log. The rect is what decides whether a portal
+        // can overlap the player at all, which is the question that "every
+        // synth portal is 90 units too high" turned on -- and it is a different
+        // question from where the object's centre is.
+        if (n <= 64) {
+            for (unsigned i = 0; i < n; i++) {
+                auto* obj = static_cast<GameObject*>(layer->m_objects->objectAtIndex(i));
+                if (!obj) continue;
+                const auto& r = obj->getObjectRect();
+                log::info("[gdrl] OBJLIST-OBJ i={:<3} id={:<5} x={:.4f} y={:.4f} "
+                          "rect=[{:.2f},{:.2f} {:.2f}x{:.2f}] type={}",
+                          i, (int)obj->m_objectID, obj->m_positionX, obj->m_positionY,
+                          r.origin.x, r.origin.y, r.size.width, r.size.height,
+                          (int)obj->m_objectType);
+            }
         }
     }
 

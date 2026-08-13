@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import math
 import mmap
 import os
 import time
@@ -372,11 +373,57 @@ class Observation:
     def coverage(self) -> np.ndarray:
         return self.record["coverage"]
 
-    def column_span(self) -> tuple[float, float]:
-        """World-x range that ``coverage[0]`` .. ``coverage[-1]`` describes."""
-        sxf = float(self.header["sectionXFactor"]) or 100.0
+    def section_factor(self) -> float | None:
+        """``m_sectionXFactor`` if it can be used as an index multiplier.
+
+        ``None`` if it cannot. See :meth:`section_width` for the measurement and
+        for why there is no fallback constant.
+        """
+        sxf = float(self.header["sectionXFactor"])
+        if not (sxf > 0.0) or not np.isfinite(sxf):
+            return None
+        return sxf
+
+    def section_width(self) -> float | None:
+        """Units of world x per section column, or ``None`` if unusable.
+
+        ``m_sectionXFactor`` is a MULTIPLIER (1 / section width), not a divisor:
+        the column index is ``floor(x * sxf)``. Measured live 2026-08-12 as
+        ``0.01`` (on the wire as the float ``0.009999999776482582``), which makes
+        ``floor(x * sxf) == floor(x / 100)`` and agrees with README's documented
+        ``sectionIndex = floor(x / 100)``. Independently cross-checked against
+        ``m_sections.size() == floor(levelLength * sxf) + 1``, exact on two
+        levels (Stereo Madness 26724 -> 268 columns, synth 6340 -> 64). The
+        divisor reading would need 2,672,400 columns for the same level.
+
+        There is deliberately NO fallback constant. The old ``or 100.0`` was the
+        right order of magnitude under the divisor reading and is wrong by 1e4
+        under the multiplier one, and a wrong section width does not produce a
+        wrong answer -- it produces a confident one. ``None`` here means the same
+        thing the mod's own guard means: we cannot speak for any column.
+
+        This is the inverse direction only (column -> x, for describing a span).
+        Indexing x -> column goes through :meth:`section_factor` and a multiply,
+        the same expression the mod uses, so the two cannot round apart.
+        """
+        sxf = self.section_factor()
+        if sxf is None:
+            return None
+        return 1.0 / sxf
+
+    def column_span(self) -> tuple[float, float] | None:
+        """World-x range that ``coverage[0]`` .. ``coverage[-1]`` describes.
+
+        ``None`` when ``sectionXFactor`` is unusable: the mask then describes no
+        world x at all, and a numeric span would be a claim about geometry
+        nobody indexed. Callers must treat ``None`` as "did not look", the same
+        way ``unavailable_tables()`` is treated.
+        """
+        sec_w = self.section_width()
+        if sec_w is None:
+            return None
         start = int(self.header["coverageStartCol"])
-        return start * sxf, (start + GDRL_COVERAGE_COLS) * sxf
+        return start * sec_w, (start + GDRL_COVERAGE_COLS) * sec_w
 
     def known_mask(self, height: int, width: int, cell_size: float,
                    player_col: int) -> np.ndarray:
@@ -392,8 +439,25 @@ class Observation:
         is past the end of GD's own ``m_sections``, so the engine has no geometry
         there -- genuinely empty, not merely unobserved. TRUNCATED does not
         count: the array filled mid-column, so what is missing is unknown.
+
+        Two whole-frame refusals come first, both returning an all-False grid:
+
+        * ``OBJECTS_UNAVAILABLE`` set. The mod raises it on the no-player path
+          (``telemetry.cpp:889``) *without* calling ``scanObjects``, so on that
+          frame ``coverage`` and the window bounds are whatever the previous
+          frame left there. Reading them would be reporting last frame's
+          geometry as this frame's observation.
+        * ``sectionXFactor`` unusable. Without the section width there is no
+          mapping from world x to a coverage column, so no column can be spoken
+          for. See ``section_width()`` for why there is no fallback constant.
         """
         h = self.header
+        if self.has_flag(GdrlHeaderFlag.OBJECTS_UNAVAILABLE):
+            return np.zeros((height, width), dtype=bool)
+        sxf = self.section_factor()
+        if sxf is None:
+            return np.zeros((height, width), dtype=bool)
+
         player_x = float(h["playerX"])
         player_y = float(h["playerY"])
         origin_x = player_x - player_col * cell_size
@@ -405,10 +469,16 @@ class Observation:
         in_x = (cols_x >= float(h["windowMinX"])) & (cols_x <= float(h["windowMaxX"]))
         in_y = (rows_y >= float(h["windowMinY"])) & (rows_y <= float(h["windowMaxY"]))
 
-        sxf = float(h["sectionXFactor"]) or 100.0
+        # floor(x * sxf) -- a MULTIPLY, and the same expression the mod indexes
+        # with (telemetry.cpp:664). Not a divide: sxf is 0.01, so dividing lands
+        # the index 1e4 too high and every column falls outside the mask, which
+        # is how this silently reported "nothing is known" everywhere.
         start_col = int(h["coverageStartCol"])
         cov = np.asarray(self.coverage())
-        section = np.floor(cols_x / sxf).astype(np.int64) - start_col
+        section = np.floor(cols_x * sxf).astype(np.int64) - start_col
+        # A column the mask cannot speak for is UNKNOWN, never "empty" -- and
+        # because col_known ANDs this with in_x, being inside the advertised
+        # window is not on its own enough to be called known.
         valid = (section >= 0) & (section < GDRL_COVERAGE_COLS)
         state = np.where(valid, cov[np.clip(section, 0, GDRL_COVERAGE_COLS - 1)],
                          int(GdrlCoverage.UNKNOWN))
@@ -758,6 +828,32 @@ def make_loopback_buffer() -> mmap.mmap:
     return mmap.mmap(-1, SHARED_SIZE)
 
 
+# Measured live 2026-08-12 from the section-grid dump (`[gdrl] sectionXFactor`
+# / `sectionYFactor` in main.cpp), identical in all 52 surviving logs:
+#
+#   m_sectionXFactor = 0.01   -- a MULTIPLIER (1 / section width). On the wire as
+#                                the float32 0.009999999776482582. Column index
+#                                is floor(x * sxf), which is README's documented
+#                                floor(x / 100).
+#   m_sectionYFactor = 0      -- and this is the measurement, not a hole. GD's
+#                                grid is effectively 1-D: the middle vector of
+#                                m_sections is 1 deep on every level dumped, and
+#                                the mod's vertical filter is a direct
+#                                m_positionY compare. Nothing may "fix" this by
+#                                symmetry with x, and nothing may divide by it.
+#
+# The fixture publishes these rather than a round 100.0 because a test built on
+# a header the game never produces is testing a world that does not exist.
+MEASURED_SECTION_X_FACTOR = float(np.float32(0.01))
+MEASURED_SECTION_Y_FACTOR = 0.0
+
+# Stereo Madness, from the same dump: m_levelLength 26724, m_sections.size() 268.
+# floor(26724 * 0.01) + 1 == 268 -- exact, and the arithmetic only closes under
+# the multiplier reading (the divisor reading would need 2,672,400 columns).
+MEASURED_LEVEL_LENGTH = 26724.0
+MEASURED_SECTION_COLUMNS = 268
+
+
 class SyntheticGame:
     """The mod's half of the protocol, in Python, for tests.
 
@@ -808,8 +904,15 @@ class SyntheticGame:
                 coverage_cols: int = 8,
                 status: GdrlStatus = GdrlStatus.OK,
                 extra_flags: int = 0,
-                object_count_total: int = 2400) -> int:
-        """Write one observation and advance the sequence, seqlock and all."""
+                object_count_total: int = 2400,
+                section_x_factor: float = MEASURED_SECTION_X_FACTOR,
+                section_y_factor: float = MEASURED_SECTION_Y_FACTOR) -> int:
+        """Write one observation and advance the sequence, seqlock and all.
+
+        ``section_x_factor`` defaults to the measured 0.01 and is a parameter
+        only so a test can inject an unusable value and check that the decoder
+        refuses rather than substitutes.
+        """
         self.seq += 1                       # odd: write in progress
         self.obs["seq"] = self.seq
 
@@ -831,9 +934,9 @@ class SyntheticGame:
         h["stepIndex"] = tick if step_index is None else step_index
         h["dtIn"] = 1.0 / GDRL_TICK_HZ
         h["dtUsed"] = 1.0 / GDRL_TICK_HZ
-        h["sectionXFactor"] = 100.0
-        h["sectionYFactor"] = 100.0
-        h["levelLength"] = 26724.0
+        h["sectionXFactor"] = section_x_factor
+        h["sectionYFactor"] = section_y_factor
+        h["levelLength"] = MEASURED_LEVEL_LENGTH
         h["isDualMode"] = 0
         h["isPaused"] = 0
         h["inResetDelay"] = 0
@@ -847,17 +950,44 @@ class SyntheticGame:
                       | int(GdrlHeaderFlag.SPEEDSEGS_UNAVAILABLE)
                       | extra_flags)
 
-        col0 = max(0, int((player_x - 400.0) // 100.0))
-        h["coverageStartCol"] = col0
-        h["sectionColumns"] = 268
-        h["windowMinX"] = col0 * 100.0
-        h["windowMaxX"] = (col0 + coverage_cols) * 100.0
-        h["windowMinY"] = player_y - 600.0
-        h["windowMaxY"] = player_y + 600.0
-
+        # The window arithmetic follows scanObjects() in telemetry.cpp rather
+        # than being invented here: column index is floor(x * sxf) (a MULTIPLY),
+        # and the advertised right edge is backed off until it indexes to the
+        # last column the mask speaks for, so the window and the mask cannot
+        # disagree by a rounding step at the boundary. sectionYFactor is not
+        # used for anything, here or in the mod -- the vertical filter is a
+        # direct y compare -- so its measured 0 never reaches a divide.
+        sxf = float(np.float32(section_x_factor))
         cov = self.obs["coverage"]
-        cov[:] = int(GdrlCoverage.UNKNOWN)
-        cov[:coverage_cols] = int(GdrlCoverage.SCANNED)
+        if not (sxf > 0.0) or not np.isfinite(sxf):
+            # The mod's refusal path: claim nothing. Zero-area window, every
+            # column UNKNOWN, OBJECTS_UNAVAILABLE set so a count of 0 reads as
+            # "did not look" rather than "looked and found none".
+            h["coverageStartCol"] = 0
+            h["sectionColumns"] = MEASURED_SECTION_COLUMNS
+            h["windowMinX"] = player_x
+            h["windowMaxX"] = player_x
+            h["windowMinY"] = player_y
+            h["windowMaxY"] = player_y
+            h["flags"] = int(h["flags"]) | int(GdrlHeaderFlag.OBJECTS_UNAVAILABLE)
+            cov[:] = int(GdrlCoverage.UNKNOWN)
+        else:
+            sec_w = 1.0 / sxf
+            col0 = max(0, int(math.floor((player_x - 400.0) * sxf)))
+            col1 = col0 + coverage_cols - 1
+            edge = (col1 + 1) * sec_w
+            for _ in range(8):
+                if math.floor(edge * sxf) <= col1:
+                    break
+                edge = math.nextafter(edge, 0.0)
+            h["coverageStartCol"] = col0
+            h["sectionColumns"] = MEASURED_SECTION_COLUMNS
+            h["windowMinX"] = col0 * sec_w
+            h["windowMaxX"] = edge
+            h["windowMinY"] = player_y - 600.0
+            h["windowMaxY"] = player_y + 600.0
+            cov[:] = int(GdrlCoverage.UNKNOWN)
+            cov[:coverage_cols] = int(GdrlCoverage.SCANNED)
 
         p0 = self.obs["players"][0]
         p0["present"] = 1
