@@ -669,15 +669,37 @@ void scanObjects(GJBaseGameLayer* layer, GdrlObservation* o, double px, double p
     // was scanned, or "unknown" silently becomes "empty".
     col1 = std::min(col1, col0 + GDRL_COVERAGE_COLS - 1);
 
-    // Right edge of column col1 in world x. Computed from secW and then backed
-    // off until it indexes to col1 under the SAME expression used above, so the
-    // advertised window and the coverage mask cannot disagree by a rounding
-    // step at the boundary. (sxf is a float; 1/0.01f is 100.0000022, so the
-    // naive edge can sit a fraction of a unit past the column it names.)
-    double colEdge = (double)(col1 + 1) * secW;
-    for (int i = 0; i < 8 && (int)std::floor(colEdge * (double)sxf) > col1; i++) {
-        colEdge = std::nextafter(colEdge, 0.0);
-    }
+    // Right edge of column col1 in world x, one section width past its left
+    // edge. sxf is a float, so 1/0.01f is 100.0000022 and this edge sits a
+    // fraction of a ULP past the column it names.
+    //
+    // NOTHING CORRECTS FOR THAT, DELIBERATELY. A `std::nextafter` back-off used
+    // to sit here, justified by the claim that it kept the advertised window and
+    // the coverage mask from disagreeing by a rounding step at the boundary. It
+    // was measured dead on 2026-08-14 and deleted. Two reasons, and the second
+    // is the one that matters:
+    //
+    // 1. It could not survive the store. windowMaxX below is an f32; at
+    //    colEdge = 6400.0001430511511 (col1 = 63) one double ULP is 9.095e-13
+    //    against an f32 ULP of 4.8828e-4, i.e. the correction was 1.9e-9 of the
+    //    truncation that immediately follows it. Swept over EVERY float32 px in
+    //    [-2048, 131072) at sxf = 0.01f -- 2,365,587,456 values, and the loop
+    //    ran on all of them -- the stored float is bit-identical with and
+    //    without the back-off. Same result over 1.31e9 (sxf, col1) pairs with
+    //    sxf spanning [0.001, 1), and with a window wide enough
+    //    (GDRL_ENV_WIN_AHEAD=20000, which clamps at :670) that colEdge rather
+    //    than maxXRequested is what wins the min() below, on all 2.37e9.
+    // 2. The guarantee it claimed to provide is false, and the real one does not
+    //    need it. Window and mask DO disagree, at the LEFT edge, on every
+    //    nonzero start column: windowMinX is px - g_winBehind (:709) while col0
+    //    is floor(minX * sxf) (:664), so the window starts partway INTO column
+    //    col0 -- by up to a full section. The reason that cannot lie is
+    //    structural: Python looks `state` up from the per-cell section index,
+    //    not from the window, so knowledge is the INTERSECTION of the two and
+    //    widening either alone can only remove cells, never add them. See the
+    //    "WHY A WINDOW THAT IS TOO WIDE CANNOT LIE" comment in env.py's
+    //    known_mask(), which is the correct statement of it.
+    const double colEdge = (double)(col1 + 1) * secW;
     const double maxX = std::min(maxXRequested, colEdge);
 
     o->header.sectionXFactor   = layer->m_sectionXFactor;

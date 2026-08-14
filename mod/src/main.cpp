@@ -32,6 +32,7 @@
 #include "level_dump.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 
 using namespace geode::prelude;
@@ -263,6 +264,42 @@ namespace {
     void resetCondEdge() {
         g_cond     = CondState{};
         g_condInit = false;
+    }
+
+    // The physics-tick index for a log line.
+    //
+    // NOT m_currentStep. That field was logged as `step=` on the COND and MODE
+    // lines under a comment claiming it gave tick-exact attribution, and it
+    // never did: it is CONSTANT across an attempt while x runs from 0 to 4468.
+    // In six of the eight logs kept in backups/reference-logs it is 0 on every
+    // COND line; in the other two (the same run) it is 0 at x=0.000 and 416 on
+    // all six later lines, x=1163.871 through x=4468.861. Either way it dates
+    // nothing. In the 2.2081 bindings it sits in GJBaseGameLayer's replay/record
+    // block, between m_replayRandSeed and m_queuedButtons -- a recording cursor,
+    // not a physics counter. (Why 416 rather than 0 in that run is not known and
+    // was not chased; it is not a tick either way.)
+    //
+    // lround(m_attemptTime * 240) is the repo's established tick clock and the
+    // one every other file here uses (probes.cpp, experiments.cpp,
+    // telemetry.cpp:1037). Never `t == n/240.0`: GD accumulates a float32 1/240
+    // into a double, so the sum is never exactly n/240.
+    //
+    // Validated live on 2026-08-14 (backups/reference-logs/
+    // mode-tick-fixed-20260814-133745.log): across the synth level's five speed
+    // segments the implied dx/dtick is 1.298340, 1.616995, 1.955795, 2.384043
+    // and 1.046827 units/tick, i.e. 311.60 / 388.08 / 469.39 / 572.17 / 251.24
+    // units/s against the 311.58 / 387.42 / 468.00 / 576.00 / 251.16 the README
+    // lists -- within 0.7%, and within 0.03% on the two segments long enough for
+    // the per-frame sampling of the endpoints not to dominate. That is a check
+    // of the CLOCK, not of the speed constants.
+    //
+    // -1 means "no PlayLayer", which is a real state (menus, editor) and is
+    // reported rather than papered over with 0 -- 0 is a legitimate tick.
+    constexpr double kTicksPerSec = 240.0;
+
+    long gdrlTick() {
+        auto* pl = PlayLayer::get();
+        return pl ? std::lround(pl->m_attemptTime * kTicksPerSec) : -1;
     }
 }
 
@@ -575,9 +612,17 @@ class $modify(GDRLBaseGameLayer, GJBaseGameLayer) {
         //
         // Sampled per render frame rather than per physics tick, which is fine
         // *for cataloguing*: a regime change persists for many ticks, so no
-        // transition can hide between two samples. Tick-exact attribution comes
-        // from m_currentStep, logged alongside, and from the switchedToMode
-        // hook below which fires on the transition itself.
+        // transition can hide between two samples. `tick=` therefore dates the
+        // frame that NOTICED the change, not the tick that caused it -- it is an
+        // upper bound, loose by up to one frame's worth of ticks (32 at the
+        // speeds this runs at). The MODE line below is the tighter one: it fires
+        // inside the transition itself, so it is exact to within the one-tick
+        // question telemetry.cpp's test list still has open -- whether GD
+        // advances m_attemptTime before or after the physics step. Do not read
+        // either as sub-tick attribution.
+        //
+        // `tick=` was `step=` (m_currentStep) until 2026-08-14, which was a
+        // constant for the whole attempt and dated nothing. See gdrlTick().
         //
         // Emitted on change only. A level is a few dozen regime changes, so
         // this is a complete record of the conditioning trajectory at a cost
@@ -596,9 +641,9 @@ class $modify(GDRLBaseGameLayer, GJBaseGameLayer) {
             }
 
             log::info(
-                "[gdrl] COND step={:<7} x={:.3f} {:<6} grav={} size={:.2f} "
+                "[gdrl] COND tick={:<7} x={:.3f} {:<6} grav={} size={:.2f} "
                 "spd={:.2f} gmul={:.2f} warp={:.2f} dual={} sideways={}",
-                m_currentStep, p->getPositionX(), vehicleName(cur.vehicle),
+                gdrlTick(), p->getPositionX(), vehicleName(cur.vehicle),
                 cur.upsideDown ? "up" : "dn", cur.vehicleSize, cur.playerSpeed,
                 cur.gravity, cur.timeWarp, (int)cur.dual, (int)cur.sideways);
 
@@ -610,9 +655,9 @@ class $modify(GDRLBaseGameLayer, GJBaseGameLayer) {
         // COND lines, which are the actual data.
         if (g_verbose && g_frame % 60 == 0) {
             log::info(
-                "[gdrl] f={:<5} step={:<7} dt={:.5f} pos=({:.1f},{:.1f}) "
+                "[gdrl] f={:<5} tick={:<7} dt={:.5f} pos=({:.1f},{:.1f}) "
                 "yv={:+.2f} {} ground={} up={} size={:.2f} spd={:.2f}",
-                g_frame, m_currentStep, dt, p->getPositionX(), p->getPositionY(),
+                g_frame, gdrlTick(), dt, p->getPositionX(), p->getPositionY(),
                 p->m_yVelocity, vehicleName(cur.vehicle),
                 (int)p->m_isOnGround, (int)p->m_isUpsideDown,
                 p->m_vehicleSize, p->m_playerSpeed);
@@ -651,18 +696,46 @@ class $modify(GDRLPlayerObject, PlayerObject) {
         return PlayerObject::pushButton(button);
     }
 
+    // WHY THIS LOGS UNCONDITIONALLY, AND WHY `after` IS NOT THE NEW VEHICLE.
+    //
+    // This hook fired zero times in every run ever recorded, including the runs
+    // whose COND line shows a genuine cube -> ship edge at x=4468. The cause was
+    // an `if (before == after) return;` guard here, and it could never be false
+    // on a mode ENTRY. Read off the shipped arm64 binary (GD 2.2081), not
+    // inferred:
+    //
+    //   GJBaseGameLayer::switchToFlyMode  (m1 0xfcebc)
+    //     0x1000fcee8  bl 0x100388338   <- PlayerObject::switchedToMode, FIRST
+    //     ...
+    //     0x1000fcf50  cmp w22,#0x5 / b.ne ...      switch on the portal type
+    //     0x1000fcf94  bl 0x10038bf50   <- toggleBirdMode(true, ...)   type 19
+    //     0x1000fcfc4  bl 0x10038b4d8   <- toggleFlyMode(true, ...)    type 5
+    //
+    // and switchedToMode itself (0x100388338) only ever calls the toggles with
+    // enable = 0 (`mov w1,#0` at 0x100388354/0x100388364/0x10038837c before each
+    // bl): it CLEARS the outgoing vehicle. The flag that names the incoming one
+    // is set by the caller, after this returns. So entering a ship from a cube
+    // is before = cube, after = cube, and the guard swallowed it. The instrument
+    // was broken, not the mechanism -- switchedToMode has 21 `bl` call sites and
+    // 0 `b` ones in the arm64 slice, so it is a real call, not inlined away.
+    //
+    // Consequence for the reader: `cleared=` is the vehicle state after the
+    // outgoing mode was turned off, which is why it is usually the same as
+    // `from=`. The vehicle that was ENTERED is named by the next COND line, and
+    // `type=` is the raw GameObjectType the portal passed -- logged raw because
+    // the portal-id -> enum mapping is read off logs, not assumed. Measured so
+    // far: type=5 at the x=4500 ship portal.
     void switchedToMode(GameObjectType type) {
         const Vehicle before = deriveVehicle(this);
         PlayerObject::switchedToMode(type);
-        const Vehicle after  = deriveVehicle(this);
+        const Vehicle cleared = deriveVehicle(this);
 
         auto* pl = PlayLayer::get();
         if (!pl || (pl->m_player1 != this && pl->m_player2 != this)) return;
-        if (before == after) return;
 
-        log::info("[gdrl] MODE step={:<7} x={:.3f} {} -> {} (objectType={}) p{}",
-                  pl->m_currentStep, this->getPositionX(),
-                  vehicleName(before), vehicleName(after),
+        log::info("[gdrl] MODE tick={:<7} x={:.3f} from={} cleared={} type={} p{}",
+                  gdrlTick(), this->getPositionX(),
+                  vehicleName(before), vehicleName(cleared),
                   (int)type, pl->m_player2 == this ? 2 : 1);
     }
 };

@@ -1049,8 +1049,12 @@ With the offset applied (`kLevelStringYOffset = 90.f`, `levelStringY()`), all si
 fire:
 
 ```
-[gdrl] COND step=0  x=1163.871 cube grav=dn size=1.00 spd=1.10 gmul=0.96 warp=1.00 dual=0 sideways=0
+[gdrl] COND tick=896  x=1163.871 cube grav=dn size=1.00 spd=1.10 gmul=0.96 warp=1.00 dual=0 sideways=0
 ```
+
+(The field was `step=` when this was first recorded, carrying `m_currentStep`,
+which is not the physics-tick counter. It is now `tick=`, from
+`lround(m_attemptTime * 240)`. See "Vehicle mode transitions" below.)
 
 1.10 @ x=1163.871, 1.30 @ 1758.925, 1.60 @ 2361.310, 0.70 @ 2971.625, 0.90 @
 3570.410, and `cube -> ship` @ 4468.861 — reproduced byte-identically across
@@ -1506,6 +1510,33 @@ cannot use one static action mapping — it has to be conditioned on the active
 physics regime. The mod emits that regime as a `COND` line whenever any axis of
 it changes, plus a `MODE` line from `PlayerObject::switchedToMode` for the
 transition itself.
+
+### `MODE` names the vehicle *departed*, not the one entered
+
+Established 2026-08-14, and it is the opposite of what the hook's name suggests.
+`PlayerObject::switchedToMode` **clears the outgoing vehicle**; the flag naming
+the incoming one is set by the caller *after* it returns. Read off the arm64
+slice: `GJBaseGameLayer::switchToFlyMode` calls `switchedToMode` **first**, and
+only then branches to `toggleFlyMode(true, …)`; inside `switchedToMode` the
+toggles are called exclusively with `enable = 0`.
+
+Consequence: on a cube→ship entry, `before == after == cube`. A
+`if (before == after) return;` guard therefore swallowed **every** transition,
+which is why `MODE` had never once fired in the project's history despite the
+hook being correctly installed and not inlined (21 `bl` call sites, 0 `b`). The
+guard is gone. Live, on the same tick:
+
+```
+[gdrl] MODE tick=3092 x=4468.861 from=cube cleared=cube type=5 p1
+[gdrl] COND tick=3092 x=4468.861 ship  grav=dn size=1.00 spd=0.90 …
+```
+
+`cleared=cube` is the disassembly's prediction confirmed, and `type=5` matches
+the `cmp w22,#0x5 → toggleFlyMode` branch. **So read the pair together: `MODE`
+gives the departure and the raw `GameObjectType`, `COND` on the same tick gives
+the vehicle actually entered.** Only `5 → ship` is confirmed live;
+`19 → toggleBirdMode` (ufo) and a third branch at `0x29` are from disassembly
+only, and `type=6` (four lines per level load, at tick 0) is **unidentified**.
 
 Fields, all read live off `PlayerObject` / `GJBaseGameLayer` rather than inferred
 from portals passed, so they stay correct through triggers and respawns:

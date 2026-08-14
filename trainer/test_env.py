@@ -336,6 +336,272 @@ UNUSABLE_SECTION_FACTORS = [
 ]
 
 
+# -- the fixture's window must be the mod's window ---------------------------
+#
+# Every mask test below reads windowMinX out of the header and recomputes its
+# own expectation from it, so all of them pass against ANY internally consistent
+# window -- including the one publish() used to emit, whose left edge was snapped
+# down to a column boundary and was therefore up to a full 100-unit section wider
+# than anything scanObjects() can produce (TODO L5).
+#
+# MEASURED 2026-08-14: reverting publish()'s left edge to the old
+# ``col0 * sec_w`` failed ZERO of the 64 tests that existed before these two were
+# added -- the whole L5 fix was ungraded. That is what they are for, and it is
+# why they compare header fields directly instead of going through known_mask().
+
+def _mod_scan_window(player_x: float, player_y: float, sxf_f32: float, *,
+                     coverage_cols: int, n_cols: int,
+                     win_behind: float, win_ahead: float, win_vert: float) -> dict:
+    """``scanObjects()``'s window arithmetic, restated from telemetry.cpp:649-808.
+
+    EVERY LINE NUMBER BELOW IS IN telemetry.cpp AS OF COMMIT 8dd5ceb
+    (``git show 8dd5ceb:mod/src/telemetry.cpp``). The working tree moved while
+    this was being written -- the right-edge ``nextafter`` back-off at
+    8dd5ceb:677-680 was measured dead and deleted, which shifts everything after
+    :669 -- and no published value changes either way, so this transcription
+    keeps the loop and pins the commit rather than chasing the numbers.
+
+    Statement for statement, in the mod's order and the mod's FORM: the window is
+    primary (``minX = px - g_winBehind``, :651, published unchanged at :688) and
+    the column is DERIVED from it (``col0 = (int)floor(minX * sxf)``, :664). The
+    inverse -- deriving the advertised edge from the column -- is a different
+    function whenever ``minX`` is not exactly on a column boundary, which for the
+    measured sxf is almost always, and it is the bug L5 closed.
+
+    TIER (i). This is a transcription of the C, written out a second time; it
+    grades our restatement of the mod, NOT the mod. If telemetry.cpp changes,
+    both this and publish() are wrong together and nothing here will say so --
+    only reading the C will. What it does catch is publish() drifting away from
+    scanObjects() again, which is exactly how L5 happened.
+
+    Every constant comes from the mod: g_winBehind / g_winAhead / g_winVert
+    default to 400 / 1400 / 600 at telemetry.cpp:184-186, and the clamp at :670
+    is GDRL_COVERAGE_COLS (``coverage_cols`` here is publish()'s stand-in for it,
+    so a test can hand the decoder a narrower mask).
+
+    The coverage array covers only the states the fixture can reach. The mod has
+    two more: ABSENT for a null ``m_sections[col]`` (:712) and TRUNCATED when the
+    object array fills mid-column, neither of which publish() produces -- tests
+    that need TRUNCATED write it by hand.
+    """
+    sxf = float(np.float32(sxf_f32))            # float m_sectionXFactor
+    sec_w = 1.0 / sxf                                                    # :649
+    min_x = player_x - win_behind                                        # :651
+    max_x_requested = player_x + win_ahead                               # :652
+    min_y = player_y - win_vert                                          # :653
+    max_y = player_y + win_vert                                          # :654
+
+    col0 = int(math.floor(min_x * sxf))                                  # :664
+    if col0 < 0:                                                         # :665
+        col0 = 0
+    col1 = int(math.floor(max_x_requested * sxf))                        # :666
+    col1 = min(col1, col0 + coverage_cols - 1)                           # :670
+
+    col_edge = (col1 + 1) * sec_w                                        # :677
+    i = 0
+    while i < 8 and math.floor(col_edge * sxf) > col1:                   # :678-680
+        col_edge = math.nextafter(col_edge, 0.0)
+        i += 1
+    max_x = min(max_x_requested, col_edge)                               # :681
+
+    coverage = np.empty(sg.GDRL_COVERAGE_COLS, dtype=np.uint8)           # :696-808
+    scanned = 0
+    for c in range(sg.GDRL_COVERAGE_COLS):
+        col = col0 + c
+        if col > col1:                                                   # :698
+            coverage[c] = int(sg.GdrlCoverage.UNKNOWN)
+        elif col >= n_cols:                                              # :705
+            coverage[c] = int(sg.GdrlCoverage.ABSENT)
+        else:
+            coverage[c] = int(sg.GdrlCoverage.SCANNED)
+            scanned += 1
+
+    # The (float) stores at :686-691. windowMin/MaxX are float32 on the wire, so
+    # the comparison has to happen after that truncation or it is a comparison of
+    # a precision the header cannot carry.
+    return {
+        "coverageStartCol": col0,
+        "sectionColumns": n_cols,
+        "windowMinX": float(np.float32(min_x)),
+        "windowMaxX": float(np.float32(max_x)),
+        "windowMinY": float(np.float32(min_y)),
+        "windowMaxY": float(np.float32(max_y)),
+        "coverage": coverage,
+        "scanned": scanned,
+        # Not published by the mod. Kept for the disagreement test below: it is
+        # the left edge the OLD fixture advertised, i.e. column-primary.
+        "snapped_min_x": float(np.float32(col0 * sec_w)),
+    }
+
+
+def _column_tickover_x(k: int) -> float:
+    """Smallest world x whose section index ``floor(x * sxf)`` is ``k``.
+
+    Derived from the measured sxf (0.009999999776482582), not tabulated: the
+    boundary sits at ``k / sxf``, about ``k * 100.0000022``, and the two neighbours
+    of it are where a window-primary and a column-primary left edge disagree by
+    the largest amount that still keeps the column the same.
+    """
+    sxf = envmod.MEASURED_SECTION_X_FACTOR
+    x = k * (1.0 / sxf)
+    while math.floor(x * sxf) < k:
+        x = math.nextafter(x, math.inf)
+    while math.floor(math.nextafter(x, -math.inf) * sxf) >= k:
+        x = math.nextafter(x, -math.inf)
+    return x
+
+
+def _f32_neighbours_of_player_x(min_x: float) -> tuple[float, float]:
+    """The float32 player_x either side of the one that puts minX on ``min_x``.
+
+    player_x arrives as ``p1->getPositionX()`` (8dd5ceb:927), a float
+    widened to double, so only float32-representable placements are reachable in
+    the game -- and the column boundary always falls strictly BETWEEN two of them
+    at these magnitudes, which is what makes the pair straddle the tick-over.
+    """
+    exact = min_x + envmod.MOD_WIN_BEHIND
+    hi = np.float32(exact)
+    if float(hi) < exact:
+        hi = np.nextafter(hi, np.float32(np.inf))
+    lo = np.nextafter(np.float32(hi), np.float32(-np.inf))
+    return float(lo), float(hi)
+
+
+def _agreement_placements():
+    """(id, player_x, win_behind, win_ahead, coverage_cols) for the pair below.
+
+    Three groups, and each is here for a reason:
+
+      * the placements the mask tests in this file actually stand on (500, 450,
+        12345) -- 500 is the L5 worst case, a full section of phantom window;
+      * player_x < g_winBehind, where minX goes negative and the ``col0 < 0``
+        clamp at :665 engages while minX itself is published unclamped;
+      * boundary-adjacent pairs straddling a column tick-over at k = 1, 5, 119,
+        267, where window-primary and column-primary arithmetic diverge most.
+    """
+    out = [
+        pytest.param(500.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD, 4,
+                     id="the-default-mask-placement"),
+        pytest.param(450.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD, 4,
+                     id="px-450"),
+        pytest.param(12345.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD, 4,
+                     id="px-12345-start-col-119"),
+        pytest.param(500.0, envmod.MOD_WIN_BEHIND, 8000.0, sg.GDRL_COVERAGE_COLS,
+                     id="window-wide-enough-that-the-64-col-clamp-binds"),
+        # THE CONFIGURATION THE MOD ACTUALLY RUNS: all 64 columns available and
+        # the mod's own 1400 ahead, so the WINDOW binds at 19 columns and the
+        # clamp at :670 never does. Every other placement here has
+        # coverage_cols small enough that the clamp wins, which makes the
+        # requested edge, the +1 on col1 and the clamp itself unobservable --
+        # three mutants survived on exactly that (D5, D6, D7).
+        pytest.param(500.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD,
+                     sg.GDRL_COVERAGE_COLS, id="mod-defaults-window-binds"),
+        pytest.param(12345.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD,
+                     sg.GDRL_COVERAGE_COLS, id="mod-defaults-window-binds-deep"),
+        # Past the end of m_sections (268 columns, Stereo Madness), where the
+        # fixture's own ABSENT branch is the only thing that can be right.
+        pytest.param(26900.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD,
+                     sg.GDRL_COVERAGE_COLS, id="past-the-end-of-m-sections"),
+        pytest.param(100.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD, 4,
+                     id="window-reaches-left-of-x-zero"),
+        pytest.param(0.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD, 4,
+                     id="level-start"),
+        pytest.param(500.0, 0.0, envmod.MOD_WIN_AHEAD, 4,
+                     id="no-window-behind"),
+    ]
+    for k in (1, 5, 119, 267):
+        lo, hi = _f32_neighbours_of_player_x(_column_tickover_x(k))
+        out.append(pytest.param(lo, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD, 8,
+                                id=f"just-below-column-{k}"))
+        out.append(pytest.param(hi, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD, 8,
+                                id=f"just-above-column-{k}"))
+    return out
+
+
+AGREEMENT_PLACEMENTS = _agreement_placements()
+
+
+@pytest.mark.parametrize("player_x,win_behind,win_ahead,coverage_cols",
+                         AGREEMENT_PLACEMENTS)
+def test_the_fixture_publishes_the_window_the_mod_would(
+        loop, player_x, win_behind, win_ahead, coverage_cols):
+    """publish() must emit scanObjects()'s window, field for field.
+
+    TIER (i), and deliberately so: both sides are this repo's transcription of
+    telemetry.cpp:649-691, so agreement proves the transcription is consistent,
+    not that either matches the game. It is worth having anyway -- the fixture
+    silently drifted from the mod once already (L5) and every other test in this
+    file was blind to it, because they all recompute their expectations from
+    whatever window the header happens to carry.
+
+    If someone edits publish() to derive the window from the column again, this
+    fails and nothing else does.
+    """
+    game, chan = loop
+    game.publish(tick=1, player_x=player_x, player_y=105.0,
+                 coverage_cols=coverage_cols,
+                 win_behind=win_behind, win_ahead=win_ahead)
+    obs = chan.poll(timeout=1.0)
+    h = obs.header
+
+    want = _mod_scan_window(player_x, 105.0, envmod.MEASURED_SECTION_X_FACTOR,
+                            coverage_cols=coverage_cols,
+                            n_cols=envmod.MEASURED_SECTION_COLUMNS,
+                            win_behind=win_behind, win_ahead=win_ahead,
+                            win_vert=envmod.MOD_WIN_VERT)
+
+    for field in ("coverageStartCol", "sectionColumns"):
+        assert int(h[field]) == want[field], field
+    for field in ("windowMinX", "windowMaxX", "windowMinY", "windowMaxY"):
+        assert float(h[field]) == want[field], (
+            f"{field}: fixture {float(h[field])!r} != mod {want[field]!r}")
+    # The derived half: which coverage entries came out SCANNED / ABSENT /
+    # UNKNOWN follows from col0 and col1, so a window that agreed by accident
+    # while the columns disagreed is still caught. Compared entry by entry
+    # rather than by count -- a count cannot tell ABSENT from SCANNED, and the
+    # fixture's ABSENT branch had no test at all before this one.
+    got_cov = np.asarray(obs.coverage())
+    assert (got_cov == want["coverage"]).all(), (
+        f"coverage differs at {np.nonzero(got_cov != want['coverage'])[0].tolist()}")
+    assert game.scanned_cols == want["scanned"]
+
+
+def test_a_column_primary_left_edge_is_a_different_window(loop):
+    """The agreement test above is not vacuous: the two formulations differ.
+
+    Window-primary (``minX = px - g_winBehind``, telemetry.cpp:688) and
+    column-primary (``col0 * secW``, what publish() used to advertise) coincide
+    only when minX lands exactly on a column boundary. Over the placements above
+    they disagree on most, by up to a full section.
+
+    The two exact gaps asserted here are the ones recorded in TODO L5 and
+    re-measured on 2026-08-14 -- 500 -> 100.0 units, 12345 -> 45.0 units. Tier
+    (i) regression: it pins the size of the defect L5 removed, so a partial
+    revert cannot pass by shrinking the gap instead of closing it.
+    """
+    gaps = {}
+    for p in AGREEMENT_PLACEMENTS:
+        player_x, win_behind, win_ahead, coverage_cols = p.values
+        w = _mod_scan_window(player_x, 105.0, envmod.MEASURED_SECTION_X_FACTOR,
+                             coverage_cols=coverage_cols,
+                             n_cols=envmod.MEASURED_SECTION_COLUMNS,
+                             win_behind=win_behind, win_ahead=win_ahead,
+                             win_vert=envmod.MOD_WIN_VERT)
+        gaps[p.id] = w["windowMinX"] - w["snapped_min_x"]
+
+    differing = [k for k, v in gaps.items() if v != 0.0]
+    assert len(differing) >= len(gaps) - 2, (
+        "almost every placement should distinguish the two left edges; "
+        f"only {differing} do")
+    assert gaps["the-default-mask-placement"] == 100.0
+    assert gaps["px-12345-start-col-119"] == 45.0
+    # Left of x=0 the mod publishes the unclamped minX while col0 is clamped to
+    # 0, so the column-primary edge is 300 units to the RIGHT -- the one case
+    # where snapping made the window too NARROW, not too wide.
+    assert gaps["window-reaches-left-of-x-zero"] == -300.0
+    assert max(gaps.values()) < 100.0 + 1e-6
+
+
 def _cell_centres(obs, width: int, cell_size: float, player_col: int) -> np.ndarray:
     """World x of each raster column's centre, the way known_mask lays them out."""
     origin_x = float(obs.header["playerX"]) - player_col * cell_size
@@ -458,6 +724,16 @@ def test_an_unusable_section_factor_is_refused_not_substituted(loop, sxf):
     # The fixture mirrors the mod's own refusal: it also raises
     # OBJECTS_UNAVAILABLE, so a count of 0 reads as 'did not look'.
     assert "objects" in obs.unavailable_tables()
+    # And the frame this test stands on is the mod's refusal frame -- claim
+    # nothing (telemetry.cpp:620-634 as of 8dd5ceb): a zero-area window and all
+    # 64 columns UNKNOWN. Nothing checked that, so publish() could have left a
+    # real window here and every assertion above would still hold while the
+    # frame had stopped being the one the docstring describes (mutation-measured
+    # 2026-08-14: D15 survived).
+    h = obs.header
+    assert float(h["windowMinX"]) == float(h["windowMaxX"]) == float(h["playerX"])
+    assert float(h["windowMinY"]) == float(h["windowMaxY"]) == float(h["playerY"])
+    assert (np.asarray(obs.coverage()) == int(sg.GdrlCoverage.UNKNOWN)).all()
 
 
 @pytest.mark.parametrize("sxf", UNUSABLE_SECTION_FACTORS)
@@ -727,9 +1003,21 @@ def test_columns_past_the_end_of_the_coverage_array_are_unknown(loop):
     contains at least one cell centre -- including section 64 itself, the single
     index an upper bound written ``<=`` would let through. A coarser raster can
     step straight over it and the mutant lives.
+
+    ``win_ahead`` is 8000 (a value of GDRL_ENV_WIN_AHEAD, telemetry.cpp:185, not
+    a fabricated header) because the whole array has to actually be SCANNED for
+    the out-of-range read to be distinguishable. It was NOT, from the moment the
+    fixture started binding col1 to the requested window (L5): with the mod's
+    default 1400 ahead only 19 columns are SCANNED and coverage[63] is UNKNOWN,
+    so the clipped read returned UNKNOWN and the ``<=`` mutant survived while
+    this test stayed green. The guard below is the part that would have said so.
     """
     game, chan = loop
-    game.publish(tick=1, player_x=450.0, coverage_cols=sg.GDRL_COVERAGE_COLS)
+    game.publish(tick=1, player_x=450.0, coverage_cols=sg.GDRL_COVERAGE_COLS,
+                 win_ahead=8000.0)
+    assert (np.asarray(game.obs["coverage"]) == int(sg.GdrlCoverage.SCANNED)).all(), (
+        "this test needs the whole coverage array SCANNED, or a clipped "
+        "out-of-range read is indistinguishable from an honest UNKNOWN")
     start = int(game.obs["header"]["coverageStartCol"])
     end_x = (start + sg.GDRL_COVERAGE_COLS) / envmod.MEASURED_SECTION_X_FACTOR
     game.obs["header"]["windowMaxX"] = end_x + 2000.0
@@ -790,6 +1078,47 @@ def test_the_player_row_sits_at_half_the_grid_height(loop):
     assert rows == {height // 2 - 1, height // 2}
 
 
+def test_both_window_edges_are_inclusive_in_both_axes(loop):
+    """A cell centre exactly on a window edge is inside the window.
+
+    Tier (i): it pins the decoder's convention (``>=`` / ``<=`` on all four
+    edges, env.py known_mask), which mirrors the mod's own object filter --
+    ``m_positionY < minY || m_positionY > maxY`` at 8dd5ceb:762, i.e.
+    rejects strictly outside, keeps the edge.
+
+    Every other test places cell centres strictly inside the window, so the
+    vertical edges could be flipped to ``>`` / ``<`` with the whole suite green
+    (mutation-measured 2026-08-14: A15 survived). The four edges are set BY HAND
+    onto exact cell centres; that is a fabricated header, and it is the only way
+    to put a centre on an edge without relying on a coincidence of the fixture's
+    arithmetic.
+    """
+    game, chan = loop
+    game.publish(tick=1, player_x=500.0, player_y=105.0, coverage_cols=4)
+    height, width, cell, player_col = 8, 48, 30.0, 12
+
+    # The same layout known_mask() uses (env.py: origin_x / origin_y).
+    origin_x = 500.0 - player_col * cell
+    origin_y = 105.0 - (height // 2) * cell
+    cols_x = origin_x + (np.arange(width) + 0.5) * cell
+    rows_y = origin_y + (np.arange(height) + 0.5) * cell
+
+    lo_row, hi_row = 2, 5
+    # Columns 3 and 6 have centres at 245 and 335, inside the SCANNED span
+    # [0, 400) that player_x=500 with coverage_cols=4 produces -- so the only
+    # thing deciding the edges here is the window comparison.
+    lo_col, hi_col = 3, 6
+    h = game.obs["header"]
+    h["windowMinY"], h["windowMaxY"] = rows_y[lo_row], rows_y[hi_row]
+    h["windowMinX"], h["windowMaxX"] = cols_x[lo_col], cols_x[hi_col]
+    obs = chan.poll(timeout=1.0)
+
+    mask = obs.known_mask(height=height, width=width, cell_size=cell,
+                          player_col=player_col).grid()
+    assert set(np.nonzero(mask.any(axis=1))[0].tolist()) == set(range(lo_row, hi_row + 1))
+    assert set(np.nonzero(mask.any(axis=0))[0].tolist()) == set(range(lo_col, hi_col + 1))
+
+
 # -- the factor itself, against the live measurement -------------------------
 
 def test_the_section_factor_reproduces_the_measured_section_count(loop):
@@ -812,6 +1141,99 @@ def test_the_section_factor_reproduces_the_measured_section_count(loop):
     assert math.floor(envmod.MEASURED_LEVEL_LENGTH / sxf) + 1 != envmod.MEASURED_SECTION_COLUMNS
     # section_width() is 1 / sxf, i.e. 100 units per column, not the factor.
     assert obs.section_width() == pytest.approx(100.0, abs=1e-3)
+
+
+def test_the_level_length_cross_check_agrees_on_both_measured_levels(loop):
+    """``floor(levelLength * sxf) + 1 == sectionColumns``, on the two live pairs.
+
+    Tier (iii) in its inputs: 26724 -> 268 (Stereo Madness) and 6340 -> 64 (the
+    synth test level) were both dumped from the running game on 2026-08-12
+    (telemetry.cpp:597-600), and they are the ONLY two levels this identity has
+    ever been measured on -- which is exactly why L6 made it a diagnostic and not
+    a gate. The arithmetic being checked is this repo's, so the check itself is
+    tier (i); what is tier (iii) is that it has to close on those numbers.
+
+    Written because the diagnostic had no test at all: mutation-measured
+    2026-08-14, both dropping the ``+ 1`` and replacing the whole comparison with
+    ``return True`` survived the entire suite (C7, C8).
+    """
+    game, chan = loop
+    for length, cols in ((envmod.MEASURED_LEVEL_LENGTH, envmod.MEASURED_SECTION_COLUMNS),
+                         (envmod.MEASURED_SYNTH_LEVEL_LENGTH,
+                          envmod.MEASURED_SYNTH_SECTION_COLUMNS)):
+        game.publish(tick=1, level_length=length, section_columns=cols)
+        obs = chan.poll(timeout=1.0)
+        assert obs.level_length_agrees_with_section_count() is True, (length, cols)
+
+
+@pytest.mark.parametrize("sxf,agrees_stereo,agrees_synth", [
+    # The measured factor, and the four wrong readings L6 claims it rejects.
+    pytest.param(envmod.MEASURED_SECTION_X_FACTOR, True, True, id="measured"),
+    pytest.param(100.0, False, False, id="the-divisor-reading"),
+    pytest.param(1e-30, False, False, id="positive-finite-and-absurd"),
+    pytest.param(0.005, False, False, id="half"),
+    pytest.param(0.0101, False, False, id="one-percent-high"),
+    # And the honest limit of it: the acceptance band is 0.37% wide on Stereo
+    # Madness and 1.58% on the synth level, so a factor can be wrong and still
+    # pass on the shorter one. 0.01009 is that value -- computed from the band
+    # [63/6340, 64/6340), not tabulated.
+    pytest.param(0.01009, False, True, id="inside-the-synth-band-only"),
+])
+def test_the_level_length_cross_check_rejects_the_wrong_readings(
+        loop, sxf, agrees_stereo, agrees_synth):
+    """What the diagnostic can and cannot see, including where it is blind.
+
+    The ``inside-the-synth-band-only`` case is the reason L6 refuses to let this
+    gate ``known_mask()``: on the level this repo tests most, a 0.9% error in the
+    factor passes. A gate that weak, blanking an entire level's uncertainty
+    channel when it fires, is a worse failure than reporting and continuing.
+    """
+    game, chan = loop
+    game.publish(tick=1, section_x_factor=sxf,
+                 layout_x_factor=envmod.MEASURED_SECTION_X_FACTOR)
+    obs = chan.poll(timeout=1.0)
+    assert obs.level_length_agrees_with_section_count() is agrees_stereo
+
+    game.publish(tick=2, section_x_factor=sxf,
+                 layout_x_factor=envmod.MEASURED_SECTION_X_FACTOR,
+                 level_length=envmod.MEASURED_SYNTH_LEVEL_LENGTH,
+                 section_columns=envmod.MEASURED_SYNTH_SECTION_COLUMNS)
+    obs = chan.poll(timeout=1.0)
+    assert obs.level_length_agrees_with_section_count() is agrees_synth
+
+
+def test_the_level_length_cross_check_is_a_diagnostic_not_a_gate(loop):
+    """It answers None when it cannot ask, and it never blanks the mask.
+
+    L6's decision, pinned: a factor that is positive, finite and absurd
+    (1e-30 collapses every world x onto column 0) is REPORTED as disagreeing and
+    still produces a grid, because a false reject would present as "refused
+    everywhere" -- indistinguishable from a genuinely corrupt factor, which is
+    the exact confusion L4 exists to remove.
+    """
+    game, chan = loop
+    # Cannot ask: the factor is unusable, so there is no arithmetic to do.
+    game.publish(tick=1, section_x_factor=0.0)
+    assert chan.poll(timeout=1.0).level_length_agrees_with_section_count() is None
+
+    # Cannot ask: levelLength / sectionColumns unpopulated. Fabricated headers,
+    # named as such -- they stand in for a frame where the mod could not read
+    # m_levelLength or m_sections.
+    game.publish(tick=2, level_length=0.0)
+    assert chan.poll(timeout=1.0).level_length_agrees_with_section_count() is None
+    game.publish(tick=3, section_columns=0)
+    assert chan.poll(timeout=1.0).level_length_agrees_with_section_count() is None
+
+    # Disagrees, and still hands out a grid rather than a refusal.
+    game.publish(tick=4, player_x=500.0, coverage_cols=4, section_x_factor=1e-30,
+                 layout_x_factor=envmod.MEASURED_SECTION_X_FACTOR)
+    obs = chan.poll(timeout=1.0)
+    assert obs.level_length_agrees_with_section_count() is False
+    assert obs.section_factor() is not None, "still a usable multiplier, however absurd"
+    km = obs.known_mask(height=8, width=48, cell_size=30.0, player_col=12)
+    assert not km.refused
+    km.grid()
+    assert not obs.problems(), "the diagnostic must not be wired into problems()"
 
 
 def test_column_span_is_exactly_what_the_coverage_array_indexes(loop):

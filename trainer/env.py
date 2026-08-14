@@ -1263,13 +1263,20 @@ class SyntheticGame:
             col0 = max(0, col0)                                  # :665
             col1 = int(math.floor(max_x_requested * sxf))        # :666
             col1 = min(col1, col0 + coverage_cols - 1)           # :670
-            # The right-edge back-off, :677-680. MEASURED INERT for the value
-            # that reaches the wire: across 3000 start columns x 3 window widths
-            # the loop always iterated (1 or 2 nextafter steps) and the float32
-            # store landed on the SAME bit pattern as the un-backed-off edge in
-            # 9000 of 9000 cases. It is transcribed anyway because the mod has
-            # it and this file's job is to mirror the mod; it is not doing any
-            # work here, and nothing may rely on it doing any.
+            # The right-edge back-off, 8dd5ceb:677-680. MEASURED INERT for the
+            # value that reaches the wire: across 3000 start columns x 3 window
+            # widths the loop always iterated (1 or 2 nextafter steps) and the
+            # float32 store landed on the SAME bit pattern as the un-backed-off
+            # edge in 9000 of 9000 cases.
+            #
+            # 2026-08-14: the mod DELETED its copy, on a far stronger sweep
+            # (every float32 px in [0, 65536) at sxf = 0.01f, 1.2e9 values, all
+            # bit-identical). That change was still uncommitted when this comment
+            # was written, so the loop stays here rather than being removed on
+            # the strength of another agent's in-flight work -- it costs nothing,
+            # because inert means the published float32 is the same either way,
+            # which is also why no test can tell (mutate.py D8, an expected
+            # survivor). DELETE THIS BLOCK once the mod's deletion lands.
             col_edge = (col1 + 1) * sec_w                        # :677
             for _ in range(8):                                   # :678-680
                 if math.floor(col_edge * sxf) <= col1:
@@ -1282,8 +1289,8 @@ class SyntheticGame:
             h["windowMaxX"] = max_x                              # :689
             h["windowMinY"] = min_y                              # :690
             h["windowMaxY"] = max_y                              # :691
-            # The coverage loop, :696-766: UNKNOWN past col1, ABSENT past the end
-            # of GD's own section grid, SCANNED otherwise. (TRUNCATED is the one
+            # The coverage loop, 8dd5ceb:696-808: UNKNOWN past col1, ABSENT past
+            # the end of GD's own section grid, SCANNED otherwise. (TRUNCATED is one
             # state the fixture cannot reach -- it needs the object array to fill
             # mid-column -- so tests that need it set it by hand.)
             scanned = 0

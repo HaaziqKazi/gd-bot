@@ -3,12 +3,20 @@
 Single place for what is left. Companion to `README.md`, which records what has
 been **established**; this file records what has **not**.
 
-Status as of commit `0c6852d` + the 2026-08-13 session below.
+Status as of commit `8dd5ceb` + the 2026-08-13 (L) and 2026-08-14 (M) sessions
+below.
 
-> **Read "Session 2026-08-13" (section L) first.** It closes I, J and the
-> evidence-labelling debt, and it hardens the observation decoder. J turned out
-> to be the dangerous branch: **GD was emitting the player's own collision proxy
-> as a SOLID block on top of the player**, on every frame, on every level.
+> **Read sections L and M first.** Between them they close I, J and K, harden
+> the observation decoder, and delete one loop that could never have done
+> anything. J turned out to be the dangerous branch: **GD was emitting the
+> player's own collision proxy as a SOLID block on top of the player**, on every
+> frame, on every level.
+>
+> **Two claims in this file turned out to be false when written** — see L1 (the
+> vacuous-test claim was true of one assertion, not the enclosing test) and M3
+> (`COND step=` was *not* 0 in every log; it reads 416 in six lines of one). Both
+> conclusions survived; both supporting observations did not. Treat unchecked
+> numbers in this file as unchecked, including these.
 >
 > **Then read "Open decisions", which now leads with a benchmark question that
 > outranks everything else in this file.** Whether hidden simulator rollouts are
@@ -39,9 +47,9 @@ decided yet.
 | Unattended running | **Proven** — `GDRL_WINDOWED`, 0.41/s unfocused |
 | Binary env transport | **Built + validated** — defaults clean, observation passive |
 | Forward projection (Objective B) | **Validated against recorded game data** — motion model exact; the 1.9198-tick fire-tick lead is **corrected and independently re-validated** 2026-08-12. Residual is the game's own float32 drift (max `5.6457e-04` units, `0.0031` ticks) |
-| Conditioning (Objective A) | **A real portal crossing finally happened** 2026-08-12 (H): six synth portals fire, incl. `cube -> ship`. `MODE` still never fires (K). The phantom that made the geometry untrustworthy is **identified and filtered** (L2) |
+| Conditioning (Objective A) | **Mod side evidenced end-to-end** (H, L2, M2): six synth portals fire incl. `cube -> ship`, both `COND` and `MODE` now report it on the same tick, and the phantom that made the geometry untrustworthy is identified and filtered. **The Python side has never been checked against it** — `conditioning.py` vs what the mod actually emits is the open half (Track 1.3) |
 | Object observation window | **Fixed, confirmed live, and de-phantomed** (H/E/L2): `objectCount == 0` on 0 of 3,722 ticks, was 4,344 of 4,653; the player's own collision proxy no longer reports as a SOLID block on the player. **Any `objectCount` recorded before 2026-08-13 was inflated by 5–10** and must be recomputed, not trusted |
-| Observation decoder honesty | **Hardened** (L3/L4): refusal is structurally distinguishable from "known-empty" and cannot be laundered into an array; `test_env.py` regraded 7/25 → 25/25 by mutation |
+| Observation decoder honesty | **Hardened** (L3/L4/N): refusal is structurally distinguishable from "known-empty" and cannot be laundered into an array. `test_env.py` regraded by mutation 7/25 → **46/46**, and the harness now lives at `trainer/mutate.py` because the score decays silently as code moves (N2) |
 | Hold duration (Objective C) | **Untouched** |
 | In-context failure memory (Objective D) | **Nothing** |
 | Uncertainty policy (Objective E) | **Substrate only** (coverage mask + certainty channel) |
@@ -258,21 +266,27 @@ horizon is a third of a tile.
 - [ ] `dx = x[t+1] - x[t]` on the tick after the portal.
 - [ ] Replace the four unverified constants in `UNITS_PER_TICK`.
 
-### 1.3 Cross a real vehicle portal  — **HALF DONE** (see H and K)
+### 1.3 Cross a real vehicle portal  — **acceptance criterion MET** (H, M2)
 
-The ship portal now fires: `cube -> ship` at x=4468.861, a real `COND` edge. But
-**zero `MODE` lines**, in any run — so the acceptance criterion below is only
-half met, and the ship-entry path is not evidenced by the hook written to
-evidence it. See K before calling this done.
+Both instruments now fire on a real cube→ship crossing at x=4468.861, on the
+same tick, reproduced bit-identically across runs:
 
-Synth's ship portal lands correctly. Objective A is currently validated only at
-the **flag-decode** level via `GDRL_FORCE_VEHICLE`. A real portal also sets
-size, gravity and speed — this is the difference between conditioning being
-tested and merely being written.
+```
+[gdrl] MODE tick=3092 x=4468.861 from=cube cleared=cube type=5 p1
+[gdrl] COND tick=3092 x=4468.861 ship  grav=dn size=1.00 spd=0.90 ...
+```
 
-- [ ] Drive through the synth ship portal; confirm `COND`/`MODE` lines fire.
-- [ ] Verify the regime the mod reports matches what `conditioning.py` expects.
-- [ ] Repeat for at least one other vehicle once 1.1 lands.
+Read the pair together: **`MODE` names the vehicle departed** (it hooks
+`switchedToMode`, which *clears* the outgoing vehicle), and `COND` names the one
+entered. See M2.
+
+- [x] Drive through the synth ship portal; confirm `COND`/`MODE` lines fire.
+- [ ] **Verify the regime the mod reports matches what `conditioning.py`
+      expects.** Not done — the mod side is evidenced, the Python side has never
+      been checked against it. This is the half that makes Objective A more than
+      flag-decoding.
+- [ ] Repeat for at least one other vehicle once 1.1 lands. Note only
+      `type=5 -> ship` is confirmed live; `19 -> ufo` is disassembly-only.
 
 ---
 
@@ -936,20 +950,22 @@ on the player.** In neither README nor TODO before now.
       filter-by-object-id is a semantic decision, and filtering by an id whose
       meaning is unknown is the guess this repo bans.
 
-### K. `MODE` never fires, and `COND step=` is always 0
+### K. `MODE` never fires, and `COND step=` is always 0 — **BOTH RESOLVED 2026-08-14, see M**
 
-- [ ] **`MODE` lines never fire, even on a genuine vehicle change.** The ship
-      portal at x=4500 produces a `COND` edge `cube -> ship` and **zero** `MODE`
-      lines in any run. So `PlayerObject::switchedToMode` is either not the
-      mechanism for ship entry or its `before == after` guard always trips.
-      **Track 1.3's acceptance criterion ("confirm `COND`/`MODE` lines fire") is
-      therefore half met**: `COND` is the working instrument, `MODE` is not, and
-      the ship-entry path is not evidenced by the hook written to evidence it.
-- [ ] **`COND step=` is 0 in every log ever**, this session and prior, while x
-      advances to 4468. `main.cpp`'s comment claiming "tick-exact attribution
-      comes from `m_currentStep`, logged alongside" is **false as written** — the
-      field is useless as logged. The x values are still good. (Consistent with
-      the older finding that `m_currentStep` is not the physics-tick counter.)
+- [x] **`MODE` lines never fire, even on a genuine vehicle change.** Root cause
+      found: it was **our guard**, not GD's plumbing. `switchedToMode` *clears*
+      the outgoing vehicle — the incoming one is set by the caller *after* it
+      returns — so entering ship from cube is `before == after == cube` and the
+      `if (before == after) return;` swallowed every entry. Guard removed; the
+      line now fires and names the vehicle **departed**. See M2.
+- [x] ~~**`COND step=` is 0 in every log ever**~~ — **this claim was false**, and
+      it was false when written. In `phantom-synth-jump200.log` the field reads
+      `step=0` once (at `x=0.000`) and **`step=416` on all six later lines**
+      (verified in the main thread: `1 COND step=0`, `6 COND step=416`). The
+      *conclusion* held — `m_currentStep` is not the physics-tick counter and was
+      useless as logged — but the supporting observation did not, and it went
+      into this file unchecked. `step=` is now `tick=`, wired to
+      `lround(m_attemptTime * 240)`. See M3.
 
 ---
 
@@ -1054,7 +1070,9 @@ Logs preserved: `phantom-synth-behind400.log`, `phantom-synth-behind900.log`,
 ### L3. `test_env.py` was graded by mutation, and it was catching almost nothing
 
 Not "the tests pass" — a mutation table. **7 of 25 mutants killed before, 25 of
-25 after.** Survivors of the old suite included dropping the
+25 after.** *(Corrected 2026-08-14: the "25 of 25" did not survive the L5 window
+change — `A7-upper-fencepost` regressed to SURVIVED on the very next edit. See
+N2. A mutation score is only true for the tree it was measured on.)* Survivors of the old suite included dropping the
 `OBJECTS_UNAVAILABLE` refusal entirely, the refusal returning all-*True*, and
 `column_span` substituting `100.0` instead of `None`.
 
@@ -1124,6 +1142,10 @@ caused the original inversion: `100 * 0.009999999776482582 = 0.9999999776`,
 which floors to 0, not 1. Every mask test reads `windowMinX` out of the header,
 so none of them failed; they were certifying a left-edge geometry the game never
 produces. The fixture now mirrors the mod, with `telemetry.cpp` line citations.
+*(Corrected 2026-08-14, N1: this explanation is incomplete and too kind. At the
+default `player_x=500` the two windows produce **byte-identical masks** — no
+cell centre lies in the disputed band — so the tests could not have observed the
+error even in principle. Reverting the fix fails zero of the 64 tests.)*
 
 **Two comments were the defect, not the code:**
 
@@ -1159,59 +1181,281 @@ because:
   would present as "refused everywhere", indistinguishable from a genuinely
   corrupt factor — the exact confusion L4 exists to remove;
 - the acceptance band is `1/N` wide: 0.37% on Stereo Madness but **1.6% on the
-  64-column synth level**, i.e. weakest precisely where we test most. It would
-  pass `0.0101` on synth.
+  64-column synth level**, i.e. weakest precisely where we test most.
 
 It does reject `1e-30`, `0.005`, `0.0101`, `100.0`, and the divisor reading.
+
+> **Correction (2026-08-14).** This section as first written said the check
+> "would pass `0.0101` on synth" one line above saying it rejects `0.0101`. Both
+> cannot be true and the second is the correct one: `floor(6340 * 0.0101) + 1 =
+> 65 ≠ 64`, so `0.0101` is rejected on synth *and* on Stereo Madness. The value
+> that actually demonstrates the band-width weakness is **`0.01009`** — accepted
+> on synth (64 = 64), rejected on Stereo Madness (270 ≠ 268). Verified in the
+> main thread. That value is now a harness param
+> (`inside-the-synth-band-only`), so the real weakness is pinned by a test
+> rather than asserted by a wrong example. The error was mine: I transcribed two
+> figures from an agent report into one section without checking they were
+> consistent with each other.
+
+
+---
+
+## Session 2026-08-14 — K closed, one dead loop deleted, one false claim caught
+
+Mod-side only; `mod/src/{main.cpp,telemetry.cpp}`. Build green and universal.
+Verified inert with **no** `GDRL_*` switches set: mod loads, no `COND`/`MODE`/`EXP`
+output, no errors. No new switches added.
+
+### M1. The right-edge `nextafter` back-off is dead code. Deleted.
+
+Not "probably dead by analogy with the Python copy" — measured on the mod's own
+expression over the **entire reachable input domain**. `px` comes from
+`getPositionX()`, a float32, so sweeping every float32 in range is not a sample.
+
+```
+sweep1  float px in [-2048,131072):  n=2365587456  loopRan=2365587456  wireDiffs=0
+        (winAhead=1400: colEdge never wins the min(); winAhead=20000: wins all 2.37e9)
+sweep2  (sxf x col1), 20000 sxf values x 65536 cols:  n=1310720000  wireDiffs=0
+```
+
+2.37e9 float32 `px` values, the loop ran on every one, **zero** differences in the
+stored 4 bytes. Both regimes of the `min()` forced, including a 20000-unit window
+where `colEdge` wins every time. The arithmetic: at `col1=63` the loop moves
+`colEdge` by `9.095e-13` against an f32 ULP of `4.8828e-4` — a correction of
+**1.9e-9 of one ULP**. It operates on a `double` and is then truncated to `float`,
+which is coarser by nine orders of magnitude. It could never have survived.
+
+Tier: exhaustive static evaluation of a transcription of the mod's own lines,
+compiled by the same clang — a claim about *our* code, matched by its instrument.
+**Not** tier (iv): `windowMaxX` was never observed on the wire (that needs
+`GDRL_ENV=1` plus a Python peer). The two facts the sweep rests on *are* tier (iv):
+`px` is float32, and `sectionXFactor = 0.01` (re-observed today).
+
+**The comment it stood under was also false**, and that was the more valuable half:
+it claimed the back-off meant window and mask "cannot disagree by a rounding step
+at the boundary." They disagree at the **left** edge on every nonzero start column,
+always by exactly −1 — `windowMinX = px - g_winBehind` vs `col0 = floor(minX*sxf)`,
+so the window starts partway into column `col0`. The C++ comment now states the
+real guarantee structurally, as `env.py` already did (L5): knowledge is the
+*intersection* of window and per-cell coverage, so widening either alone can only
+remove cells, never add them.
+
+### M2. `MODE` never fired because of **our guard**, not GD's plumbing
+
+`PlayerObject::switchedToMode` **clears the outgoing vehicle**; the flag naming the
+incoming one is set by the caller *after* it returns. So a cube→ship entry has
+`before == after == cube`, and `if (before == after) return;` swallowed every
+transition. The hook was fine all along.
+
+Read off the arm64 slice (GD 2.2081 runs arm64; the bindings' `m1` addresses are
+the live ones), `GJBaseGameLayer::switchToFlyMode`:
+
+```
+0x1000fcee8  bl 0x100388338   <- PlayerObject::switchedToMode, FIRST
+0x1000fcf4c  cmp w22, #0x5 / b.ne ...
+0x1000fcf94  bl 0x10038bf50   <- toggleBirdMode(true, ...)   type 19
+0x1000fcfc4  bl 0x10038b4d8   <- toggleFlyMode(true, ...)    type 5
+```
+
+and inside `switchedToMode` the toggles are only ever called with `enable = 0`
+(`mov w1,#0x0` immediately before each `bl`).
+
+Falsified on the way, all three by measurement rather than argument: *the hook is
+not installed on this arch* (Geode logs it enabled); *`switchedToMode` is inlined
+so the address is not a call site* (**21 `bl`, 0 `b`**); *`switchedToMode` is not
+the ship-entry mechanism* (it is the first call in `switchToFlyMode`).
+
+Live, tier (iv), and reproduced bit-identically across two runs:
+
+```
+[gdrl] MODE tick=3092 x=4468.861 from=cube cleared=cube type=5 p1
+[gdrl] COND tick=3092 x=4468.861 ship  grav=dn size=1.00 spd=0.90 gmul=0.96 ...
+```
+
+**Track 1.3's acceptance criterion is now fully met**, with the caveat that a
+`MODE` line names the vehicle *departed* and the vehicle *entered* is named by the
+`COND` line on the same tick. Recorded in README under "Vehicle mode transitions".
+
+### M3. `step=` is now `tick=`, and TODO's own claim about it was false
+
+`m_currentStep` is out of every log line; `tick=` is `lround(m_attemptTime * 240)`
+via a `gdrlTick()` helper (`-1` when there is no PlayLayer).
+
+**The claim in K — "`COND step=` is 0 in every log ever" — was false when
+written.** In `phantom-synth-jump200.log` the field reads `step=0` once (at
+`x=0.000`) and **`step=416` on all six later lines**; verified independently in the
+main thread (`1 COND step=0`, `6 COND step=416`). The *conclusion* survived —
+`m_currentStep` is not the physics-tick counter and was useless as logged — but the
+supporting observation did not, and it entered this file unchecked. Why it reads
+416 in that run was not chased; that run's only `INJECT` line reads `pushed=0`, so
+"the run that injected buttons" is **not** a supported explanation.
+
+Cross-validated live rather than merely "it moves now" — implied `dx/dtick` across
+the synth level's five speed segments against README's constants: +0.17%, +0.30%,
+−0.66%, +0.03%, +0.01%. This validates the **clock**, not the speed constants; the
+residuals are dominated by `COND` being sampled per render frame, and the two long
+segments landing within 0.03% is what a real clock looks like.
+
+### Still open from this session
+
+- **`GameObjectType 6` is unidentified** — four `MODE tick=0 x=0.000 type=6` lines
+  fire per level load (p1 and p2, twice). Logged raw by design. The id→vehicle map
+  is confirmed only for `5 → ship`; `19 → ufo` and a branch at `0x29` are
+  disassembly-only.
+- **Whether `MODE` fires on a mode *exit*** — never observed; the synth level ends
+  in ship. The disassembly predicts it would, and would have even under the old
+  guard.
+- **No tier-(iv) observation of `windowMaxX`.** Needs `GDRL_ENV=1` plus a Python
+  peer.
+- **Why `m_currentStep` read 416** in that one run rather than 0.
+
+
+---
+
+## Session 2026-08-14 (cont.) — the L5 fix had never been graded, and one test had regressed
+
+Tree at **235 tests**. Mutation harness landed in the repo and re-run end to end:
+**46 of 46 killable mutants killed**, 2 deliberate survivors.
+
+### N1. The entire L5 window fix was ungraded — and at the default placement, ungradeable
+
+Method: revert only `h["windowMinX"] = min_x` back to `col0 * sec_w` in a scratch
+copy, run the tree's own suite. **Zero of the 64 pre-existing tests fail.**
+
+L5 explained this as "every mask test reads `windowMinX` out of the header, so
+none of them failed." True, but the stronger and worse fact is this: at the
+default `player_x=500`, with the raster at `player_col=12, cell=30` starting at
+x=140, **no cell centre ever lay in the disputed `[0, 100)` band** — so the mask
+bytes are *identical* under both windows. The tests were not merely failing to
+assert the left edge; they could not have observed it. Only `player_x=12345` with
+`player_col=16` distinguishes the two, and then by exactly 2 raster columns.
+
+Fixed by `test_the_fixture_publishes_the_window_the_mod_would` (16 params) built
+on `_mod_scan_window()` — `scanObjects()` restated statement for statement,
+window primary, column derived, each line carrying its `telemetry.cpp` citation
+against `git show 8dd5ceb`. It asserts `coverageStartCol`, `sectionColumns`, all
+four window edges after the float32 store, **and the full 64-entry coverage
+array**. Params include the `col0 < 0` clamp, past the end of `m_sections`, the
+mod's real production config, and float32-neighbour pairs straddling the
+`floor(minX*sxf)` tick-over at k = 1, 5, 119, 267 (derived in-test from the
+measured sxf, not tabulated). Reverting `publish()`'s left edge now fails 15 of
+16. **Tier (i)**, and the docstring says so: it grades our transcription of the
+mod, not the mod — if `telemetry.cpp` changes, both halves are wrong together.
+
+### N2. **L3's "25 of 25" was no longer true.** A mutation table is only true for the tree it was measured on
+
+`A7-upper-fencepost` (`section < COLS` → `<= COLS`), killed in L3, had regressed
+to **SURVIVED** — and L5 caused it. `test_columns_past_the_end_of_the_coverage_
+array_are_unknown` says in its docstring "the whole array is SCANNED". Once
+`publish()` began binding `col1` to the requested window, `player_x=450` with the
+mod's default 1400-ahead SCANs only **19 of 64** columns, so `coverage[63]` is
+UNKNOWN, the clipped out-of-range read returns UNKNOWN anyway, and the mutant
+became invisible. **The test had been passing for the wrong reason.** Fixed with
+`win_ahead=8000.0` plus a guard asserting the array really is fully SCANNED.
+
+This is the argument for keeping the harness in the repo rather than in a
+scratchpad: a mutation score decays silently as the code moves under it, exactly
+like a test that stops testing what its name says.
+
+### N3. Eight more survivors, all closed
+
+First run on the tree as received: **37 of 46 killable killed**. Beyond A7:
+
+| Survivor | Why it lived |
+|---|---|
+| `A15-window-y-becomes-exclusive` | every test placed row centres strictly inside the y window |
+| `C7`, `C8` — the L6 diagnostic | **it had no test at all** |
+| `D5`, `D6`, `D7` — right-edge / `col1` | every placement had `coverage_cols` small enough that the clamp won, so the requested-window branch was never taken |
+| `D13-absent-columns-published-as-scanned` | the fixture's own ABSENT branch was never reached — the one ABSENT test writes the bytes by hand |
+| `D15-refusal-frame-keeps-a-real-window` | nothing asserted the refusal frame's zero-area window |
+
+Four new tests plus the agreement test's whole-coverage-array comparison close
+all of them. **46 of 46 after.**
+
+Two deliberate survivors, labelled with their reason in the harness:
+`D8-delete-the-right-edge-backoff` (measured inert — a test killing it would pin
+a difference that never reaches the f32 wire) and `Z0-control-no-behavioural-
+change` (instrument check: if Z0 ever reports KILLED, no other row can be read).
+
+### N4. The harness
+
+`trainer/mutate.py`, no scratchpad dependency — resolves `trainer/` from
+`__file__`, copies to a fresh temp dir per mutant, cleans up.
+
+```
+python3 trainer/mutate.py                    # 48 mutants against test_env.py
+python3 trainer/mutate.py --list | --only left-edge | --killers | --keep
+python3 trainer/mutate.py --tests test_env.py test_trajectory.py
+```
+
+Exit 0 only if every mutant matched its expectation. A mutant whose anchor no
+longer matches is **PATCH-FAILED and counted as a failure**, never silently
+skipped — which is what makes N2 detectable at all.
+
+### N5. Known gap left open deliberately
+
+`publish()` still transcribes the right-edge back-off loop **that the mod no
+longer has** (M1 deleted it). The agent declined to delete our copy on the
+strength of another agent's uncommitted work — correct call — and left a
+`DELETE THIS BLOCK once the mod's deletion lands` marker in `env.py`. The
+deletion has now landed in the same commit as this note, so **the marker is
+actionable: delete the block.** Its mutant `D8` should then be removed too.
+
+### Not verified
+
+- **Nothing in N touches the game.** The agreement test is tier (i) by
+  construction; it cannot tell you `publish()` matches `scanObjects()` today,
+  only that our two Python restatements agree. The C was read, not run.
+- The 1.2e9-value inertness sweep behind `D8` is M1's measurement, not
+  reproduced here.
+- Assumes numpy's `float32` cast and C's `(float)` cast round identically
+  (round-to-nearest-even). **Unmeasured.** If false, the agreement test's four
+  window-edge comparisons are where it would surface.
+- Tier-(iii) content is only in the *inputs* (26724→268, 6340→64 from the
+  2026-08-12 dump, via `MEASURED_*`); the arithmetic exercising them is ours.
 
 
 ### Queue for next session, in order
 
-0. **Answer the benchmark question in "Open decisions" first.** It is not a
-   tuning knob and it outranks every item below: it decides whether the next
-   phase is planning or learning, and therefore whether Objectives D and E are
-   load-bearing or decorative. Items 1–4 below are worth doing under *either*
-   answer; item 5 onward is not.
+**Everything on the previous queue is done.** Items 1-4 closed in sections N
+(fixture fidelity + the mutation harness) and M (the dead back-off, `MODE`,
+`COND tick=`). What follows is the new queue.
 
-1. **Finish the fixture-fidelity test updates** (L5). `env.py` is done and
-   correct; the *tests* were mid-update when the session stopped. One assertion
-   (`test_the_first_covered_column_is_included`) was completed in the main
-   thread and re-graded against the `>= 0` → `> 0` fencepost mutant, which it
-   still kills. What was **not** reached: the agent was told to report which
-   other expectations changed under the narrower window, and to add a test
-   pinning fixture↔mod agreement across a spread of `player_x` including
-   boundary-adjacent values (tier (i) — it pins our transcription of the mod,
-   not the mod). Neither exists yet.
+0. **The benchmark question in "Open decisions" is still unanswered** and still
+   outranks everything below. It decides whether the next phase is planning or
+   learning, and therefore whether Objectives D and E are load-bearing or
+   decorative. Items 1-3 are worth doing under *either* answer; 4 onward is not.
 
-2. **Re-run the mutation harness end-to-end** on the current tree. The 25/25
-   result predates the L5 window change and the 8/8 refusal result predates it
-   too; both were re-verified only in part. The harness is small and worth
-   keeping — consider moving it out of the scratchpad into the repo, because
-   "the tests pass" is exactly the claim this session showed to be worthless.
+1. **Delete `publish()`'s copy of the right-edge back-off** (N5). The mod's copy
+   is gone as of this commit, so the `DELETE THIS BLOCK once the mod's deletion
+   lands` marker in `env.py` is now actionable. Remove mutant `D8` with it. One
+   minute of work; left undone only because the two halves landed in different
+   agents.
 
-3. **Verify the mod's right-edge back-off is inert** (L5). Measured dead in
-   `publish()`; `telemetry.cpp:677-681` is structurally identical but
-   **UNVERIFIED**. If it is dead there too, delete it and the comment — dead
-   code under a confident comment is how this repo accumulates false beliefs.
+2. **Check `conditioning.py` against what the mod actually emits** (Track 1.3,
+   the open half). The mod side is now evidenced end to end — `COND` and `MODE`
+   both fire on a real cube→ship crossing — but **the Python side has never been
+   compared against it**. This is the difference between Objective A being tested
+   and merely being written, and it is the last thing standing between the
+   conditioning work and "validated".
 
-4. **`MODE` / `COND step=`** (K) — instrument defects, cheap, and Track 1.3
-   cannot be called done without the first. Note L2 changes the reading of the
-   object window, so anything that consumed `objectCount` before 2026-08-13 was
-   inflated by 5–10 phantom entries and should be recomputed, not trusted.
+3. **Identify `GameObjectType 6`** (M3). Four `MODE type=6` lines fire per level
+   load and nobody knows what they are. The id→vehicle map is confirmed only for
+   `5 -> ship`; `19 -> ufo` and a branch at `0x29` are disassembly-only, and
+   conditioning needs the map regardless.
 
-5. **Measure the four speed buckets properly** (Track 1.2) — genuinely
-   unblocked, portals fire. Beware the float32-binade quantisation: measure
-   where it is smallest, or use a method robust to it. The H table is not it.
+4. **Measure the four speed buckets properly** (Track 1.2). Beware the
+   float32-binade quantisation: measure where it is smallest, or use a method
+   robust to it. The H table is **not** it — it is ±1 ulp sampled at different
+   binades. Note M3 gives you a real tick clock now, which is what this
+   measurement was always missing.
 
-6. Then Track 0.2 (predictor spec + test-tier audit).
+5. Then Track 0.2 (predictor spec + test-tier audit).
 
-**Closed this session:** I (L3), J (L2, and it was the dangerous branch), and
-the evidence-labelling debt (L1). The `known_mask` API hardening (L4) and the
-`levelLength` diagnostic (L6) were not on the queue and came out of the work.
-
-**Two agents were stopped mid-task**; both had landed complete, verified work
-before stopping, and neither left the tree broken. What each had *not* reached
-is items 1–3 above.
+**A standing item, not a task:** `python3 trainer/mutate.py` should be re-run
+after any change to `env.py`, and its result quoted rather than "tests pass".
+N2 is the reason — a mutant killed in one session had regressed to SURVIVED by
+the next edit, silently, while the suite stayed green.
 
 Task #8 (a synth trigger at x=300.65, arrival 231.5809, frac 0.58) is **largely
 superseded**: the activation mechanism is now measured directly rather than
