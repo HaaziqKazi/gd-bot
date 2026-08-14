@@ -992,13 +992,44 @@ UNVERIFIED: that GD's own indexing is `floor(x·sxf)` *in float* rather than som
 other rounding. The cross-checks pin the factor, not the rounding mode, so a
 boundary object could still be one column out.
 
-**Do not trust `objectCount` yet.** Fixing the window revealed — it did not cause
-— five entries per step sharing one `uniqueID` (`objectID=1816, objectType=39,
-kind=SOLID`), sitting at the player's x lagged one tick. That object is not in
-`m_objects` at all. `objectCount` averaged 7.64 where the true in-window count is
-2–3, and any consumer that does not dedupe by `uniqueID` sees a solid block
-riding on top of the player. Unidentified; see TODO item J before building on the
-object window.
+### The player's own collision proxy was being reported as level geometry
+
+**Identified and fixed 2026-08-13.** Fixing the window above revealed — it did
+not cause — five entries per step sharing one `uniqueID` (`objectID=1816,
+objectType=39`), sitting at the player's x lagged one tick, reported as `SOLID`.
+
+It is **`GJBaseGameLayer::m_player1CollisionBlock` / `m_player2CollisionBlock`**,
+GD's own per-player collision proxy, created by `createPlayerCollisionBlock()`.
+Its `m_positionX` at tick *t* equals the player's `getPositionX()` at *t−1* to
+all nine decimals. It is reachable through the section grid but **not** through
+`m_objects` (`inObjects=-1`), which is exactly why the census never saw it and
+why it looked like a phantom.
+
+Three things worth carrying forward:
+
+- **`objectType=39` is `GameObjectType::CollisionObject`, not `Solid`** (which is
+  `0`). Read off the bindings in `mod/build/_deps/bindings-src/`, not a community
+  id table. The `kind=SOLID` on the wire was *our* `collapseKind()` mapping
+  `CollisionObject -> SOLID` — a deliberate line in `telemetry.cpp`, not an
+  unknown type hitting a default branch.
+- **It registers once per column it has ever entered, and those registrations are
+  never removed.** Hence five entries at `GDRL_ENV_WIN_BEHIND=400` and **ten at
+  900** — the count tracks the window, which is what makes this the explanation
+  rather than a guess.
+- **It is filtered by pointer, not by object id.** `1816` is the editor's
+  Collision Block, a real authorable object a level may legitimately contain —
+  and that one *does* live in `m_objects` and should be reported. Filtering by id
+  would have silently deleted real geometry.
+
+Until this fix, every consumer of the object window saw a 30×30 solid block
+standing on the player on every frame. **`objectCount` recorded before
+2026-08-13 was inflated by 5–10 and must be recomputed, not trusted.**
+Evidence: `backups/reference-logs/phantom-synth-behind{400,900}.log`,
+`phantom-stereomadness.log` — **which are not in the repo.** `backups/` is
+gitignored, so every log this project cites as tier-(iii) evidence, including
+the 480-record `Geode 2026-08-11 18.41.23.log` that the ground-truth tests are
+built on, exists only on the machine that produced it. See TODO, "Open
+decisions".
 
 ## Synth level-string y is runtime y − 90, and the portals now fire
 

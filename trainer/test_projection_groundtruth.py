@@ -42,6 +42,13 @@ Asserted against the game:
      line, and one tick either way is 500x larger, so an off-by-one still fails
      loudly.
 
+NOT EVERY ASSERTION HERE IS TIER (iii), and the exceptions are labelled at the
+site. ``test_residual_against_every_one_of_the_480_records`` carries two
+tier-(i) assertions -- the residual/negated-deviation identity, in which the
+recorded value cancels algebraically, and the equality of ``worst`` with the
+fixture constant recomputed from the same records. Both have falsification power
+on the predictor and none on GD. See that test's docstring.
+
 WHAT THE CORRECTION WAS, SINCE THIS FILE PINNED THE DEFECT
 ----------------------------------------------------------
 The 1.9198-tick lead decomposed into two independent errors in two different
@@ -379,11 +386,24 @@ def test_rounding_the_crossing_would_miss_the_recorded_tick():
 # Those are not free numbers. They are, to every digit, the record's OWN
 # deviation from the theoretical line 435 + 90*(t-233)/480 -- gt's
 # LINEARITY_RESIDUAL_{MAX,RMS}_THEORETICAL, which were measured before this
-# correction existed. The predictor now sits exactly on that line, so what is
-# left is GD accumulating m_deltaTimeInFloat in float32 while the predictor
-# computes it in float64, and nothing else. The bound below is therefore taken
-# from the fixture rather than hand-tuned: widening it would mean claiming the
-# game is noisier than it was measured to be.
+# correction existed. The bound below is therefore taken from the fixture rather
+# than hand-tuned: widening it would mean claiming the game is noisier than it
+# was measured to be.
+#
+# READ THE "to every digit" CLAIM NARROWLY. The predictor's output IS the
+# theoretical line, exactly (max |out.y - line| = 0.000e+00 over all 480 ticks,
+# re-derived 2026-08-13). So "the residual equals the record's own deviation
+# from the line" is an algebraic identity, not a measurement: it is true for any
+# record whatsoever, including randomised ones. See
+# test_residual_against_every_one_of_the_480_records, which is where the
+# identity is asserted and where it is now labelled tier (i).
+#
+# What the constant is still good for is a THRESHOLD, and that use is tier (iii):
+# in test_pending_path_agrees_with_the_game the left-hand side is
+# out.y - (recorded y interpolated across one 0.1875-unit step), so a predictor
+# that moved off the line would blow it. The supporting claim that the leftover
+# is GD's float32 accumulation at ~6.1 ppm rests on gt.LSQ_SLOPE
+# (0.187501148182 against a theoretical 0.1875), not on the identity.
 CORRECTED_RESIDUAL_BOUND_UNITS = gt.LINEARITY_RESIDUAL_MAX_THEORETICAL
 
 
@@ -501,15 +521,30 @@ def test_residual_against_every_one_of_the_480_records():
     record covers every tick in 234..713. It is NOT a claim that a block was
     ever recorded at that x.
 
-    Two things are asserted, and the second is the interesting one:
+    MIXED TIERS, and the split matters -- this docstring used to claim the
+    sharpest assertion here was the strongest one, and it is the weakest.
 
-      * the residual is inside the game's own float32 noise, everywhere;
-      * it equals, to 1e-12, the NEGATED deviation of the record from the
-        theoretical line. That is a much sharper statement than "small": it
-        says the predictor is now exactly the theoretical line and every
-        remaining unit of disagreement belongs to GD's float32 accumulation of
-        m_deltaTimeInFloat. A predictor with any residual of its own would
-        break this equality while still passing a tolerance.
+      * TIER (iii): the residual is inside the game's own float32 noise at every
+        one of the 480 recorded ticks. The right-hand side is a recorded number
+        and a predictor off the line fails it.
+      * TIER (i), REGRESSION ONLY: the residual equals, to 1e-12, the NEGATED
+        deviation of the record from the theoretical line. Read as evidence
+        about GD this is worth nothing, because ``recorded_y`` cancels
+        algebraically: err = out.y - recorded_y and the right-hand side is
+        line - recorded_y, so the assertion reduces to out.y == line. Measured
+        2026-08-13: replacing every record with ``rec + uniform(-500, 500)``
+        leaves it passing at max violation 0.000e+00. It is stated directly
+        below instead -- out.y == line, EXACTLY, max deviation 0.000e+00 over
+        480 ticks -- which is the whole of what it tests, and is a real
+        regression on the predictor: any residual of the predictor's own breaks
+        it while still passing a tolerance.
+      * TIER (i): ``worst == LINEARITY_RESIDUAL_MAX_THEORETICAL``. Same reason.
+        Given out.y == line, ``worst`` is by construction max|line - record|,
+        which is how that fixture constant was measured in the first place; the
+        assertion compares a fixture constant against a recomputation from the
+        same records. It catches a predictor that drifts off the line, and a
+        re-paste of RECORDS from a different run. It does not corroborate the
+        line.
     """
     step = gt.MOVE_OFFSET_Y / (gt.DURATION * 240.0)
     worst = 0.0
@@ -520,6 +555,21 @@ def test_residual_against_every_one_of_the_480_records():
         err = out.y - recorded_y
         worst = max(worst, abs(err))
         line = gt.TARGET_Y_START + step * (target_tick - gt.ACTIVATION_TICK)
+        # Tier (iii): against the recorded value. FLOAT32_NOISE_UNITS rather
+        # than CORRECTED_RESIDUAL_BOUND_UNITS on purpose -- the worst of these
+        # residuals is 5.6457e-04 against a bound of 5.646e-04, a 0.005% margin,
+        # so the tighter constant would be a threshold fitted to this very
+        # maximum. The <=-the-bound version is the `worst` assertion below, and
+        # it is labelled tier (i) for that reason.
+        assert abs(err) < FLOAT32_NOISE_UNITS
+        # Tier (i): the identity, stated as itself. Exact, not approximate --
+        # if this ever needs a tolerance the predictor has stopped being the
+        # line and the tier-(iii) assertion above is the one to trust.
+        assert out.y == line, (
+            f"predictor is {out.y - line:+.3e} units off the theoretical line "
+            f"at tick {target_tick}")
+        # Tier (i): the same identity in the form it was historically written
+        # in. Kept so the equivalence is visible rather than asserted.
         assert err == pytest.approx(-(recorded_y - line), abs=1e-12)
     assert worst == pytest.approx(gt.LINEARITY_RESIDUAL_MAX_THEORETICAL,
                                   rel=1e-3), (
@@ -692,6 +742,13 @@ def test_the_two_linearity_residuals_are_against_the_two_stated_fits():
     drift. Both are named in the fixture; this recomputes each from the 480
     records against the fit its name claims, so the labels cannot drift apart
     from the numbers.
+
+    WHAT TIER THAT IS: a fixture constant checked against a recomputation from
+    the same records, so it says nothing about the predictor -- ``trajectory``
+    is not imported into this test's arithmetic at all. It is tier (iii) about
+    the FIXTURE (RECORDS is a verbatim transcription of the log's y column, and
+    these constants are correct summaries of it) and tier (i) about everything
+    else. Its real job is catching a swapped label or a re-pasted RECORDS.
     """
     n = len(gt.RECORDS)
     ts = [float(t) for t, _ in gt.RECORDS]

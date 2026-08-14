@@ -58,6 +58,14 @@ into a boolean grid aligned with ``trajectory.TrajectoryRaster``, and the
 intended consumption is trajectory.py's existing *certainty* channel rather than
 a parallel mechanism -- the failure modes are the same ones it was built for.
 
+It returns a ``KnownMask``, not the array, because there are frames for which no
+grid exists at all: the mod did not scan, or there is no x -> column mapping to
+scan with. Those are refusals, and an all-False grid is a different statement
+("looked, knows nothing"). Handing back the same bytes for both is how "refused"
+becomes "known-empty" without anyone deciding to make it so -- the same shape of
+defect as the inverted section factor. ``KnownMask.grid()`` raises rather than
+substituting; there is no default anywhere in this path.
+
 NOT A SIMULATOR
 ---------------
 
@@ -71,6 +79,7 @@ nothing it produces is evidence about the game.
 from __future__ import annotations
 
 import ctypes
+import enum
 import errno
 import math
 import mmap
@@ -218,6 +227,114 @@ def derive_kind(object_type: int, slope_is_hazard: bool) -> int:
     # actually does something is more dangerous filed as scenery than scenery is
     # filed as interactive.
     return int(GdrlObjectKind.INTERACTIVE)
+
+
+# ---------------------------------------------------------------------------
+# Known vs empty: a mask you cannot read without reading the refusal
+# ---------------------------------------------------------------------------
+
+class MaskRefusal(enum.Enum):
+    """Why no boolean grid can be produced for a frame.
+
+    Deliberately NOT an IntEnum. A refusal must not be usable as an array index,
+    must not compare equal to 0, and must not be falsy: every one of those is a
+    way for "we did not look" to be silently spent as if it were data.
+    """
+
+    OBJECTS_UNAVAILABLE = "objects table not populated on this frame"
+    NO_SECTION_MAPPING = "sectionXFactor unusable: no world x -> column mapping"
+
+
+class MaskRefused(RuntimeError):
+    """Raised when the grid of a refused :class:`KnownMask` is asked for.
+
+    Deliberately fatal, and deliberately raised at the point of *use* rather
+    than at the point of decode: a refusal is a normal, expected frame state
+    (the mod raises ``OBJECTS_UNAVAILABLE`` on every no-player step), so
+    constructing the observation must not throw -- but converting one into
+    geometry must.
+    """
+
+
+@dataclass(frozen=True, eq=False)
+class KnownMask:
+    """A (height, width) boolean grid, or a refusal -- never a stand-in for one.
+
+    WHY THIS IS NOT AN ndarray
+    --------------------------
+
+    ``known_mask()`` used to return a bare array, and it returned a bit-identical
+    all-False array for three materially different situations:
+
+      1. the section factor is unusable, so there is no mapping from world x to a
+         coverage column at all;
+      2. the mod did not populate the objects table this frame, so ``coverage``
+         and the window bounds are last frame's;
+      3. the mod looked, the mapping is fine, and every column in the window was
+         TRUNCATED or ABSENT -- genuine knowledge that nothing is known.
+
+    (1) and (2) are refusals. (3) is an observation. A consumer holding only the
+    array could not tell them apart, and nothing in the signature forced it to
+    ask. That is the same defect class as the inverted section factor: not a
+    crash, a confident answer nobody measured.
+
+    So the grid is not reachable without passing the refusal. ``grid()`` raises
+    :class:`MaskRefused` when refused, ``__array__`` raises the same thing (so
+    ``np.asarray(km)`` cannot launder it), ``__bool__`` always raises, and there
+    is no ``.any()`` / ``.shape`` / ``[]`` to fall through to -- a consumer that
+    kept writing ``obs.known_mask(...).any()`` gets an ``AttributeError`` on the
+    first frame rather than a plausible empty grid forever.
+
+    There is deliberately no ``mask_or_empty()`` and no default. Collapsing a
+    refusal into all-False is exactly the bug; if a caller decides to do it, that
+    decision belongs in the caller's source where it can be read.
+    """
+
+    shape: tuple[int, int]
+    refusal: MaskRefusal | None
+    _grid: np.ndarray | None = None
+
+    @property
+    def refused(self) -> bool:
+        return self.refusal is not None
+
+    def grid(self) -> np.ndarray:
+        """The boolean grid. Raises :class:`MaskRefused` if there is not one.
+
+        True where the mod actually looked. Note that all-False is a legitimate
+        return: it is case (3), "looked, and knows nothing" -- which is a
+        different statement from either refusal and is why they cannot share a
+        representation.
+        """
+        if self.refusal is not None:
+            raise MaskRefused(
+                f"no known-mask for this frame: {self.refusal.value} "
+                f"({self.refusal.name}). This is a refusal, not an empty grid -- "
+                "treating it as 'nothing is here' asserts geometry nobody "
+                "observed. Handle it, or drop the frame."
+            )
+        assert self._grid is not None
+        return self._grid
+
+    # np.asarray() is the other route to a grid, so it goes through the same
+    # gate. Not defining it at all would let np.asarray() build a 0-d object
+    # array that fails somewhere far from the cause.
+    def __array__(self, dtype=None, copy=None):
+        g = self.grid()
+        if dtype is not None:
+            g = g.astype(dtype, copy=bool(copy))
+        return g
+
+    def __bool__(self) -> bool:
+        raise TypeError(
+            "KnownMask has no truth value: 'refused' and 'nothing is known' are "
+            "different frames. Ask .refused, or call .grid()."
+        )
+
+    def __repr__(self) -> str:
+        if self.refusal is not None:
+            return f"KnownMask(shape={self.shape}, REFUSED: {self.refusal.name})"
+        return f"KnownMask(shape={self.shape}, known={int(self._grid.sum())} cells)"
 
 
 @dataclass(frozen=True)
@@ -411,6 +528,48 @@ class Observation:
             return None
         return 1.0 / sxf
 
+    def level_length_agrees_with_section_count(self) -> bool | None:
+        """Diagnostic: does ``floor(levelLength * sxf) + 1 == sectionColumns``?
+
+        ``None`` when the question cannot be asked (``sectionXFactor`` unusable,
+        or ``levelLength`` / ``sectionColumns`` unpopulated), ``True`` / ``False``
+        otherwise.
+
+        A DIAGNOSTIC, NOT A GATE. It is deliberately absent from
+        ``problems()``, and neither ``known_mask()`` nor ``section_factor()``
+        consults it. That is a considered trade, not an oversight:
+
+        * The identity itself is UNVERIFIED as a general property of GD. It has
+          been measured on exactly two levels -- Stereo Madness (m_levelLength
+          26724, m_sections.size() 268) and the synth test level (6340, 64), both
+          from the 2026-08-12 section-grid dump, recorded at telemetry.cpp:
+          597-600. Two points do not establish that ``m_sections`` is sized from
+          ``m_levelLength`` at all; it may be sized from the rightmost object, a
+          rounded-up level bound, or something else that merely happened to
+          agree twice.
+        * It is a weak constraint even where it holds. The band of sxf that
+          satisfies it is [267/26724, 268/26724) = [0.0099910, 0.0100284) on
+          Stereo Madness -- 0.37% wide -- and [63/6340, 64/6340) =
+          [0.0099369, 0.0100946) on the synth level, 1.58% wide. It is weakest
+          exactly where levels are shortest, i.e. where a mis-scaled factor
+          costs the least to detect elsewhere.
+
+        Letting a twice-measured identity of that width blank the entire
+        uncertainty channel for a whole level is a worse failure than reporting
+        the disagreement and continuing. What it IS good for is the failure the
+        positivity guard cannot see: ``sectionXFactor = 1e-30`` is positive and
+        finite, passes ``section_factor()``, and yields a confident mask in which
+        every x indexes to column 0. This returns False for it.
+        """
+        sxf = self.section_factor()
+        if sxf is None:
+            return None
+        length = float(self.header["levelLength"])
+        cols = int(self.header["sectionColumns"])
+        if not np.isfinite(length) or length <= 0.0 or cols <= 0:
+            return None
+        return math.floor(length * sxf) + 1 == cols
+
     def column_span(self) -> tuple[float, float] | None:
         """World-x range that ``coverage[0]`` .. ``coverage[-1]`` describes.
 
@@ -426,37 +585,48 @@ class Observation:
         return start * sec_w, (start + GDRL_COVERAGE_COLS) * sec_w
 
     def known_mask(self, height: int, width: int, cell_size: float,
-                   player_col: int) -> np.ndarray:
-        """(height, width) bool grid: True where the mod actually looked.
+                   player_col: int) -> KnownMask:
+        """Where the mod actually looked -- as a :class:`KnownMask`, not an array.
 
-        Aligned with ``trajectory.TrajectoryRaster`` so the two can be stacked.
-        The arguments mirror that class's constructor rather than being read off
-        it, because importing the raster here would make the wire depend on a
-        rendering choice.
+        The grid is (height, width) bool, True where the mod looked, aligned with
+        ``trajectory.TrajectoryRaster`` so the two can be stacked. The arguments
+        mirror that class's constructor rather than being read off it, because
+        importing the raster here would make the wire depend on a rendering
+        choice. Call ``.grid()`` to get it; that call is where a refusal becomes
+        an exception, and see :class:`KnownMask` for why it is not just an array.
 
         A cell is known when it lies inside the scanned window AND its section
         column was SCANNED or ABSENT. ABSENT counts as known: it means the index
         is past the end of GD's own ``m_sections``, so the engine has no geometry
         there -- genuinely empty, not merely unobserved. TRUNCATED does not
-        count: the array filled mid-column, so what is missing is unknown.
+        count: the array filled mid-column, so what is missing is unknown. An
+        all-False grid is therefore a real answer ("looked, knows nothing") and
+        must not share a representation with the two refusals below.
 
-        Two whole-frame refusals come first, both returning an all-False grid:
+        Two whole-frame refusals come first, and neither yields a grid:
 
-        * ``OBJECTS_UNAVAILABLE`` set. The mod raises it on the no-player path
-          (``telemetry.cpp:889``) *without* calling ``scanObjects``, so on that
-          frame ``coverage`` and the window bounds are whatever the previous
-          frame left there. Reading them would be reporting last frame's
-          geometry as this frame's observation.
-        * ``sectionXFactor`` unusable. Without the section width there is no
-          mapping from world x to a coverage column, so no column can be spoken
-          for. See ``section_width()`` for why there is no fallback constant.
+        * ``OBJECTS_UNAVAILABLE`` set -> ``MaskRefusal.OBJECTS_UNAVAILABLE``. The
+          mod raises it on the no-player path (``telemetry.cpp:889``) *without*
+          calling ``scanObjects``, so on that frame ``coverage`` and the window
+          bounds are whatever the previous frame left there. Reading them would
+          be reporting last frame's geometry as this frame's observation.
+        * ``sectionXFactor`` unusable -> ``MaskRefusal.NO_SECTION_MAPPING``.
+          Without the section width there is no mapping from world x to a
+          coverage column, so no column can be spoken for. See
+          ``section_width()`` for why there is no fallback constant.
+
+        The order matters for the *label*, not for the outcome:
+        ``OBJECTS_UNAVAILABLE`` is checked first because when the mod did not
+        scan, ``sectionXFactor`` is also whatever the previous frame left in the
+        header -- reporting a factor refusal there would be a claim read off
+        stale bytes. The mod's own bad-factor path sets both.
         """
         h = self.header
         if self.has_flag(GdrlHeaderFlag.OBJECTS_UNAVAILABLE):
-            return np.zeros((height, width), dtype=bool)
+            return KnownMask((height, width), MaskRefusal.OBJECTS_UNAVAILABLE)
         sxf = self.section_factor()
         if sxf is None:
-            return np.zeros((height, width), dtype=bool)
+            return KnownMask((height, width), MaskRefusal.NO_SECTION_MAPPING)
 
         player_x = float(h["playerX"])
         player_y = float(h["playerY"])
@@ -476,16 +646,36 @@ class Observation:
         start_col = int(h["coverageStartCol"])
         cov = np.asarray(self.coverage())
         section = np.floor(cols_x * sxf).astype(np.int64) - start_col
-        # A column the mask cannot speak for is UNKNOWN, never "empty" -- and
-        # because col_known ANDs this with in_x, being inside the advertised
-        # window is not on its own enough to be called known.
+        # WHY A WINDOW THAT IS TOO WIDE CANNOT LIE.
+        #
+        # The advertised window and the coverage mask DO disagree at the left
+        # edge, and not rarely: the mod publishes windowMinX = px - g_winBehind
+        # (telemetry.cpp:688) but derives col0 = floor(minX * sxf) (:664), so the
+        # window starts partway INTO column col0 -- by up to a full section, and
+        # by exactly 100 units at the default fixture player_x of 500. So the two
+        # descriptions of "the scanned region" are not the same set of x.
+        #
+        # That disagreement can never manufacture knowledge, and the reason is
+        # structural rather than empirical: `state` below is looked up from the
+        # PER-CELL section index, not from the window. A cell the window admits
+        # is still UNKNOWN unless its own column says SCANNED or ABSENT, and a
+        # cell outside the window is dropped by the `in_x &` regardless of what
+        # its column says. Knowledge is the INTERSECTION of the two, so widening
+        # either one alone can only ever remove cells, never add them. A window
+        # that overreaches (past the coverage array, before column col0, or into
+        # a column the scan never reached) hits `valid` or a non-SCANNED state
+        # and resolves to UNKNOWN. That is a property of the expression, not a
+        # measurement of one fixture, and it holds for any window the mod emits.
+        #
+        # A column the mask cannot speak for is therefore UNKNOWN, never "empty".
         valid = (section >= 0) & (section < GDRL_COVERAGE_COLS)
         state = np.where(valid, cov[np.clip(section, 0, GDRL_COVERAGE_COLS - 1)],
                          int(GdrlCoverage.UNKNOWN))
         col_known = in_x & (
             (state == int(GdrlCoverage.SCANNED)) | (state == int(GdrlCoverage.ABSENT))
         )
-        return col_known[None, :] & in_y[:, None]
+        return KnownMask((height, width), None,
+                         _grid=col_known[None, :] & in_y[:, None])
 
     def unavailable_tables(self) -> list[str]:
         """Tables the mod did not populate, so a count of 0 is not an observation.
@@ -853,6 +1043,28 @@ MEASURED_SECTION_Y_FACTOR = 0.0
 MEASURED_LEVEL_LENGTH = 26724.0
 MEASURED_SECTION_COLUMNS = 268
 
+# The synth test level from the same dump (telemetry.cpp:598-599): 6340 -> 64.
+# Kept because it is the SECOND of the only two levels the section-count identity
+# has ever been measured on, and because it is the one where that identity is
+# weakest -- see Observation.level_length_agrees_with_section_count().
+MEASURED_SYNTH_LEVEL_LENGTH = 6340.0
+MEASURED_SYNTH_SECTION_COLUMNS = 64
+
+# The mod's observation window, world units around the player, read straight off
+# telemetry.cpp:184-186:
+#
+#   const int g_winBehind = envInt("GDRL_ENV_WIN_BEHIND", 400);
+#   const int g_winAhead  = envInt("GDRL_ENV_WIN_AHEAD", 1400);
+#   const int g_winVert   = envInt("GDRL_ENV_WIN_VERT",  600);
+#
+# These are the mod's own defaults, not a fixture invention. publish() takes them
+# as parameters for the same reason the mod takes them from the environment: they
+# are tunable there, so a test that varies them is exercising a configuration the
+# mod supports rather than fabricating one.
+MOD_WIN_BEHIND = 400.0
+MOD_WIN_AHEAD = 1400.0
+MOD_WIN_VERT = 600.0
+
 
 class SyntheticGame:
     """The mod's half of the protocol, in Python, for tests.
@@ -874,6 +1086,11 @@ class SyntheticGame:
                                  buffer=buf, offset=OFFSET_ACTION)
         self.seq = 0
         self.scheduled: list[tuple[int, bool, int, int]] = []   # (tick, push, button, player)
+        # How many coverage entries the LAST publish() actually marked SCANNED.
+        # It is not always the ``coverage_cols`` that was asked for: the mod's
+        # window can bind first (see publish()), and a test that assumed
+        # otherwise would be checking a geometry the fixture did not produce.
+        self.scanned_cols = 0
         self._init_control(pid if pid is not None else os.getpid())
 
     def _init_control(self, pid: int) -> None:
@@ -906,12 +1123,54 @@ class SyntheticGame:
                 extra_flags: int = 0,
                 object_count_total: int = 2400,
                 section_x_factor: float = MEASURED_SECTION_X_FACTOR,
-                section_y_factor: float = MEASURED_SECTION_Y_FACTOR) -> int:
+                section_y_factor: float = MEASURED_SECTION_Y_FACTOR,
+                layout_x_factor: float | None = None,
+                level_length: float = MEASURED_LEVEL_LENGTH,
+                section_columns: int = MEASURED_SECTION_COLUMNS,
+                win_behind: float = MOD_WIN_BEHIND,
+                win_ahead: float = MOD_WIN_AHEAD,
+                win_vert: float = MOD_WIN_VERT) -> int:
         """Write one observation and advance the sequence, seqlock and all.
+
+        ``coverage_cols`` is the fixture's stand-in for ``GDRL_COVERAGE_COLS``
+        in the clamp at telemetry.cpp:670 -- how many columns the mask is
+        allowed to speak for. It is an UPPER bound, not a promise: the requested
+        window can bind first, exactly as it does in the mod (with the mod's own
+        defaults, 400 behind + 1400 ahead is 18 columns, so in the real game the
+        window binds and the 64-column clamp never does). Read
+        ``self.scanned_cols`` for how many entries actually came out SCANNED.
+
+        ``win_behind`` / ``win_ahead`` / ``win_vert`` default to the mod's own
+        defaults (telemetry.cpp:184-186) and are parameters for the same reason
+        they are ``envInt`` there.
 
         ``section_x_factor`` defaults to the measured 0.01 and is a parameter
         only so a test can inject an unusable value and check that the decoder
-        refuses rather than substitutes.
+        refuses rather than substitutes. It is the value that lands in the
+        header.
+
+        ``layout_x_factor`` is the factor the *geometry* is built from -- the
+        window bounds, ``coverageStartCol``, and which coverage entries are
+        SCANNED. It defaults to ``section_x_factor``, i.e. header and geometry
+        agree, which is the only combination GD is claimed to produce.
+
+        Passing them differently FABRICATES a header: it is the only way to hand
+        the decoder an unusable factor on a frame that otherwise looks normal,
+        and it exists because the honest refusal frame cannot test the factor
+        guard. When the factor is unusable the mod refuses the whole scan --
+        zero-area window, every column UNKNOWN, ``OBJECTS_UNAVAILABLE`` set --
+        and the decoder checks that flag first, so ``section_x_factor=0.0``
+        alone never reaches the factor branch, and the zero-area window makes an
+        empty mask prove nothing (a decoder that substituted 0.01 would produce
+        an empty mask too, from a window of zero area). Use
+
+            publish(section_x_factor=0.0,
+                    layout_x_factor=MEASURED_SECTION_X_FACTOR)
+
+        to get a real window, a SCANNED coverage prefix, no
+        ``OBJECTS_UNAVAILABLE``, and an unusable factor as the only defect. That
+        header is a test instrument. It is NOT asserted to be a state the game
+        produces.
         """
         self.seq += 1                       # odd: write in progress
         self.obs["seq"] = self.seq
@@ -936,7 +1195,7 @@ class SyntheticGame:
         h["dtUsed"] = 1.0 / GDRL_TICK_HZ
         h["sectionXFactor"] = section_x_factor
         h["sectionYFactor"] = section_y_factor
-        h["levelLength"] = MEASURED_LEVEL_LENGTH
+        h["levelLength"] = level_length
         h["isDualMode"] = 0
         h["isPaused"] = 0
         h["inResetDelay"] = 0
@@ -950,44 +1209,94 @@ class SyntheticGame:
                       | int(GdrlHeaderFlag.SPEEDSEGS_UNAVAILABLE)
                       | extra_flags)
 
-        # The window arithmetic follows scanObjects() in telemetry.cpp rather
-        # than being invented here: column index is floor(x * sxf) (a MULTIPLY),
-        # and the advertised right edge is backed off until it indexes to the
-        # last column the mask speaks for, so the window and the mask cannot
-        # disagree by a rounding step at the boundary. sectionYFactor is not
-        # used for anything, here or in the mod -- the vertical filter is a
-        # direct y compare -- so its measured 0 never reaches a divide.
-        sxf = float(np.float32(section_x_factor))
+        # The window arithmetic is a TRANSCRIPTION of scanObjects(),
+        # telemetry.cpp:649-766, in the same order and the same form -- the
+        # WINDOW is primary and the columns are derived from it, never the other
+        # way round. Each step below cites the line it mirrors. The one
+        # substitution is `coverage_cols` where the mod writes
+        # GDRL_COVERAGE_COLS, so a test can hand the decoder a narrow mask; with
+        # coverage_cols == GDRL_COVERAGE_COLS this is the mod's expression
+        # unchanged.
+        #
+        # It used to derive windowMinX from col0 instead (`col0 * sec_w`), which
+        # snapped the advertised left edge DOWN to a column boundary and made the
+        # fixture's window up to a full section wider than any the mod publishes
+        # -- 100 units too wide at the default player_x=500, which is the frame
+        # nearly every mask test stands on. The mechanism was the same sub-0.01
+        # sxf that caused the original inversion: 100 * 0.009999999776482582 is
+        # 0.9999999776, which floors to 0, so col0 was 0 while minX was 100.
+        # The mod defines what arrives on the wire, so the fixture moved.
+        #
+        # sectionYFactor is not used for anything, here or in the mod -- the
+        # vertical filter is a direct y compare -- so its measured 0 never
+        # reaches a divide.
+        #
+        # The geometry is laid out from layout_x_factor, and the refusal branch
+        # is taken when THAT is unusable -- because it is what the window and the
+        # coverage array would have been computed from. The header carries
+        # section_x_factor either way; see the docstring for why they can differ.
+        sxf = float(np.float32(section_x_factor if layout_x_factor is None
+                               else layout_x_factor))
         cov = self.obs["coverage"]
         if not (sxf > 0.0) or not np.isfinite(sxf):
-            # The mod's refusal path: claim nothing. Zero-area window, every
-            # column UNKNOWN, OBJECTS_UNAVAILABLE set so a count of 0 reads as
-            # "did not look" rather than "looked and found none".
+            # The mod's refusal path (telemetry.cpp:620-634): claim nothing.
+            # Zero-area window, every column UNKNOWN, OBJECTS_UNAVAILABLE set so
+            # a count of 0 reads as "did not look" rather than "looked and found
+            # none".
             h["coverageStartCol"] = 0
-            h["sectionColumns"] = MEASURED_SECTION_COLUMNS
+            h["sectionColumns"] = section_columns
             h["windowMinX"] = player_x
             h["windowMaxX"] = player_x
             h["windowMinY"] = player_y
             h["windowMaxY"] = player_y
             h["flags"] = int(h["flags"]) | int(GdrlHeaderFlag.OBJECTS_UNAVAILABLE)
             cov[:] = int(GdrlCoverage.UNKNOWN)
+            self.scanned_cols = 0
         else:
-            sec_w = 1.0 / sxf
-            col0 = max(0, int(math.floor((player_x - 400.0) * sxf)))
-            col1 = col0 + coverage_cols - 1
-            edge = (col1 + 1) * sec_w
-            for _ in range(8):
-                if math.floor(edge * sxf) <= col1:
+            sec_w = 1.0 / sxf                                    # :649
+            min_x = player_x - win_behind                        # :651
+            max_x_requested = player_x + win_ahead               # :652
+            min_y = player_y - win_vert                          # :653
+            max_y = player_y + win_vert                          # :654
+            n_cols = section_columns                             # :663 m_sections.size()
+            col0 = int(math.floor(min_x * sxf))                  # :664
+            col0 = max(0, col0)                                  # :665
+            col1 = int(math.floor(max_x_requested * sxf))        # :666
+            col1 = min(col1, col0 + coverage_cols - 1)           # :670
+            # The right-edge back-off, :677-680. MEASURED INERT for the value
+            # that reaches the wire: across 3000 start columns x 3 window widths
+            # the loop always iterated (1 or 2 nextafter steps) and the float32
+            # store landed on the SAME bit pattern as the un-backed-off edge in
+            # 9000 of 9000 cases. It is transcribed anyway because the mod has
+            # it and this file's job is to mirror the mod; it is not doing any
+            # work here, and nothing may rely on it doing any.
+            col_edge = (col1 + 1) * sec_w                        # :677
+            for _ in range(8):                                   # :678-680
+                if math.floor(col_edge * sxf) <= col1:
                     break
-                edge = math.nextafter(edge, 0.0)
-            h["coverageStartCol"] = col0
-            h["sectionColumns"] = MEASURED_SECTION_COLUMNS
-            h["windowMinX"] = col0 * sec_w
-            h["windowMaxX"] = edge
-            h["windowMinY"] = player_y - 600.0
-            h["windowMaxY"] = player_y + 600.0
-            cov[:] = int(GdrlCoverage.UNKNOWN)
-            cov[:coverage_cols] = int(GdrlCoverage.SCANNED)
+                col_edge = math.nextafter(col_edge, 0.0)
+            max_x = min(max_x_requested, col_edge)               # :681
+            h["coverageStartCol"] = col0                         # :686
+            h["sectionColumns"] = n_cols                         # :687
+            h["windowMinX"] = min_x                              # :688
+            h["windowMaxX"] = max_x                              # :689
+            h["windowMinY"] = min_y                              # :690
+            h["windowMaxY"] = max_y                              # :691
+            # The coverage loop, :696-766: UNKNOWN past col1, ABSENT past the end
+            # of GD's own section grid, SCANNED otherwise. (TRUNCATED is the one
+            # state the fixture cannot reach -- it needs the object array to fill
+            # mid-column -- so tests that need it set it by hand.)
+            scanned = 0
+            for c in range(GDRL_COVERAGE_COLS):
+                col = col0 + c
+                if col > col1:
+                    cov[c] = int(GdrlCoverage.UNKNOWN)
+                elif col >= n_cols:
+                    cov[c] = int(GdrlCoverage.ABSENT)
+                else:
+                    cov[c] = int(GdrlCoverage.SCANNED)
+                    scanned += 1
+            self.scanned_cols = scanned
 
         p0 = self.obs["players"][0]
         p0["present"] = 1

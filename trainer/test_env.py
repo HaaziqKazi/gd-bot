@@ -8,7 +8,8 @@ game side of the handshake in pure Python over an anonymous mapping.
 What this does and does not prove:
 
   * It DOES prove the encode/decode round trip, the seqlock, the handshake
-    refusals, the validity gate, the known/unknown mask, and that HOLD expands
+    refusals, the validity gate, the known/unknown mask, that an unusable
+    sectionXFactor is REFUSED rather than substituted for, and that HOLD expands
     into the pair of events the mod expands it into.
   * It does NOT prove anything about the game. SyntheticGame fabricates field
     values; it is not a simulator. Every claim about what GD actually does is
@@ -20,6 +21,7 @@ Run: cd trainer && python3 -m pytest test_env.py -q
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 
@@ -320,13 +322,59 @@ def test_unknown_object_types_default_to_interactive():
 # Objective E: known vs empty
 # ---------------------------------------------------------------------------
 
+# Every value of sectionXFactor that section_factor() must reject, one per
+# rejection reason. These are NOT values the game produces -- the measured one
+# is envmod.MEASURED_SECTION_X_FACTOR (0.01, live 2026-08-12). They are the
+# shapes a corrupt or unread header can take, and the point of injecting them is
+# that the decoder must REFUSE rather than substitute a plausible constant.
+UNUSABLE_SECTION_FACTORS = [
+    pytest.param(0.0, id="zero"),                    # a field the mod never wrote
+    pytest.param(-0.01, id="negative"),              # sign flip
+    pytest.param(float("nan"), id="nan"),            # 0/0 upstream
+    pytest.param(float("inf"), id="posinf"),         # 1/0 upstream
+    pytest.param(float("-inf"), id="neginf"),
+]
+
+
+def _cell_centres(obs, width: int, cell_size: float, player_col: int) -> np.ndarray:
+    """World x of each raster column's centre, the way known_mask lays them out."""
+    origin_x = float(obs.header["playerX"]) - player_col * cell_size
+    return origin_x + (np.arange(width) + 0.5) * cell_size
+
+
+def _expected_known_columns(obs, centres: np.ndarray, scanned_cols: int) -> np.ndarray:
+    """Which raster columns SHOULD be known, derived a different way.
+
+    known_mask() decides per cell, by flooring ``x * sxf`` into a coverage index.
+    This decides by intersecting two world-x intervals instead:
+
+      * the advertised window ``[windowMinX, windowMaxX]`` (inclusive, as the
+        decoder reads it), and
+      * the world-x range the SCANNED/ABSENT prefix of the coverage array covers,
+        ``[startCol * w, (startCol + scanned_cols) * w)`` -- half open, because
+        the right edge is the first x belonging to the next column.
+
+    Same specification, different arithmetic: no floor, no array indexing, no
+    coverage lookup. It is an independent reimplementation only in the tier-(ii)
+    sense of being written from the spec rather than from the code -- it is still
+    Python on both sides and says nothing about GD. ``scanned_cols`` is passed in
+    because the caller, not the decoder, decides how the fixture filled coverage.
+    """
+    sec_w = obs.section_width()
+    start = int(obs.header["coverageStartCol"])
+    return ((centres >= float(obs.header["windowMinX"]))
+            & (centres <= float(obs.header["windowMaxX"]))
+            & (centres >= start * sec_w)
+            & (centres < (start + scanned_cols) * sec_w))
+
+
 def test_known_mask_marks_unscanned_columns_unknown(loop):
     """An off-screen pit and an empty floor must not be the same bytes."""
     game, chan = loop
     game.publish(tick=1, player_x=500.0, player_y=105.0, coverage_cols=4)
     obs = chan.poll(timeout=1.0)
 
-    mask = obs.known_mask(height=32, width=48, cell_size=30.0, player_col=12)
+    mask = obs.known_mask(height=32, width=48, cell_size=30.0, player_col=12).grid()
     assert mask.shape == (32, 48)
     assert mask.any(), "nothing at all was marked known"
     assert not mask.all(), "the whole window was claimed known despite 4 columns"
@@ -350,7 +398,7 @@ def test_absent_columns_count_as_known_empty(loop):
     game.obs["coverage"][4:8] = int(sg.GdrlCoverage.ABSENT)
     game.obs["header"]["windowMaxX"] = float(game.obs["header"]["windowMaxX"]) + 400.0
     obs = chan.poll(timeout=1.0)
-    mask = obs.known_mask(height=8, width=48, cell_size=30.0, player_col=12)
+    mask = obs.known_mask(height=8, width=48, cell_size=30.0, player_col=12).grid()
     assert mask.any(axis=0).sum() > 4 * 100 / 30
 
 
@@ -360,8 +408,430 @@ def test_truncated_columns_are_not_known(loop):
     game.publish(tick=1, player_x=500.0, coverage_cols=8)
     game.obs["coverage"][:] = int(sg.GdrlCoverage.TRUNCATED)
     obs = chan.poll(timeout=1.0)
-    mask = obs.known_mask(height=8, width=48, cell_size=30.0, player_col=12)
+    mask = obs.known_mask(height=8, width=48, cell_size=30.0, player_col=12).grid()
     assert not mask.any()
+
+
+# -- the refusal path -------------------------------------------------------
+#
+# section_factor() is the only thing standing between a corrupt header and a
+# confident answer about geometry nobody indexed, and until these tests it was
+# the one branch of the fix nothing exercised.
+#
+# All fixture values below come from one of three places, and each test says
+# which: (a) the live 2026-08-12 dump, via envmod.MEASURED_* -- the section
+# factor 0.01, level length 26724, 268 columns; (b) publish()'s own arithmetic,
+# which follows scanObjects(); (c) an explicitly named fabrication, used only to
+# reach a branch the honest frame cannot reach, and never asserted to be a state
+# GD produces.
+
+@pytest.mark.parametrize("sxf", UNUSABLE_SECTION_FACTORS)
+def test_an_unusable_section_factor_is_refused_not_substituted(loop, sxf):
+    """Every rejection reason, and what refusal has to look like downstream.
+
+    This is the mod's own bad-factor frame, which publish() mirrors: zero-area
+    window, all 64 columns UNKNOWN, OBJECTS_UNAVAILABLE set. The old code had
+    ``or 100.0`` here. A substituted section width does not produce a wrong
+    mask, it produces a confident one -- so the assertion is not 'the mask is
+    empty' (a substituting decoder can also produce an empty mask, and on THIS
+    frame it certainly would, from a window of zero area) but that every
+    x -> column question answers None and that no grid comes out at all.
+
+    Because the mod sets both refusal conditions on this frame, the mask's
+    reason is OBJECTS_UNAVAILABLE: the decoder checks that first on purpose,
+    since with no scan the factor field is stale too. The factor guard is
+    isolated in the next test.
+    """
+    game, chan = loop
+    game.publish(tick=1, player_x=500.0, section_x_factor=sxf)
+    obs = chan.poll(timeout=1.0)
+
+    assert obs.section_factor() is None
+    assert obs.section_width() is None
+    assert obs.column_span() is None, "a span here is a claim about columns nobody indexed"
+    km = obs.known_mask(height=8, width=48, cell_size=30.0, player_col=12)
+    assert km.shape == (8, 48)
+    assert km.refused
+    assert km.refusal is envmod.MaskRefusal.OBJECTS_UNAVAILABLE
+    with pytest.raises(envmod.MaskRefused):
+        km.grid()
+    # The fixture mirrors the mod's own refusal: it also raises
+    # OBJECTS_UNAVAILABLE, so a count of 0 reads as 'did not look'.
+    assert "objects" in obs.unavailable_tables()
+
+
+@pytest.mark.parametrize("sxf", UNUSABLE_SECTION_FACTORS)
+def test_the_factor_refusal_stands_on_its_own(loop, sxf):
+    """The bad-factor guard must not be load-bearing on OBJECTS_UNAVAILABLE.
+
+    On the mod's own refusal frame the whole-frame OBJECTS_UNAVAILABLE check
+    shadows the factor check, and the zero-area window means an empty mask
+    proves nothing. ``layout_x_factor`` builds the geometry from the measured
+    0.01 while the header carries the unusable value: a real 4-column window, a
+    SCANNED coverage prefix, no OBJECTS_UNAVAILABLE, and the factor as the only
+    defect. That header is a FABRICATION for the purpose of reaching one branch;
+    it is NOT asserted to be a state GD produces.
+
+    The control frame below is the same fixture with the measured factor in the
+    header, and it yields a non-empty grid -- so the refusal here cannot be an
+    artifact of a degenerate window, which is precisely how the previous version
+    of this test passed against a decoder that substitutes 0.01.
+    """
+    game, chan = loop
+
+    game.publish(tick=1, player_x=500.0, coverage_cols=4,
+                 layout_x_factor=envmod.MEASURED_SECTION_X_FACTOR)
+    control = chan.poll(timeout=1.0)
+    assert control.known_mask(height=8, width=48, cell_size=30.0,
+                              player_col=12).grid().any(), (
+        "control frame is empty; the refusal below would prove nothing")
+
+    game.publish(tick=2, player_x=500.0, coverage_cols=4, section_x_factor=sxf,
+                 layout_x_factor=envmod.MEASURED_SECTION_X_FACTOR)
+    obs = chan.poll(timeout=1.0)
+
+    assert "objects" not in obs.unavailable_tables()
+    assert int(obs.coverage()[0]) == int(sg.GdrlCoverage.SCANNED)
+    assert float(obs.header["windowMaxX"]) > float(obs.header["windowMinX"])
+    assert float(obs.header["windowMaxY"]) > float(obs.header["windowMinY"])
+
+    km = obs.known_mask(height=8, width=48, cell_size=30.0, player_col=12)
+    assert km.refusal is envmod.MaskRefusal.NO_SECTION_MAPPING, (
+        "an unusable factor was substituted for instead of refused")
+    with pytest.raises(envmod.MaskRefused):
+        km.grid()
+    assert obs.column_span() is None
+
+
+def test_objects_unavailable_refuses_the_whole_frame(loop):
+    """The no-player path leaves last frame's coverage in place; do not read it.
+
+    The factor is the measured one and the coverage array says four columns were
+    SCANNED, so every ingredient for a confident mask is present. The flag alone
+    has to veto it.
+    """
+    game, chan = loop
+    game.publish(tick=1, player_x=500.0, coverage_cols=4,
+                 extra_flags=int(sg.GdrlHeaderFlag.OBJECTS_UNAVAILABLE))
+    obs = chan.poll(timeout=1.0)
+
+    assert obs.section_factor() is not None
+    assert int(obs.coverage()[0]) == int(sg.GdrlCoverage.SCANNED)
+    km = obs.known_mask(height=8, width=48, cell_size=30.0, player_col=12)
+    assert km.refusal is envmod.MaskRefusal.OBJECTS_UNAVAILABLE
+    with pytest.raises(envmod.MaskRefused):
+        km.grid()
+
+
+def test_a_refusal_cannot_be_spent_as_an_empty_grid(loop):
+    """The type has to make the mistake impossible, not merely detectable.
+
+    A consumer that never asks about the refusal must not end up holding
+    something that behaves like an all-False mask. Every route from a refused
+    KnownMask to an array is checked here: .grid(), np.asarray(), truthiness,
+    and the ndarray methods a caller would reach for out of habit. The frame is
+    the mod's own bad-factor refusal (fixture (b), publish()'s refusal path).
+    """
+    game, chan = loop
+    game.publish(tick=1, player_x=500.0, section_x_factor=0.0)
+    obs = chan.poll(timeout=1.0)
+    km = obs.known_mask(height=8, width=48, cell_size=30.0, player_col=12)
+
+    with pytest.raises(envmod.MaskRefused):
+        km.grid()
+    with pytest.raises(envmod.MaskRefused):
+        np.asarray(km)                       # cannot be laundered into an array
+    with pytest.raises(TypeError):
+        bool(km)                             # not silently truthy, not falsy
+    for attr in ("any", "all", "sum", "astype", "__getitem__", "__len__", "__iter__"):
+        assert not hasattr(km, attr), f"KnownMask.{attr} lets a caller skip the refusal"
+    # A refusal has to be legible when it is printed into a log, too.
+    assert "REFUSED" in repr(km)
+
+
+def test_looked_and_knew_nothing_still_yields_a_grid(loop):
+    """All-False is an answer, and it must survive as one.
+
+    TRUNCATED everywhere: the mod looked, the mapping is fine, and it cannot
+    vouch for a single column. That is knowledge, not a refusal, and collapsing
+    it into the refusal branch would be the same erasure in the other direction.
+    """
+    game, chan = loop
+    game.publish(tick=1, player_x=500.0, coverage_cols=4)
+    game.obs["coverage"][:] = int(sg.GdrlCoverage.TRUNCATED)
+    obs = chan.poll(timeout=1.0)
+
+    km = obs.known_mask(height=8, width=48, cell_size=30.0, player_col=12)
+    assert km.refusal is None and not km.refused
+    grid = km.grid()
+    assert grid.shape == (8, 48)
+    assert not grid.any()
+
+
+def test_refused_and_looked_but_knew_nothing_are_distinguishable(loop):
+    """Four frames that a bare all-False array would have flattened into one.
+
+    * TRUNCATED everywhere -- the mod looked, and cannot vouch for what it saw.
+    * unusable factor, geometry otherwise normal -- no mapping from x to a
+      column at all (fabricated via layout_x_factor; see that test above).
+    * OBJECTS_UNAVAILABLE with a good factor -- the mod did not look this frame.
+    * the mod's own bad-factor refusal, which raises both conditions at once.
+
+    The old ``known_mask()`` returned the same bytes for all four. What is
+    pinned now is that the difference is carried by the mask itself -- the
+    refusal reason -- and, independently, that it also survives on the
+    Observation, so a consumer that only has the header can still tell them
+    apart: ``column_span()`` is None exactly when the factor is unusable, and
+    ``unavailable_tables()`` names objects exactly when the flag is set.
+    """
+    game, chan = loop
+
+    game.publish(tick=1, player_x=500.0, coverage_cols=4)
+    game.obs["coverage"][:] = int(sg.GdrlCoverage.TRUNCATED)
+    truncated = chan.poll(timeout=1.0)
+
+    game.publish(tick=2, player_x=500.0, coverage_cols=4, section_x_factor=0.0,
+                 layout_x_factor=envmod.MEASURED_SECTION_X_FACTOR)
+    bad_factor = chan.poll(timeout=1.0)
+
+    game.publish(tick=3, player_x=500.0, coverage_cols=4,
+                 extra_flags=int(sg.GdrlHeaderFlag.OBJECTS_UNAVAILABLE))
+    no_look = chan.poll(timeout=1.0)
+
+    game.publish(tick=4, player_x=500.0, section_x_factor=0.0)
+    mod_refusal = chan.poll(timeout=1.0)
+
+    kw = dict(height=8, width=48, cell_size=30.0, player_col=12)
+    fingerprints = []
+    for obs in (truncated, bad_factor, no_look, mod_refusal):
+        km = obs.known_mask(**kw)
+        if km.refused:
+            with pytest.raises(envmod.MaskRefused):
+                km.grid()
+        else:
+            assert not km.grid().any()
+        fingerprints.append((km.refusal,
+                             obs.column_span() is None,
+                             "objects" in obs.unavailable_tables()))
+
+    R = envmod.MaskRefusal
+    assert fingerprints[0] == (None, False, False)                  # looked, cannot vouch
+    assert fingerprints[1] == (R.NO_SECTION_MAPPING, True, False)   # cannot index at all
+    assert fingerprints[2] == (R.OBJECTS_UNAVAILABLE, False, True)  # did not look
+    assert fingerprints[3] == (R.OBJECTS_UNAVAILABLE, True, True)   # the mod's own refusal
+    assert len(set(fingerprints)) == 4, "two refusals are indistinguishable"
+    # and the one that is not a refusal is the only one that hands out a grid.
+    assert sum(f[0] is None for f in fingerprints) == 1
+
+
+# -- what the mask actually indexes -----------------------------------------
+
+@pytest.mark.parametrize("player_x,player_col,cell_size,scanned,win_ahead", [
+    # start_col == 0; the case every pre-existing test used.
+    pytest.param(500.0, 12, 30.0, 4, envmod.MOD_WIN_AHEAD, id="start-col-zero"),
+    # A cell straddling the right window edge: centre outside, left edge inside.
+    pytest.param(450.0, 12, 30.0, 4, envmod.MOD_WIN_AHEAD, id="cell-straddles-the-edge"),
+    # Deep into the level, so coverageStartCol is 119 rather than 0, and the
+    # leftmost cells the WINDOW admits land in the FIRST covered column
+    # (section == 0). Note the window starts at 11945, partway into column 119,
+    # so the cells at 11880..11940 are in that column but outside the window --
+    # which is the left-edge disagreement, and it resolves to UNKNOWN.
+    pytest.param(12345.0, 16, 30.0, 4, envmod.MOD_WIN_AHEAD, id="nonzero-start-col"),
+    pytest.param(12345.0, 12, 30.0, 4, envmod.MOD_WIN_AHEAD, id="nonzero-start-col-shifted"),
+    # The full 64-column array with cells wide enough to reach its far end. This
+    # needs a window that actually reaches column 63: with the mod's default
+    # 1400 ahead the window binds at 19 columns and the 64-column clamp never
+    # does, so the far end of the array would never be exercised. 8000 is a
+    # value of GDRL_ENV_WIN_AHEAD, not a fabricated header.
+    pytest.param(500.0, 2, 200.0, sg.GDRL_COVERAGE_COLS, 8000.0, id="whole-coverage-array"),
+])
+def test_the_known_columns_are_the_window_intersected_with_the_scan(
+        loop, player_x, player_col, cell_size, scanned, win_ahead):
+    """Which raster columns are known, checked by interval arithmetic instead.
+
+    Tier (ii) against ``_expected_known_columns``, which answers the same
+    question without flooring anything or touching the coverage array; tier (i)
+    with respect to GD, since both sides are this repo's own description of the
+    protocol. Parametrised over the placements that move the parts of the
+    indexing expression independently: coverageStartCol away from 0 (a sign or a
+    dropped term stops cancelling), a cell whose centre and left edge fall on
+    opposite sides of the window edge, and cells that run off the end of the
+    64-column array.
+    """
+    game, chan = loop
+    game.publish(tick=1, player_x=player_x, player_y=105.0, coverage_cols=scanned,
+                 win_ahead=win_ahead)
+    assert game.scanned_cols == scanned, (
+        "the fixture's window bound before the mask did, so this case is not "
+        "testing the geometry it names")
+    obs = chan.poll(timeout=1.0)
+
+    mask = obs.known_mask(height=8, width=48, cell_size=cell_size, player_col=player_col).grid()
+    centres = _cell_centres(obs, 48, cell_size, player_col)
+    expected = _expected_known_columns(obs, centres, scanned)
+
+    assert expected.any(), "fixture placed nothing known in view; the case is vacuous"
+    assert not expected.all(), "fixture covered the whole view; boundaries untested"
+    got = mask.any(axis=0)
+    bad = np.nonzero(got != expected)[0]
+    assert bad.size == 0, (
+        f"columns {bad.tolist()} at x={centres[bad].tolist()} disagree: "
+        f"mask={got[bad].tolist()} expected={expected[bad].tolist()}")
+
+
+def test_the_first_covered_column_is_included(loop):
+    """coverage[0] is a column the mod walked, not a fencepost.
+
+    With coverageStartCol == 119 the leftmost cells in view index to section 0.
+    A lower bound of ``> 0`` instead of ``>= 0`` would silently drop them, and
+    every pre-existing test was blind to it because the fixture's start column
+    was 0 and no cell ever indexed there.
+    """
+    game, chan = loop
+    game.publish(tick=1, player_x=12345.0, coverage_cols=4)
+    obs = chan.poll(timeout=1.0)
+    start = int(obs.header["coverageStartCol"])
+    assert start > 0, "fixture no longer produces a nonzero start column"
+
+    centres = _cell_centres(obs, 48, 30.0, 16)
+    first_col = np.floor(centres * obs.section_factor()).astype(np.int64) - start == 0
+    assert first_col.any(), "no cell in view indexes to the first covered column"
+
+    # Only the cells the advertised window actually admits. Since windowMinX is
+    # `player_x - win_behind` (telemetry.cpp:688) and col0 is floor(minX * sxf)
+    # (:664), the first covered column starts LEFT of the window: the mod walks
+    # the whole of column col0 but advertises a window that begins partway into
+    # it. So a cell can index to section 0 and still, correctly, be outside the
+    # window. Asserting over those was testing the old fixture's snapped-left
+    # window, not the mod's.
+    in_win = ((centres >= float(obs.header["windowMinX"]))
+              & (centres <= float(obs.header["windowMaxX"])))
+    target = first_col & in_win
+    assert target.any(), "no in-window cell indexes to the first covered column"
+
+    mask = obs.known_mask(height=8, width=48, cell_size=30.0, player_col=16).grid()
+    assert mask.any(axis=0)[target].all()
+
+
+def test_columns_past_the_end_of_the_coverage_array_are_unknown(loop):
+    """Index 64 must not read as a copy of index 63.
+
+    The decoder clips the index before indexing so the gather stays in bounds;
+    the clip is only safe because ``valid`` throws the clipped entries away
+    afterwards. Here the whole array is SCANNED and the window is widened past
+    its right edge by hand (a fabrication, to reach the out-of-range branch --
+    the mod is not claimed to advertise a window wider than it scanned), so a
+    clip that survived into the result would read as extra known columns.
+
+    The raster is 50 units per cell so that EVERY 100-unit section past the end
+    contains at least one cell centre -- including section 64 itself, the single
+    index an upper bound written ``<=`` would let through. A coarser raster can
+    step straight over it and the mutant lives.
+    """
+    game, chan = loop
+    game.publish(tick=1, player_x=450.0, coverage_cols=sg.GDRL_COVERAGE_COLS)
+    start = int(game.obs["header"]["coverageStartCol"])
+    end_x = (start + sg.GDRL_COVERAGE_COLS) / envmod.MEASURED_SECTION_X_FACTOR
+    game.obs["header"]["windowMaxX"] = end_x + 2000.0
+    obs = chan.poll(timeout=1.0)
+
+    centres = _cell_centres(obs, 200, 50.0, 0)
+    beyond = centres >= end_x
+    assert beyond.sum() >= 5, "fixture no longer puts cells past the array"
+    first_past = np.floor(centres[beyond] * obs.section_factor()).astype(np.int64) - start
+    assert first_past.min() == sg.GDRL_COVERAGE_COLS, "no cell indexes the first out-of-range column"
+
+    mask = obs.known_mask(height=8, width=200, cell_size=50.0, player_col=0).grid()
+    assert not mask.any(axis=0)[beyond].any()
+
+
+def test_a_scanned_column_outside_the_window_is_not_known(loop):
+    """Being in the coverage array is not on its own enough to be known.
+
+    known_mask() ANDs the coverage state with the advertised window. The window
+    is narrowed here to half the scanned span by hand -- the fixture normally
+    makes the two agree exactly, which is why nothing caught the AND being
+    dropped. Tier (i): it pins the documented conjunction, not the game.
+    """
+    game, chan = loop
+    game.publish(tick=1, player_x=500.0, coverage_cols=4)
+    game.obs["header"]["windowMaxX"] = 200.0
+    obs = chan.poll(timeout=1.0)
+
+    centres = _cell_centres(obs, 48, 30.0, 12)
+    outside = (centres > 200.0) & (centres < 400.0)
+    assert outside.any()
+    # Those columns really are SCANNED -- the only thing excluding them is the window.
+    idx = np.floor(centres[outside] * obs.section_factor()).astype(np.int64)
+    assert (obs.coverage()[idx] == int(sg.GdrlCoverage.SCANNED)).all()
+
+    mask = obs.known_mask(height=8, width=48, cell_size=30.0, player_col=12).grid()
+    assert not mask.any(axis=0)[outside].any()
+
+
+def test_the_player_row_sits_at_half_the_grid_height(loop):
+    """Rows are laid out from the player, and one row off is a real error.
+
+    Tier (i): this pins the raster convention known_mask() shares with
+    TrajectoryRaster (origin_y = playerY - (height // 2) * cell), nothing about
+    GD. The vertical window is narrowed by hand to +/- 20 so that exactly the two
+    rows whose centres bracket the player survive; a shifted origin moves which
+    two those are.
+    """
+    game, chan = loop
+    game.publish(tick=1, player_x=500.0, player_y=105.0, coverage_cols=4)
+    game.obs["header"]["windowMinY"] = 105.0 - 20.0
+    game.obs["header"]["windowMaxY"] = 105.0 + 20.0
+    obs = chan.poll(timeout=1.0)
+
+    height = 32
+    mask = obs.known_mask(height=height, width=48, cell_size=30.0, player_col=12).grid()
+    rows = set(np.nonzero(mask.any(axis=1))[0].tolist())
+    assert rows == {height // 2 - 1, height // 2}
+
+
+# -- the factor itself, against the live measurement -------------------------
+
+def test_the_section_factor_reproduces_the_measured_section_count(loop):
+    """Tier (iii): the arithmetic has to close on numbers read out of the game.
+
+    m_levelLength 26724 and m_sections.size() 268 were dumped live from Stereo
+    Madness on 2026-08-12 (envmod.MEASURED_LEVEL_LENGTH / _SECTION_COLUMNS).
+    ``floor(length * sxf) + 1 == 268`` closes exactly under the multiplier
+    reading. The divisor reading -- the defect this file failed to catch for its
+    whole life -- would need 2,672,401 columns, so the same expression written
+    with a division is checked here to NOT close.
+    """
+    game, chan = loop
+    game.publish(tick=1)
+    obs = chan.poll(timeout=1.0)
+
+    sxf = obs.section_factor()
+    assert sxf == envmod.MEASURED_SECTION_X_FACTOR
+    assert math.floor(envmod.MEASURED_LEVEL_LENGTH * sxf) + 1 == envmod.MEASURED_SECTION_COLUMNS
+    assert math.floor(envmod.MEASURED_LEVEL_LENGTH / sxf) + 1 != envmod.MEASURED_SECTION_COLUMNS
+    # section_width() is 1 / sxf, i.e. 100 units per column, not the factor.
+    assert obs.section_width() == pytest.approx(100.0, abs=1e-3)
+
+
+def test_column_span_is_exactly_what_the_coverage_array_indexes(loop):
+    """The span's endpoints, checked by re-indexing them.
+
+    Not by restating ``start * w, (start + COLS) * w`` -- that would only prove
+    the line was copied correctly. The low end must index to the start column and
+    the high end must be the first x that indexes one past the last column the
+    array holds, using the mod's own floor(x * sxf) expression.
+    """
+    game, chan = loop
+    game.publish(tick=1, player_x=12345.0, coverage_cols=4)
+    obs = chan.poll(timeout=1.0)
+
+    start = int(obs.header["coverageStartCol"])
+    sxf = obs.section_factor()
+    lo, hi = obs.column_span()
+    assert math.floor(lo * sxf) == start
+    assert math.floor(hi * sxf) == start + sg.GDRL_COVERAGE_COLS
+    assert math.floor(math.nextafter(hi, 0.0) * sxf) == start + sg.GDRL_COVERAGE_COLS - 1
 
 
 def test_unavailable_tables_are_distinguishable_from_empty_ones(loop):

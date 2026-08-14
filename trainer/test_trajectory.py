@@ -292,12 +292,21 @@ def test_one_tick_at_1x_advances_the_measured_distance():
 
 
 def test_the_1x_constant_is_the_float32_the_game_actually_adds():
-    """Tier (ii): reconstructed independently, not copied from the module.
+    """Tier (ii) FOR THE FLOAT32 ENCODING, AND FOR NOTHING ELSE.
 
     The module used to carry 311.58/240 = 1.298250000 under a comment citing
     the measured 1.298250437 -- the code did not hold the number it cited. It
     now holds float32(1.298250437), which is what the game adds, and this
     rebuilds that value from the decimal rather than trusting the literal.
+
+    Scope of the (ii): what is independently reimplemented here is the float32
+    rounding (via struct, against the module's own _f32), so what is falsified
+    is a mistyped or mis-expanded literal. The DECIMAL 1.298250437 is the same
+    README measurement the module cites, carried in this file as
+    UNITS_PER_TICK_1X -- this test cannot tell you it is the right number, only
+    that the module holds the float32 of it. The game-grounded check on the
+    value itself is the Stereo Madness anchor below and the recorded player-x
+    samples in test_projection_groundtruth.
     """
     reconstructed = struct.unpack("<f", struct.pack("<f", UNITS_PER_TICK_1X))[0]
     assert UNITS_PER_TICK[1] == reconstructed
@@ -308,10 +317,17 @@ def test_stereo_madness_first_spike_is_391_ticks_of_travel_away():
     """A real anchor rather than a synthetic one: no-input Stereo Madness dies
     at maxX = 507.615234375, bit-identical over 175 attempts.
 
-    Note the frames, since this is exactly the confusion the 2026-08-12 origin
-    correction was about. 391 is the number of TICKS OF TRAVEL from x = 0. The
-    ABSOLUTE tick is 392, because x = 0 at tick 1 -- README's "tick 391" is one
-    off in the ENV channel's own convention, which TODO G6 records.
+    The claim, stated as what the evidence supports: 391 accumulated float32
+    steps from x = 0 reproduce 507.615234375 bit-exactly (see the test below);
+    on the continuous line the same distance is 390.999471 ticks of TRAVEL,
+    which is what is asserted here.
+
+    Nothing here settles what ABSOLUTE tick number the game or README would put
+    on that step. Converting travel to an absolute tick needs the origin
+    convention, x = 0 at tick 1, which is measured on a different level in a
+    different channel; this test does not exercise it and an earlier version of
+    this docstring used it to call README's "tick 391" off by one. That
+    off-by-one is UNVERIFIED here and is left to TODO G6.
     """
     profile = SpeedProfile(player_x=0.0)
     assert profile.ticks_to_reach(507.615234375) == pytest.approx(391.0, abs=0.01)
@@ -320,11 +336,20 @@ def test_stereo_madness_first_spike_is_391_ticks_of_travel_away():
 def test_the_float32_accumulator_reproduces_the_stereo_madness_death_x():
     """Tier (iii), and from a level this module was never fitted to.
 
-    README's null-input death x on Stereo Madness is reproduced BIT-EXACTLY at
-    absolute tick 392 by the game's own accumulator, which was characterised on
-    the synth level from a different probe. Different level, different probe,
-    ~550 attempts apart, no free parameters. It is corroboration of both the
-    origin convention and the float32 accumulation at once.
+    THE CLAIM: 391 accumulated float32 steps from x = 0 reproduce README's
+    null-input Stereo Madness death x, 507.615234375, BIT-EXACTLY -- and 390
+    steps do not (506.3169860839844). Different level, different probe, ~550
+    attempts apart, no free parameters. That is corroboration of the float32
+    accumulation, on a step COUNT, which is what the accumulator is a function
+    of.
+
+    ``player_x_at_tick_float32(392)`` is how 391 steps are spelled here, because
+    the function's origin is x = 0 at tick 1. The absolute tick number is
+    therefore the origin convention's contribution, not this record's: the
+    measurement is the step count. An earlier version of this docstring read the
+    agreement as corroborating the origin convention as well, which it cannot --
+    a run with x = 0 at tick 0 would produce the identical 507.615234375 from
+    the identical 391 steps.
     """
     assert player_x_at_tick_float32(392) == 507.615234375
     assert player_x_at_tick_float32(391) != 507.615234375
@@ -341,13 +366,20 @@ def test_the_player_x_origin_is_tick_one():
 
 
 def test_the_documented_float32_drift_bound_is_the_measured_one():
-    """Tier (ii): the bound the module trades away is recomputed, not asserted.
+    """Tier (i), regression on a documented constant. NO recorded data enters.
 
     SpeedProfile models player x as a line; the game accumulates in float32.
     The module documents the resulting divergence over a lookahead window as a
-    bounded known error, so the bound has to stay honest. This recomputes it
-    over the full 4,653-tick recorded run, the same span the accumulator was
-    measured over.
+    bounded known error, so the bound has to stay honest. This recomputes it.
+
+    The tier used to read "(ii)" here and the text used to say "recomputed over
+    the full 4,653-tick recorded run". Neither is true and trajectory.py's own
+    docstring says so ("this bound is arithmetic on the measured accumulator,
+    not an observation of a mis-predicted trigger"). 4,653 is the length of the
+    run the accumulator law was characterised on; what runs below is a
+    SIMULATION of 4,653 ticks of that law. No sample of the game's x is read,
+    and no observation of a mis-predicted trigger exists at all. If the law
+    itself were wrong this test would happily reproduce the wrong bound.
     """
     u = UNITS_PER_TICK[1]
     xs = []

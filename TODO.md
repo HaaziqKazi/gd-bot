@@ -3,17 +3,21 @@
 Single place for what is left. Companion to `README.md`, which records what has
 been **established**; this file records what has **not**.
 
-Status as of commit `7fb0c7d` + the 2026-08-12 session below.
+Status as of commit `0c6852d` + the 2026-08-13 session below.
 
-> **Read "Session 2026-08-12" first**, and its sections **H–K** before anything
-> else. Track 0.1 is closed; the arrival-tick defect is corrected and
-> independently validated; both C++ bugs are fixed and confirmed against the
-> running game, so Track 1.2 is genuinely unblocked for the first time. Three
-> new open items came out of it — an unfinished `test_env.py` (I), a phantom
-> SOLID object glued to the player (J), and two dead instruments (K).
+> **Read "Session 2026-08-13" (section L) first.** It closes I, J and the
+> evidence-labelling debt, and it hardens the observation decoder. J turned out
+> to be the dangerous branch: **GD was emitting the player's own collision proxy
+> as a SOLID block on top of the player**, on every frame, on every level.
+>
+> **Then read "Open decisions", which now leads with a benchmark question that
+> outranks everything else in this file.** Whether hidden simulator rollouts are
+> allowed is not a tuning knob — it decides whether this project is a planning
+> problem or a learning problem, and therefore which of Objectives A–E are
+> load-bearing. Do not start Track 4 before answering it.
 >
 > **Start at "Queue for next session".** Nothing is blocked on a build or a
-> measurement; the tree is green at 182 tests.
+> measurement; the tree is green at 207 tests and the mod builds universal.
 
 ---
 
@@ -35,8 +39,9 @@ decided yet.
 | Unattended running | **Proven** — `GDRL_WINDOWED`, 0.41/s unfocused |
 | Binary env transport | **Built + validated** — defaults clean, observation passive |
 | Forward projection (Objective B) | **Validated against recorded game data** — motion model exact; the 1.9198-tick fire-tick lead is **corrected and independently re-validated** 2026-08-12. Residual is the game's own float32 drift (max `5.6457e-04` units, `0.0031` ticks) |
-| Conditioning (Objective A) | **A real portal crossing finally happened** 2026-08-12 (H): six synth portals fire, incl. `cube -> ship`. But `MODE` never fires (K), and the object window it feeds carries a phantom SOLID glued to the player (J) — so the *regime* is evidenced, the *geometry* is not yet trustworthy |
-| Object observation window | **Fixed and confirmed live** (H/E): `objectCount == 0` on 0 of 3,722 ticks, was 4,344 of 4,653. Trust it only after J |
+| Conditioning (Objective A) | **A real portal crossing finally happened** 2026-08-12 (H): six synth portals fire, incl. `cube -> ship`. `MODE` still never fires (K). The phantom that made the geometry untrustworthy is **identified and filtered** (L2) |
+| Object observation window | **Fixed, confirmed live, and de-phantomed** (H/E/L2): `objectCount == 0` on 0 of 3,722 ticks, was 4,344 of 4,653; the player's own collision proxy no longer reports as a SOLID block on the player. **Any `objectCount` recorded before 2026-08-13 was inflated by 5–10** and must be recomputed, not trusted |
+| Observation decoder honesty | **Hardened** (L3/L4): refusal is structurally distinguishable from "known-empty" and cannot be laundered into an array; `test_env.py` regraded 7/25 → 25/25 by mutation |
 | Hold duration (Objective C) | **Untouched** |
 | In-context failure memory (Objective D) | **Nothing** |
 | Uncertainty policy (Objective E) | **Substrate only** (coverage mask + certainty channel) |
@@ -893,7 +898,16 @@ fixture publishes `MEASURED_SECTION_X_FACTOR` / `_Y_FACTOR` / `_LEVEL_LENGTH` /
         and they are exactly the tests that passed happily against a fabricated
         header for the whole life of the file.
 
-### J. BUG (open, uninvestigated): a phantom object is glued to the player
+### J. BUG — **RESOLVED 2026-08-13, see L2.** It was the player's own collision proxy
+
+*The investigation below is retained for the reasoning trail. The answer: object
+1816 is `GJBaseGameLayer::m_player1CollisionBlock` / `m_player2CollisionBlock`,
+GD's own per-player collision proxy, carrying the player's position from the
+**previous** physics step. It is reachable through the section grid but not
+through `m_objects` — which is exactly why the census never saw it. The answer
+to "is the player itself being emitted as geometry?" is **yes**.*
+
+### J (original text). BUG (open, uninvestigated): a phantom object is glued to the player
 
 Revealed — **not caused** — by the section-factor fix; the old 0.64-unit window
 saw nothing at all. Every `GDRL_ENV` step carries **five entries with
@@ -937,43 +951,267 @@ on the player.** In neither README nor TODO before now.
       field is useless as logged. The x values are still good. (Consistent with
       the older finding that `m_currentStep` is not the physics-tick counter.)
 
+---
+
+## Session 2026-08-13 — I, J and the evidence debt closed; the decoder hardened
+
+Tree green at **207 tests** (was 182). Mod builds universal (`x86_64 arm64`).
+Two agents were stopped mid-task at the end of the session; what they had
+already landed is complete and is described below, and what they had not
+reached is in the queue.
+
+### L1. The five mislabelled evidence claims are repaired
+
+All five figures in the independent-validation section above were **re-derived
+from scratch and reproduced exactly** — the 20.7%/17.2% bias split, the flat
+float32 plateau at ticks 462–464, the 55.8th-percentile placement of
+`3.4332e-05`, the bit-exact 391-step reproduction of `507.615234375`. Nothing
+in the previous session's measurements failed to hold up.
+
+**One correction to this file's own claim.** The text above says randomised
+records leave the vacuous test passing. That is true of the *identity assertion
+in isolation* (max violation `0.000e+00`) and false of the *enclosing test*,
+whose `worst == approx(...)` check fails at `worst ≈ 500` with garbage records.
+The test was never fully blind; one assertion in it was.
+
+Repairs landed in `trajectory.py`, `validate_projection.py`,
+`test_projection_groundtruth.py`, `test_trajectory.py`:
+
+- the circular residual identity is relabelled tier (i), and the direct
+  `out.y == line` assertion it was standing in for is now made explicitly
+  (exact at `0.0` over all 480 ticks). Measured falsification power: a `1e-14`
+  perturbation of `ease` fails the new line while the old `abs=1e-12` identity
+  still passes;
+- `3.4332e-05` is restated as "same noise floor, **zero** free parameters
+  instead of one", with the arrival sweep showing the figure is identical for
+  every arrival in `[462.0, 464.0]` — it cannot discriminate the one tick the
+  two models disagree about. `validate_projection.py` now prints `n_effective`
+  when the sweep degenerates to a single distinct value;
+- the float32 bias direction is reworded from a universal to "predominantly",
+  carrying 20.7% and the `−0.000343` counterexample at tick 232;
+- `test_the_documented_float32_drift_bound_is_the_measured_one` no longer claims
+  tier (ii) over data it simulates;
+- the tick-391-vs-392 framing is replaced by what the evidence supports.
+
+**New finding, worth more than the relabelling:** `CORRECTED_RESIDUAL_BOUND_UNITS`
+is a threshold fitted to its own maximum — worst residual `5.6457e-04` against a
+bound of `5.646e-04`, a **0.005% margin**. A bound that tight can only ever
+pass. The new per-tick tier-(iii) assertion uses a `1e-3` noise floor instead.
+
+Also swept the same four files for claims of the same shape and repaired five
+more, including one that was in this file but *not* in the code: `trajectory.py`
+presented the player-x values (2026-08-12 run) and the activation tick
+(2026-08-11 run) as a single measurement. The run-splicing caveat now lives in
+the module, where someone reading the code will meet it.
+
+**Checked and found honest, no change:** `test_aggregate_constants_derive_from_
+the_full_record` really is tier (iii) — the fixture's `RECORDS` is byte-identical
+to the 480 `MOVE` lines in `backups/reference-logs/Geode 2026-08-11 18.41.23.log`,
+and `max |dy_log − dy_from_y| = 1.000e-09`, exactly the quantum it claims.
+
+### L2. J is RESOLVED: the player was being emitted as a solid block
+
+**Object 1816 is `GJBaseGameLayer::m_player1CollisionBlock` /
+`m_player2CollisionBlock`** — GD's own per-player collision proxy, created by
+`createPlayerCollisionBlock()`. Evidence in
+`backups/reference-logs/phantom-synth-behind400.log`:
+
+```
+PH-CB tick=1320 p1 ptr=0xac89c1000 uid=25 oid=1816 otype=39
+      pos=(1864.222778320,105.0) rect=30x30 inObjects=-1
+PH    tick=1320 px=1866.172729492 prevPx=1864.222778320
+      hits=5 ptrEqP1=5 atCol=14x1,15x1,16x1,17x1,18x1
+```
+
+The block's `m_positionX` at tick *t* equals the player's `getPositionX()` at
+*t−1* to all nine decimals. `inObjects=-1` — it is reachable through the section
+grid but **not** through `m_objects`, which is precisely why the census never
+saw it and why this looked like a phantom.
+
+- **`objectType=39` is `GameObjectType::CollisionObject`**, read off the real
+  bindings (`mod/build/_deps/bindings-src/bindings/include/Geode/Enums.hpp`),
+  not a community table. It is *not* `Solid` (which is `0`). The `kind=1
+  (SOLID)` on the wire was **our own** `collapseKind()` mapping
+  `CollisionObject -> SOLID`.
+- **Answer to J's dangerous branch: yes.** Every consumer of the object window
+  was being shown a 30×30 solid block standing on the player, one tick stale, on
+  every frame. That poisons Objective A conditioning and any trajectory
+  validation against real geometry.
+- **Why five.** It registers once per column it has *ever* entered and those
+  registrations are never removed. Measured 5 at `GDRL_ENV_WIN_BEHIND=400` and
+  **10 at 900** (`phantom-synth-behind900.log`) — a cleaner explanation than the
+  no-dedupe hypothesis, and one that predicts the window-size dependence.
+- **Repair: filtered by POINTER, not by object id.** `1816` is the editor's
+  Collision Block, a real authorable object a level may legitimately contain —
+  and *that* one lives in `m_objects` and should be reported. Filtering by id
+  would have silently deleted real geometry. In every sample of both runs
+  `hits == ptrEqP1 + ptrEqP2`, so no third object is affected.
+
+Logs preserved: `phantom-synth-behind400.log`, `phantom-synth-behind900.log`,
+`phantom-stereomadness.log`, `phantom-synth-jump200.log`,
+`phantom-synth-fixedwindow-*.log`.
+
+### L3. `test_env.py` was graded by mutation, and it was catching almost nothing
+
+Not "the tests pass" — a mutation table. **7 of 25 mutants killed before, 25 of
+25 after.** Survivors of the old suite included dropping the
+`OBJECTS_UNAVAILABLE` refusal entirely, the refusal returning all-*True*, and
+`column_span` substituting `100.0` instead of `None`.
+
+Independently reproduced in the main thread: mutate `env.py` to substitute the
+measured constant instead of refusing, and **the old 39 tests pass clean while
+the new suite kills it with 11 failures**. That mutation is the original
+section-factor bug wearing a different hat, and the file meant to guard against
+it did not.
+
+**Root cause of the survivors:** every test in the file used one player
+placement, `player_x=500`, where `coverageStartCol` is **0** — so a sign flip on
+`start_col`, dropping it entirely, and a `>= 0` fencepost were all no-ops. One
+fixture constant was hiding four defects. A nonzero-start-col parametrisation
+(`player_x=12345` → `coverageStartCol=119`) is what kills them.
+
+**And the fixture was manufacturing vacuous tests.** The natural refusal test —
+publish a bad factor, assert the mask is empty — *passes against a decoder that
+substitutes*, because `publish()`'s refusal path also left a zero-area window,
+so the mask was empty regardless of what the decoder did. Anyone writing a
+refusal test here must restore the window first; `publish()` now takes
+`layout_x_factor` so that is one call rather than hand-patching a header.
+
+### L4. `known_mask()` can no longer be mistaken for knowledge
+
+It returned a bit-identical all-False grid for three different situations: no
+`x -> column` mapping exists; the mod did not look this frame; the mod looked
+and knows nothing. A caller holding only the mask could not tell them apart, and
+nothing forced it to try — so "refused" would silently become "known-empty",
+the same bug class as the inverted section factor.
+
+Changed **now** because `known_mask()`, `column_span()` and `unavailable_tables()`
+had **zero call sites outside the tests**. Nothing consumed them yet, and
+Objective E's uncertainty policy is specified to be built directly on this mask.
+
+`known_mask()` returns a `KnownMask` whose `.grid()` raises `MaskRefused` when
+refused. Every laundering route is closed: `__array__` raises, so
+`np.asarray`/`np.stack`/`torch.as_tensor` cannot convert it; `__bool__` raises
+`TypeError` (a dataclass is truthy by default, which would have been its own
+silent lie); there is no `.any()` to fall through to, so stale calling code
+fails on frame 1 rather than returning a plausible empty grid forever. There is
+deliberately **no** `mask_or_empty()` — collapsing a refusal has to appear in
+the caller's source.
+
+The asymmetry the design turns on: *"looked and knew nothing"* keeps
+`refusal is None` and returns a real all-False array. It is an observation, not
+a refusal. Both directions are mutation-pinned; the fingerprint test separates
+**four** states.
+
+### L5. The loopback fixture was not the mod at the left window edge
+
+`publish()` claimed "the window arithmetic follows `scanObjects()` rather than
+being invented here." At the left edge it did not. The mod makes the *window*
+primary (`minX = px - g_winBehind`, `telemetry.cpp:688`) and derives the column
+(`:664`); the fixture made the *column* primary and snapped the window left to
+the boundary. Measured, and verified independently in the main thread:
+
+| `player_x` | fixture `windowMinX` | mod `windowMinX` | gap |
+|---|---|---|---|
+| 500 | 0.0 | 100.0 | **100.0** |
+| 550 | 100.0 | 150.0 | 50.0 |
+| 1000 | 500.0 | 600.0 | 100.0 |
+| 12345 | 11900.0 | 11945.0 | 45.0 |
+
+The default `player_x=500` — the frame nearly every mask test stood on — is a
+worst case at a full section. The mechanism is the *same* sub-0.01 `sxf` that
+caused the original inversion: `100 * 0.009999999776482582 = 0.9999999776`,
+which floors to 0, not 1. Every mask test reads `windowMinX` out of the header,
+so none of them failed; they were certifying a left-edge geometry the game never
+produces. The fixture now mirrors the mod, with `telemetry.cpp` line citations.
+
+**Two comments were the defect, not the code:**
+
+- The claim that the back-off means window and mask "cannot disagree by a
+  rounding step at the boundary" is false — they disagree at the left edge on
+  **every** nonzero start column, always by exactly −1 (verified in the main
+  thread at columns 1, 5, 119, 267). The true guarantee is stronger and now
+  stated structurally: `state` is looked up from the per-cell section index, not
+  from the window, so knowledge is the *intersection* of the two and widening
+  either alone can only remove cells, never add them. A too-wide window cannot
+  manufacture knowledge.
+- **The right-edge `nextafter` back-off is inert.** Across 3000 start columns the
+  loop takes 4631 steps and the `f32` store erases the result in **every** case,
+  bit-identically — it corrects a double by far less than the subsequent
+  truncation to `f32`. Dead code under a confident comment. Measured on
+  `publish()`; `telemetry.cpp:677-681` is structurally identical (double
+  `colEdge`, `(float)maxX` store) so the same erasure is very likely there, but
+  **UNVERIFIED** — nobody has measured the mod's copy.
+
+### L6. The `levelLength` cross-check is a diagnostic, not a gate
+
+`floor(levelLength * sxf) + 1 == sectionColumns` is available at decode time and
+was unused, and `section_factor()` accepts any finite positive value however
+absurd (`1e-30` passes and collapses every world x onto column 0). It is now
+exposed as a diagnostic returning `None` when either field is unpopulated. It
+deliberately does **not** cause `known_mask()` or `section_factor()` to refuse,
+because:
+
+- the identity is measured on exactly **two** levels, and `m_sections.size()`
+  may be sized from the rightmost object or a reserve rather than
+  `m_levelLength` — those coincide on both levels measured;
+- a false reject would blank the uncertainty channel for an *entire level* and
+  would present as "refused everywhere", indistinguishable from a genuinely
+  corrupt factor — the exact confusion L4 exists to remove;
+- the acceptance band is `1/N` wide: 0.37% on Stereo Madness but **1.6% on the
+  64-column synth level**, i.e. weakest precisely where we test most. It would
+  pass `0.0101` on synth.
+
+It does reject `1e-30`, `0.005`, `0.0101`, `100.0`, and the divisor reading.
+
+
 ### Queue for next session, in order
 
-0. **Nothing is blocked on a build or a measurement right now.** The tree is
-   green at 182 tests and both C++ bugs are fixed and confirmed live. Items 1–3
-   are `trainer/`-only and need no GD; item 4 needs the sandbox.
-1. **Finish `test_env.py`** (I) — the refusal-path test and the three
-   `known_mask` gradings. Small, and it is the branch that keeps "unknown" from
-   silently becoming "empty".
-2. **The three evidence-labelling fixes** from the independent-validation section
-   above, plus the two the validator added (the drift-bound test's tier-(ii)
-   label over data it simulates; the tick-391-vs-392 framing). `trainer/` only.
-3. **Identify the phantom 1816 object** (J). Needs a GD run and possibly a probe.
-   Blocks trusting `objectCount` and every object-window consumer — which is
-   most of what E just unblocked.
-4. **Measure the four speed buckets properly** (Track 1.2) — now genuinely
+0. **Answer the benchmark question in "Open decisions" first.** It is not a
+   tuning knob and it outranks every item below: it decides whether the next
+   phase is planning or learning, and therefore whether Objectives D and E are
+   load-bearing or decorative. Items 1–4 below are worth doing under *either*
+   answer; item 5 onward is not.
+
+1. **Finish the fixture-fidelity test updates** (L5). `env.py` is done and
+   correct; the *tests* were mid-update when the session stopped. One assertion
+   (`test_the_first_covered_column_is_included`) was completed in the main
+   thread and re-graded against the `>= 0` → `> 0` fencepost mutant, which it
+   still kills. What was **not** reached: the agent was told to report which
+   other expectations changed under the narrower window, and to add a test
+   pinning fixture↔mod agreement across a spread of `player_x` including
+   boundary-adjacent values (tier (i) — it pins our transcription of the mod,
+   not the mod). Neither exists yet.
+
+2. **Re-run the mutation harness end-to-end** on the current tree. The 25/25
+   result predates the L5 window change and the 8/8 refusal result predates it
+   too; both were re-verified only in part. The harness is small and worth
+   keeping — consider moving it out of the scratchpad into the repo, because
+   "the tests pass" is exactly the claim this session showed to be worthless.
+
+3. **Verify the mod's right-edge back-off is inert** (L5). Measured dead in
+   `publish()`; `telemetry.cpp:677-681` is structurally identical but
+   **UNVERIFIED**. If it is dead there too, delete it and the comment — dead
+   code under a confident comment is how this repo accumulates false beliefs.
+
+4. **`MODE` / `COND step=`** (K) — instrument defects, cheap, and Track 1.3
+   cannot be called done without the first. Note L2 changes the reading of the
+   object window, so anything that consumed `objectCount` before 2026-08-13 was
+   inflated by 5–10 phantom entries and should be recomputed, not trusted.
+
+5. **Measure the four speed buckets properly** (Track 1.2) — genuinely
    unblocked, portals fire. Beware the float32-binade quantisation: measure
    where it is smallest, or use a method robust to it. The H table is not it.
-5. **`MODE` / `COND step=`** (K) — instrument defects, cheap, and 1.3 cannot be
-   called done without the first.
-6. Then Track 0.2 (predictor spec + test-tier audit), which A, B and the
-   validation now feed.
 
-~~1. **Fix D and E**~~ — done, see H.
-2. ~~**Finish the stopped audit of `test_projection_groundtruth.py`**~~ — done,
-   see A.
-3. **Correct `trajectory.py`'s arrival-tick model** per B and C — **landed and
-   independently validated**, but only **partially**: the `(t−1)` origin and
-   zero crossing latency are in; **float32 accumulation is deliberately NOT** in
-   `SpeedProfile`, which still models x as the continuous line. That is a
-   defensible call (O(1) closed form vs O(horizon); only bucket 1 has a
-   float32-exact `U`) and is documented with a measured bound in
-   `trajectory.py`'s "PLAYER X IS FLOAT32-ACCUMULATED" section. Recorded here so
-   the item is not read as fully closed.
-4. **Rerun the speed measurement** once D lands — the tester's method reproduces
-   all four buckets in one ~20s attempt with no further work.
-5. Then Track 0.2 (predictor spec + test-tier audit), which A and B now feed.
-6. **The three evidence-labelling fixes above.** `trainer/` only, no GD needed.
+6. Then Track 0.2 (predictor spec + test-tier audit).
+
+**Closed this session:** I (L3), J (L2, and it was the dangerous branch), and
+the evidence-labelling debt (L1). The `known_mask` API hardening (L4) and the
+`levelLength` diagnostic (L6) were not on the queue and came out of the work.
+
+**Two agents were stopped mid-task**; both had landed complete, verified work
+before stopping, and neither left the tree broken. What each had *not* reached
+is items 1–3 above.
 
 Task #8 (a synth trigger at x=300.65, arrival 231.5809, frac 0.58) is **largely
 superseded**: the activation mechanism is now measured directly rather than
@@ -1091,6 +1329,91 @@ suggestive rather than closing 2.3 — but it is real, and it was free.
 ---
 
 ## Open decisions (need a human)
+
+### 0. THE BENCHMARK QUESTION — answer this before Track 4, it reframes 1–4
+
+Raised 2026-08-13. Two different problems have been sharing one codebase:
+
+**Benchmark A — true sightreading.** The agent receives only what it is
+legitimately allowed to observe. It cannot inspect geometry beyond its sensor
+horizon, cannot clone the engine to try alternate futures, cannot read future
+trigger states. Attempt 1 really is attempt 1. This is the few-shot /
+in-context-learning problem.
+
+**Benchmark B — simulator-assisted minimum-attempt play.** The agent may inspect
+collision geometry ahead, read engine state, clone the game, roll out invisible
+futures and discard the ones that die. It may finish on its first *visible*
+attempt having internally performed thousands of hidden ones.
+
+Both are legitimate. They are not the same problem, and **the current MCTS
+sketch in Track 2 assumes B** — it proposes cloning the game and trying branches
+without counting them as attempts.
+
+**Why this decides the architecture.** Under B, planning is central and RL is
+nearly decorative: GD is deterministic with a 1-bit action per tick, so with
+cloning it is a search problem whose answer is known in advance — search wins,
+and the only hard part is throughput (Track 2.1 checkpoint/restore becomes
+*essential*). Under A, search is unavailable by construction, and Objectives D
+(in-context failure memory) and E (uncertainty policy) stop being nice-to-haves
+and become the whole substance of the project.
+
+**The three dials are separable**, and collapsing them into a binary hides the
+interesting middle:
+
+1. **Sensor horizon** — how far ahead, and through what occlusion, the agent
+   may observe.
+2. **Rollout budget** — how many futures it may evaluate per visible attempt.
+3. **Attempt accounting** — whether hidden rollouts count against the score.
+
+A = tight horizon, zero hidden rollouts. B = full horizon, unbounded hidden
+rollouts. **A′ = tight horizon, small bounded rollout budget over only what is
+visible** — which is much closer to what a strong human player actually does
+(they *do* simulate the next jump; they cannot simulate past the screen edge,
+and a failed rehearsal does not rewind the attempt).
+
+Note that forward projection (Objective B) is **legitimate under A**. Predicting
+where a visible moving block will be is perception plus extrapolation, which is
+what a human does. The line is not "no simulation" — it is (1) the sensor
+horizon and (2) whether a failed future costs an attempt.
+
+**Recommendation on the table (not yet decided):** make **A the headline claim**
+and keep **B as an oracle**. B's solved trajectories are the ground truth needed
+to score A's play and to generate training targets — B becomes the teacher, A
+the student. That way the restriction is a parameter, not a fork of the
+codebase, and B falls out as A's ablation and upper bound.
+
+**Architectural consequence if A is chosen — this one is load-bearing.** The
+horizon must be enforced **in the mod, in `scanObjects`**, not in Python and not
+by asking the policy to ignore what it was handed. An agent trusted to discard
+information it received is not a benchmark. That makes the object window
+(`GDRL_ENV_WIN_*`) the sensor definition rather than a performance knob, and it
+makes L2 retroactively serious: for the whole life of the ENV transport the
+observation contained a phantom solid block on the player, i.e. **the sensor was
+lying**, which under A is a benchmark-invalidating defect rather than a nuisance.
+L4's refusal-vs-ignorance distinction is likewise not hygiene under A — it is
+the primitive that lets the agent know what it does not know.
+
+### 0b. The tier-(iii) evidence is not in the repo (found 2026-08-13)
+
+`.gitignore:18` ignores `backups/`, and `git ls-files backups/reference-logs/`
+returns **nothing**. So every log this project cites as game-grounded evidence —
+including `Geode 2026-08-11 18.41.23.log`, the 480 `MOVE` records that the only
+tier-(iii) tests in the repo are built on, and this session's five `phantom-*.log`
+files — exists on exactly one machine and is one `rm` from gone.
+
+This is the repo's own rule turned on itself: *a claim resting on a log that no
+longer exists is not evidence*. The tests would still pass, because the fixtures
+carry transcribed copies — which is precisely the problem, since nobody could
+then re-derive the transcription.
+
+Decide: commit the logs (~1.6 MB for this session's set, and they compress well),
+commit a hashed manifest plus a documented way to regenerate them, or accept the
+loss explicitly. Not decided unilaterally because it changes what the repo is
+for. Note the fixtures' transcriptions **were** verified byte-identical against
+the log while it was in hand (L1), so the current state is recoverable-in-
+principle today and not tomorrow.
+
+### The four that were already here
 
 1. **Reward function** — what is the agent actually maximising?
 2. **Training regime** — search-and-distill (the original plan) vs online RL.

@@ -48,6 +48,21 @@ matters. A predictor whose entire residual vanishes under a constant shift has a
 over after the shift is getting the shape of the motion wrong. Blending the two
 into one RMS figure would hide which of those is happening.
 
+READ SECTION 4's HEADLINE RESIDUAL WITH TWO CAVEATS, both of which section 4
+now prints for itself rather than leaving to a reader:
+
+  * Its ``n=464`` is an ``n_effective`` of 1. Every observation tick predicts
+    the same arrival, so the 464 rows are one measurement repeated; ``mean ==
+    rms == max`` in the output is the tell. Section 5 is the section that
+    sweeps the motion.
+  * The residual matching the figure the pre-correction audit reached by
+    fitting a 1.9198-tick shift is the SAME NOISE FLOOR WITH ZERO FREE
+    PARAMETERS INSTEAD OF ONE -- not the corrected model rediscovering a fitted
+    value, and not evidence about the fire tick. The record's deviation from
+    the line is flat across ticks 462..464, so the figure is invariant to the
+    one tick the two models disagree about. Section 4 sweeps the arrival tick
+    to show it.
+
 Sections:
 
     1. Record integrity            -- reproduce the log's own summary numbers
@@ -534,6 +549,15 @@ def section_pending(log: ParsedLog, truth: Truth, y_start: float, offset: float,
     print(f"  observation ticks     0 .. {last_obs}")
     print(f"  predicted arrival     {min(r[1] for r in rows):.6f} .. "
           f"{max(r[1] for r in rows):.6f}  (distinct: {len(arrivals)})")
+    if len(arrivals) == 1:
+        print(f"  n_effective           1  (all {len(rows)} observation ticks "
+              "predict the SAME arrival,")
+        print("                        so the n below is a repeat count, not a "
+              "sample size. The")
+        print("                        giveaway is mean == rms == max in the "
+              "POSITION error line.")
+        print("                        Section 5 is the one that sweeps the "
+              "motion.)")
     print(f"  certainty             {sorted({r[4] for r in rows})}"
           f"   (CERTAINTY_EXACT = {CERTAINTY_EXACT})")
     print()
@@ -593,6 +617,54 @@ def section_pending(log: ParsedLog, truth: Truth, y_start: float, offset: float,
     print("  means there is no timing defect left and no position defect at")
     print("  all -- the remaining error is GD's float32 elapsed-time")
     print("  accumulation, which the predictor computes in float64.")
+    print()
+
+    # WHAT THE AGREEMENT WITH THE OLD FITTED SHIFT IS AND IS NOT.
+    #
+    # The corrected model's residual is bit-identical to the one the pre-2026-08-12
+    # audit reached by FITTING a 1.9198-tick shift. That is worth stating, and it
+    # is worth stating correctly: it is the same noise floor reached with ZERO
+    # free parameters instead of one. It is NOT the corrected model
+    # rediscovering the fitted value, and it is not independent corroboration of
+    # the fire tick -- because the residual is piecewise constant in the arrival
+    # tick right here, on a flat float32 plateau of the record. The sweep below
+    # is the check: if the figure does not move across the one tick the two
+    # models disagree about, it cannot be evidence about that tick.
+    arrival = rows[0][1]
+    lo = math.floor(arrival)
+    print("  Is that figure sensitive to the arrival tick at all? Residual of")
+    print("  the theoretical line against the RECORD, swept across arrival:")
+    print()
+    plateau = []
+    for a in [lo - 2 + 0.5 * k for k in range(9)]:
+        r = (y_start + step * (a - activation_tick)) - truth.at(a)
+        plateau.append(r)
+        print(f"    arrival {a:9.4f}   residual {r:+.6e} units")
+    flat = sum(1 for r in plateau if r == plateau[len(plateau) // 2])
+    print()
+    print(f"  {flat} of the {len(plateau)} sampled arrivals give the IDENTICAL")
+    print("  residual: the record's deviation from the line is flat over a")
+    print("  multi-tick plateau here, so this number is invariant to the tick")
+    print("  the old fit and the corrected model disagree about. The evidence")
+    print("  that the fire tick is 233 is section 2 and section 6, not this")
+    print("  figure.")
+    print()
+
+    # Where the figure sits in the record's own deviation-from-line
+    # distribution. "Noise floor" is the right phrase for its ORIGIN and the
+    # wrong one for its MAGNITUDE: it is a near-median draw from a right-skewed
+    # distribution, not a minimum.
+    dev = sorted(abs(truth.y[t] - (y_start + step * (t - activation_tick)))
+                 for t in range(truth.first, truth.last + 1))
+    mag = abs(plateau[len(plateau) // 2])
+    pct = 100.0 * sum(1 for d in dev if d <= mag) / len(dev)
+    print(f"  For scale, against the record's own |y - line| over its "
+          f"{len(dev)} ticks:")
+    print(f"    median {statistics.median(dev):.4e}   mean "
+          f"{statistics.fmean(dev):.4e}   max {max(dev):.4e} units")
+    print(f"    this residual {mag:.4e} is at the {pct:.1f}th percentile -- a")
+    print("    near-median draw from a right-skewed distribution, so 'noise")
+    print("    floor' describes where it comes from, not how small it is.")
     return statistics.fmean([abs(e) for e in errs]), exact_shift
 
 

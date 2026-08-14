@@ -129,6 +129,18 @@ Nothing here was inferred from a field name.
        and the same 233 falls out of the displacement record alone, with no
        reference to the CMDVEC run, at 232.99934 +/- 0.001 ticks.
 
+       THE ARGUMENT SPLICES RUNS, and nothing asserts they are the same level.
+       The two player-x values are from the 2026-08-12 GDRL_ENV run; the
+       activation tick is from a 2026-08-11 CMDVEC launch plus the 2026-08-11
+       MOVE record. Each half is corroborated on its own -- the x law by the
+       bit-exact accumulator and by the Stereo Madness anchor on a different
+       level, the 233 by the 480 MOVE records alone -- but the crossing argument
+       needs both halves to be about the same trigger on the same level, and no
+       assertion in this repo covers that. Closing it needs the ENV player-x
+       stream on disk WITH a level-identity assertion (tier iii), or one launch
+       carrying GDRL_PROBE_CMDVEC and the player's m_positionX in the same
+       stream (tier iv). See TODO.md, "the provenance gap that is still open".
+
        Two separate corrections came out of that, and this module had BOTH of
        them wrong in the same direction, which is why they read as one
        1.9198-tick lead:
@@ -191,12 +203,32 @@ sliding window, is at most:
     400-tick lookahead   0.0358 units   0.0275 ticks
 
 so ``ticks_to_activation`` can name a fire tick one step off the game's, but
-only when the continuous crossing lands within ~0.03 ticks of an integer -- and
-the rounding is upward-biased, so the real player arrives fractionally EARLY,
-which means the error direction is the predictor firing a trigger one tick LATE
-(the dangerous direction: a hazard seen late). UNVERIFIED: no recorded crossing
-sits near a boundary, so this bound is arithmetic on the measured accumulator,
-not an observation of a mis-predicted trigger.
+only when the continuous crossing lands within ~0.03 ticks of an integer.
+
+The direction is PREDOMINANT, NOT UNIVERSAL, and the difference matters to a
+reader deciding what to guard. The rounding is predominantly upward-biased, so
+the real player usually arrives fractionally EARLY and the usual error direction
+is the predictor firing a trigger one tick LATE (the dangerous direction: a
+hazard seen late). Measured over the 4,653-tick simulated accumulator, sliding a
+240-tick window: 913 of 4413 windows (**20.7%**) are signed NEGATIVE -- the
+player is behind the line there and the predictor would fire EARLY. At 400 ticks
+it is 730 of 4253 (17.2%). The two tails are not symmetric: worst positive
+``+0.021458`` units (``+0.016528`` ticks), worst negative ``-0.007839``
+(``-0.006038``), which is why the bound above is a positive number.
+
+The negative sign is not exotic and it is not confined to the early run. It is
+the sign at the one crossing this repo has actually recorded: at tick 232 the
+accumulator sits ``-0.000343`` units BEHIND the line. The ``0.2597`` figure is
+an end-of-run number that only builds past x ~ 2000 (at tick 1000 the drift is
+``+0.003624``).
+
+The safety conclusion survives all of that -- the divergence is bounded, under
+0.03 ticks over any lookahead the projector uses, and the dominant risk is
+firing late -- but nothing here rules out an early fire.
+
+UNVERIFIED: no recorded crossing sits near a boundary, so this bound is
+arithmetic on the measured accumulator, not an observation of a mis-predicted
+trigger.
 
 --------------------------------------------------------------------------
 WHAT IS AND IS NOT PROJECTABLE
@@ -540,9 +572,19 @@ SPEED_VERIFIED = (False, True, False, False, False)
 PLAYER_X_TICK_ORIGIN = 1
 
 # Divergence between the float32 accumulator and the continuous line over a
-# lookahead window, worst case over the recorded 4,653-tick run. See "PLAYER X
-# IS FLOAT32-ACCUMULATED" in the module docstring: this is the bounded error
+# lookahead window, worst case over 4,653 ticks. See "PLAYER X IS
+# FLOAT32-ACCUMULATED" in the module docstring: this is the bounded error
 # accepted in exchange for an O(1) closed form.
+#
+# PROVENANCE, precisely: these come from SIMULATING the accumulator law for
+# 4,653 ticks, not from differencing 4,653 recorded x samples. 4,653 is the
+# length of the run the law was characterised on, and it is carried over so the
+# span matches; the recorded stream itself is not on disk (the fixture carries
+# two player-x samples, not the run). Tier (i) as constants.
+#
+# They are the worst POSITIVE excursion. The signed distribution is two-tailed
+# and asymmetric -- 20.7% of 240-tick windows are negative, worst -0.0078 units
+# -- see the module docstring.
 PLAYER_X_FLOAT32_DRIFT_UNITS_PER_240_TICKS = 0.0215
 PLAYER_X_FLOAT32_DRIFT_UNITS_PER_400_TICKS = 0.0358
 

@@ -487,6 +487,182 @@ namespace {
             (int)p->m_isOnGround, (int)p->m_isDashing,
             (int)pl->m_gameState.m_isDualMode, pl->m_gameState.m_timeWarp);
     }
+
+    // =======================================================================
+    // Probe P: GDRL_PROBE_PHANTOM=1     (diagnostic for TODO section J)
+    // =======================================================================
+    //
+    // TODO J: every GDRL_ENV step carries five entries with objectID=1816,
+    // objectType=39, one shared uniqueID, glued to the player's x one tick
+    // behind, that the m_objects census cannot see. This probe answers "what
+    // is it" by POINTER IDENTITY against GJBaseGameLayer::m_player1CollisionBlock
+    // / m_player2CollisionBlock, not by an object-id table -- the id table is
+    // exactly what left key 36 open.
+    //
+    // Emission point is deliberately the same as telemetry.cpp's: inside
+    // GJEffectManager::prepareMoveActions, BEFORE delegating. A phantom read at
+    // a different point in the step would answer a different question than the
+    // one the ENV wire is asking.
+    const bool g_probePhantom = envOn("GDRL_PROBE_PHANTOM");
+
+    // Same window as telemetry.cpp's scanObjects, read from the same env vars,
+    // so a run that widens GDRL_ENV_WIN_BEHIND widens both together. That is
+    // the falsification lever for the "one emission per stale section
+    // registration" hypothesis: the duplicate count should track the number of
+    // scanned columns BEHIND the player and nothing else.
+    const int g_phWinBehind = envInt("GDRL_ENV_WIN_BEHIND", 400);
+    const int g_phWinAhead  = envInt("GDRL_ENV_WIN_AHEAD", 1400);
+    const int g_phWinVert   = envInt("GDRL_ENV_WIN_VERT", 600);
+    const int g_phEvery     = envInt("GDRL_PROBE_PHANTOM_EVERY", 120);
+
+    double g_phPrevPx = std::numeric_limits<double>::quiet_NaN();
+    double g_phPrevPy = std::numeric_limits<double>::quiet_NaN();
+    long   g_phPrevTick = -1;
+
+    void describeBlock(const char* tag, long tick, GJBaseGameLayer* layer,
+                       GameObject* cb, int which) {
+        if (!cb) {
+            log::info("[gdrl] PH-CB tag={} tick={} p{} ptr=null", tag, tick, which);
+            return;
+        }
+        // Is this object reachable through m_objects at all? The census walks
+        // m_objects; if the answer is no, "the census cannot see it" is
+        // explained without any appeal to the census being broken.
+        int objIdx = -1;
+        if (layer->m_objects) {
+            const unsigned n = layer->m_objects->count();
+            for (unsigned i = 0; i < n; i++) {
+                if (layer->m_objects->objectAtIndex(i) == (CCObject*)cb) {
+                    objIdx = (int)i;
+                    break;
+                }
+            }
+        }
+        const auto& r = cb->getObjectRect();
+        log::info(
+            "[gdrl] PH-CB tag={} tick={} p{} ptr={} uid={} oid={} otype={} "
+            "pos=({:.9f},{:.9f}) cc=({:.9f},{:.9f}) rect=({:.3f},{:.3f},{:.3f},{:.3f}) "
+            "sect[in={} mid={} out={}] inObjects={} groupDisabled={} slopeHaz={}",
+            tag, tick, which, (void*)cb, cb->m_uniqueID, (int)cb->m_objectID,
+            (int)cb->m_objectType, cb->m_positionX, cb->m_positionY,
+            cb->getPositionX(), cb->getPositionY(),
+            r.origin.x, r.origin.y, r.size.width, r.size.height,
+            cb->m_innerSectionIndex, cb->m_middleSectionIndex,
+            cb->m_outerSectionIndex, objIdx,
+            (int)cb->m_isGroupDisabled, (int)cb->m_slopeIsHazard);
+    }
+
+    void samplePhantom(GJBaseGameLayer* layer, PlayLayer* pl, long tick) {
+        auto* p = layer->m_player1;
+        if (!p) return;
+
+        // getPositionX/Y, NOT m_positionX/m_positionY.
+        //
+        // This is failure mode 5 in reverse, and it was measured here: for the
+        // PLAYER, m_positionX reads 0.000000000 for an entire run while
+        // getPositionX() advances normally (log
+        // backups/reference-logs/phantom-synth-fixedwindow-20260813-230816.log,
+        // every PH-PLAYER line: pos=(0.000000000,105.0) cc=(154.49,105.0)).
+        // The move pipeline writes m_positionX on OBJECTS; the player is moved
+        // through the CCNode. telemetry.cpp::fillObservation passes
+        // p1->getPositionX()/getPositionY() into scanObjects, so this probe must
+        // use the same accessor or it is answering a different question.
+        const double px = p->getPositionX();
+        const double py = p->getPositionY();
+
+        const bool emit = (tick % g_phEvery) == 0;
+
+        // The window telemetry.cpp would scan for this player position.
+        const float  sxf  = layer->m_sectionXFactor;
+        const double minX = px - g_phWinBehind;
+        const double maxX = px + g_phWinAhead;
+        const double minY = py - g_phWinVert;
+        const double maxY = py + g_phWinVert;
+        const int nCols = (int)layer->m_sections.size();
+        int col0 = (int)std::floor(minX * (double)sxf);
+        if (col0 < 0) col0 = 0;
+        int col1 = (int)std::floor(maxX * (double)sxf);
+
+        // Walk the grid exactly as scanObjects does -- same bucket nesting, same
+        // absence of dedupe -- but record only the phantom. Every emission is
+        // stamped with the column it came out of, which is the measurement that
+        // decides between "registered in five columns" and "five times in one".
+        int hits = 0, hitsPtrEq1 = 0, hitsPtrEq2 = 0;
+        std::string cols, uids;
+        std::map<int,int> perCol;
+        for (int col = col0; col <= col1 && col < nCols; col++) {
+            auto* column = layer->m_sections[col];
+            if (!column) continue;
+            for (auto* bucket : *column) {
+                if (!bucket) continue;
+                for (auto* obj : *bucket) {
+                    if (!obj) continue;
+                    if (obj->m_positionY < minY || obj->m_positionY > maxY) continue;
+                    if (obj->m_positionX < minX || obj->m_positionX > maxX) continue;
+                    if (obj != layer->m_player1CollisionBlock &&
+                        obj != layer->m_player2CollisionBlock &&
+                        obj->m_objectID != 1816) continue;
+                    hits++;
+                    perCol[col]++;
+                    if (obj == layer->m_player1CollisionBlock) hitsPtrEq1++;
+                    if (obj == layer->m_player2CollisionBlock) hitsPtrEq2++;
+                    if (!uids.empty()) uids += '.';
+                    uids += std::to_string(obj->m_uniqueID);
+                }
+            }
+        }
+        for (auto& [c, n] : perCol) {
+            if (!cols.empty()) cols += ',';
+            cols += std::to_string(c) + "x" + std::to_string(n);
+        }
+        if (cols.empty()) cols = "-";
+        if (uids.empty()) uids = "-";
+
+        // The registration census: how many times is the p1 block reachable
+        // through the WHOLE grid, ignoring the position filter entirely. The
+        // windowed `hits` above cannot distinguish "registered once, emitted
+        // five times because five columns hold it" from "registered five
+        // times in one column"; this can, and it also shows whether GD ever
+        // removes an old registration.
+        int allRegs = 0, allCols = 0;
+        auto* cb1 = layer->m_player1CollisionBlock;
+        if (cb1) {
+            for (int col = 0; col < nCols; col++) {
+                auto* column = layer->m_sections[col];
+                if (!column) continue;
+                int here = 0;
+                for (auto* bucket : *column) {
+                    if (!bucket) continue;
+                    for (auto* obj : *bucket) if (obj == cb1) here++;
+                }
+                if (here) { allRegs += here; allCols++; }
+            }
+        }
+
+        if (emit) {
+            log::info(
+                "[gdrl] PH tick={:<7} px={:.9f} py={:.9f} prevPx={:.9f} prevPy={:.9f} "
+                "prevTick={} cols[{}..{}] hits={} ptrEqP1={} ptrEqP2={} atCol={} uids={} "
+                "p1AllRegs={} p1AllCols={} pCol={}",
+                tick, px, py, g_phPrevPx, g_phPrevPy, g_phPrevTick,
+                col0, col1, hits, hitsPtrEq1, hitsPtrEq2, cols, uids,
+                allRegs, allCols, (int)std::floor(px * (double)sxf));
+            describeBlock("pre", tick, layer, layer->m_player1CollisionBlock, 1);
+            describeBlock("pre", tick, layer, layer->m_player2CollisionBlock, 2);
+            // The player's own rect, for the "is the player being emitted as
+            // geometry" question. Same accessor family the object scan uses.
+            log::info(
+                "[gdrl] PH-PLAYER tick={} pos=({:.9f},{:.9f}) cc=({:.9f},{:.9f}) "
+                "yv={:.9f} ground={} size={:.3f}",
+                tick, p->m_positionX, p->m_positionY,
+                p->getPositionX(), p->getPositionY(),
+                p->m_yVelocity, (int)p->m_isOnGround, p->m_vehicleSize);
+        }
+
+        g_phPrevPx   = px;
+        g_phPrevPy   = py;
+        g_phPrevTick = tick;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -495,6 +671,17 @@ namespace {
 // point of this probe.
 class $modify(GDRLProbeEffectManager, GJEffectManager) {
     void prepareMoveActions(float dt, bool intermediate) {
+        // Probe P samples BEFORE delegating, which is telemetry.cpp's own
+        // sampling point. Kept ahead of Probe A's gate so the two probes do not
+        // have to be enabled together.
+        if (g_probePhantom && g_inGameplayUpdate) {
+            auto* layer = GJBaseGameLayer::get();
+            auto* pl    = PlayLayer::get();
+            if (layer && pl) {
+                samplePhantom(layer, pl,
+                              std::lround(pl->m_attemptTime * kTicksPerSec));
+            }
+        }
         if (!g_probeCmdVec) {
             GJEffectManager::prepareMoveActions(dt, intermediate);
             return;
@@ -619,14 +806,17 @@ class $modify(GDRLProbeBaseGameLayer, GJBaseGameLayer) {
     }
 
     void update(float dt) {
-        if (!g_probeCmdVec && !g_probeMove && !g_probeForceVehicle) {
+        if (!g_probeCmdVec && !g_probeMove && !g_probeForceVehicle && !g_probePhantom) {
             GJBaseGameLayer::update(dt);
             return;
         }
 
-        if (g_probeCmdVec || g_probeMove) g_inGameplayUpdate = true;
+        // Probe P needs the same gameplay/seek discriminator as A and D: without
+        // it g_inGameplayUpdate stays false and Probe P emits nothing at all.
+        const bool needsDiscriminator = g_probeCmdVec || g_probeMove || g_probePhantom;
+        if (needsDiscriminator) g_inGameplayUpdate = true;
         GJBaseGameLayer::update(dt);
-        if (g_probeCmdVec || g_probeMove) g_inGameplayUpdate = false;
+        if (needsDiscriminator) g_inGameplayUpdate = false;
 
         if (!g_probeForceVehicle) return;
 

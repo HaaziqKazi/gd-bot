@@ -719,6 +719,46 @@ void scanObjects(GJBaseGameLayer* layer, GdrlObservation* o, double px, double p
             if (!bucket) continue;
             for (auto* obj : *bucket) {
                 if (!obj) continue;
+
+                // The two objects GD injects into the section grid that are not
+                // level geometry: its own per-player collision proxies
+                // (GJBaseGameLayer::m_player1CollisionBlock /
+                // m_player2CollisionBlock, created by
+                // createPlayerCollisionBlock()). Identified by POINTER, not by
+                // object id -- see the measurement in
+                // backups/reference-logs/phantom-synth-behind400.log:
+                //
+                //   PH-CB tick=1320 p1 ptr=0xac89c1000 uid=25 oid=1816
+                //       otype=39 pos=(1864.222778320,105.0) rect=30x30
+                //       inObjects=-1
+                //   PH tick=1320 px=1866.172729492 prevPx=1864.222778320
+                //       hits=5 ptrEqP1=5 atCol=14x1,15x1,16x1,17x1,18x1
+                //
+                // i.e. a 30x30 box carrying the player's own position from the
+                // PREVIOUS physics step (bit-exact: the block's m_positionX at
+                // tick t equals the player's getPositionX() at t-1 to all nine
+                // decimals), reachable through the grid but NOT through
+                // m_objects (inObjects=-1, which is why the census never saw
+                // it). collapseKind maps its GameObjectType::CollisionObject to
+                // SOLID, so every consumer was being shown a solid block
+                // standing on the player.
+                //
+                // It also appears once per column it has ever entered and those
+                // registrations are never removed, so at the default 400-unit
+                // behind-window it was emitted exactly five times per step
+                // (measured 5 at GDRL_ENV_WIN_BEHIND=400, 10 at 900 --
+                // phantom-synth-behind900.log). Dropping it by pointer removes
+                // all of those at once and touches nothing else: in every
+                // sample of both runs, hits == ptrEqP1 + ptrEqP2, so no third
+                // object was ever involved.
+                //
+                // Deliberately NOT filtered by m_objectID == 1816: 1816 is the
+                // editor's Collision Block, a real authorable object that a
+                // level may legitimately contain, and that one lives in
+                // m_objects and should be reported.
+                if (obj == layer->m_player1CollisionBlock ||
+                    obj == layer->m_player2CollisionBlock) continue;
+
                 if (obj->m_positionY < minY || obj->m_positionY > maxY) continue;
                 if (obj->m_positionX < minX || obj->m_positionX > maxX) continue;
                 if (n >= GDRL_MAX_OBJECTS) {
