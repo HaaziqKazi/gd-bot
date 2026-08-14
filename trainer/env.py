@@ -650,7 +650,7 @@ class Observation:
         #
         # The advertised window and the coverage mask DO disagree at the left
         # edge, and not rarely: the mod publishes windowMinX = px - g_winBehind
-        # (telemetry.cpp:688) but derives col0 = floor(minX * sxf) (:664), so the
+        # (telemetry.cpp:710) but derives col0 = floor(minX * sxf) (:664), so the
         # window starts partway INTO column col0 -- by up to a full section, and
         # by exactly 100 units at the default fixture player_x of 500. So the two
         # descriptions of "the scanned region" are not the same set of x.
@@ -1239,7 +1239,7 @@ class SyntheticGame:
                                else layout_x_factor))
         cov = self.obs["coverage"]
         if not (sxf > 0.0) or not np.isfinite(sxf):
-            # The mod's refusal path (telemetry.cpp:620-634): claim nothing.
+            # The mod's refusal path (telemetry.cpp:615-635): claim nothing.
             # Zero-area window, every column UNKNOWN, OBJECTS_UNAVAILABLE set so
             # a count of 0 reads as "did not look" rather than "looked and found
             # none".
@@ -1263,32 +1263,19 @@ class SyntheticGame:
             col0 = max(0, col0)                                  # :665
             col1 = int(math.floor(max_x_requested * sxf))        # :666
             col1 = min(col1, col0 + coverage_cols - 1)           # :670
-            # The right-edge back-off, 8dd5ceb:677-680. MEASURED INERT for the
-            # value that reaches the wire: across 3000 start columns x 3 window
-            # widths the loop always iterated (1 or 2 nextafter steps) and the
-            # float32 store landed on the SAME bit pattern as the un-backed-off
-            # edge in 9000 of 9000 cases.
-            #
-            # 2026-08-14: the mod DELETED its copy, on a far stronger sweep
-            # (every float32 px in [0, 65536) at sxf = 0.01f, 1.2e9 values, all
-            # bit-identical). That change was still uncommitted when this comment
-            # was written, so the loop stays here rather than being removed on
-            # the strength of another agent's in-flight work -- it costs nothing,
-            # because inert means the published float32 is the same either way,
-            # which is also why no test can tell (mutate.py D8, an expected
-            # survivor). DELETE THIS BLOCK once the mod's deletion lands.
-            col_edge = (col1 + 1) * sec_w                        # :677
-            for _ in range(8):                                   # :678-680
-                if math.floor(col_edge * sxf) <= col1:
-                    break
-                col_edge = math.nextafter(col_edge, 0.0)
-            max_x = min(max_x_requested, col_edge)               # :681
-            h["coverageStartCol"] = col0                         # :686
-            h["sectionColumns"] = n_cols                         # :687
-            h["windowMinX"] = min_x                              # :688
-            h["windowMaxX"] = max_x                              # :689
-            h["windowMinY"] = min_y                              # :690
-            h["windowMaxY"] = max_y                              # :691
+            # No right-edge back-off. A `std::nextafter` loop used to sit
+            # between these two lines, mirroring 8dd5ceb:677-680; the mod
+            # measured it dead over every float32 px in [-2048, 131072) at
+            # sxf = 0.01f (2.37e9 values, stored float bit-identical with and
+            # without it) and deleted it in efc32e9. Deleted here to match.
+            col_edge = (col1 + 1) * sec_w                        # :702
+            max_x = min(max_x_requested, col_edge)               # :703
+            h["coverageStartCol"] = col0                         # :708
+            h["sectionColumns"] = n_cols                         # :709
+            h["windowMinX"] = min_x                              # :710
+            h["windowMaxX"] = max_x                              # :711
+            h["windowMinY"] = min_y                              # :712
+            h["windowMaxY"] = max_y                              # :713
             # The coverage loop, 8dd5ceb:696-808: UNKNOWN past col1, ABSENT past
             # the end of GD's own section grid, SCANNED otherwise. (TRUNCATED is one
             # state the fixture cannot reach -- it needs the object array to fill

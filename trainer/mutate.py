@@ -272,7 +272,7 @@ mut("C8-level-length-diagnostic-always-agrees", "factor",
 mut("D1-left-edge-snaps-to-the-column", "left-edge",
     "THE L5 DEFECT ITSELF: window derived from the column instead of the "
     "reverse. Advertised up to a full 100-unit section that was never scanned.",
-    [('            h["windowMinX"] = min_x                              # :688',
+    [('            h["windowMinX"] = min_x                              # :710',
       '            h["windowMinX"] = col0 * sec_w')])
 mut("D2-window-behind-sign-flip", "left-edge",
     "minX = px + g_winBehind: the window starts ahead of the player.",
@@ -293,30 +293,18 @@ mut("D5-drop-the-coverage-clamp-on-col1", "left-edge",
     [("            col1 = min(col1, col0 + coverage_cols - 1)           # :670",
       "            col1 = col0 + coverage_cols - 1                      # :670")])
 mut("D6-right-edge-ignores-the-requested-window", "left-edge",
-    "telemetry.cpp:681. maxX must be the nearer of the requested edge and the "
+    "telemetry.cpp:703. maxX must be the nearer of the requested edge and the "
     "column edge.",
-    [("            max_x = min(max_x_requested, col_edge)               # :681",
-      "            max_x = col_edge                                     # :681")])
+    [("            max_x = min(max_x_requested, col_edge)               # :703",
+      "            max_x = col_edge                                     # :703")])
 mut("D7-col1-off-by-one", "left-edge",
     "One column too many claimed on the right.",
     [("            col1 = int(math.floor(max_x_requested * sxf))        # :666",
       "            col1 = int(math.floor(max_x_requested * sxf)) + 1    # :666")])
-mut("D8-delete-the-right-edge-backoff", "left-edge",
-    "The nextafter loop at telemetry.cpp:677-680.",
-    [("""            for _ in range(8):                                   # :678-680
-                if math.floor(col_edge * sxf) <= col1:
-                    break
-                col_edge = math.nextafter(col_edge, 0.0)
-""", "")],
-    expect="SURVIVED",
-    expect_why="MEASURED INERT (L5): across 3000 start columns x 3 window widths "
-               "the float32 store landed on the same bit pattern with and without "
-               "the back-off, 9000/9000. A test that killed this would be pinning "
-               "a difference that does not reach the wire. If this ever flips to "
-               "KILLED, the measurement or the store precision changed. NOTE "
-               "2026-08-14: the mod deleted its own copy on a 1.2e9-value sweep, "
-               "so publish() is transcribing a loop scanObjects() no longer has; "
-               "drop both when that change lands.")
+# D8-delete-the-right-edge-backoff retired 2026-08-14. It existed only to
+# record that the nextafter back-off did nothing (an expected SURVIVED). The mod
+# deleted its copy in efc32e9 and publish() no longer transcribes it, so there is
+# no code left to mutate.
 mut("D9-publish-ignores-the-injected-factor", "fixture",
     "The knob every refusal test depends on. Inert => those tests are vacuous.",
     [('        h["sectionXFactor"] = section_x_factor',

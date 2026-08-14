@@ -737,6 +737,41 @@ struct GdrlSpeedSegment {        // one speed portal boundary ahead
 **Do not** design around hooking `GJBaseGameLayer::processCommands` (0
 references of any kind) or resampling in `update` (per frame, not per step).
 
+## The observation window is now the sensor definition, and it is UNVERIFIED
+
+**Project decision, 2026-08-14: gd-rl targets Benchmark A — true sightreading.**
+The agent may receive only what it could legitimately observe: no geometry beyond
+its sensor horizon, no cloning the engine to try alternate futures, no reading
+trigger state that has not yet occurred. Full ruling and reasoning in `TODO.md`,
+"Open decisions → 0".
+
+The consequence for anyone reading this file: **`GDRL_ENV_WIN_BEHIND`,
+`GDRL_ENV_WIN_AHEAD` and `GDRL_ENV_WIN_VERT` (`telemetry.cpp:184-186`, currently
+`400` / `1400` / `600`) are no longer performance knobs.** They define what the
+agent is allowed to perceive, and therefore they are part of the benchmark.
+
+**Those three numbers have never been checked against what is actually on
+screen.** They were chosen for convenience long before this decision existed. At
+1x the player advances ~311.6 units/second, so `_AHEAD = 1400` is roughly **4.5
+seconds** of lookahead, which is plausibly well beyond the visible viewport — and
+if it is, the observation has been handing the agent off-screen geometry, and no
+run so far qualifies as a Benchmark A run. **This is a suspicion, not a
+measurement**; it is stated here so nobody treats the current values as
+justified. Measuring the real viewport is queue item 1.
+
+Two things already established reach backwards under this decision:
+
+- The phantom collision proxy (above) was **benchmark-invalidating**, not a
+  nuisance. A sensor that reports a solid block on the player is a sensor that
+  lies, and under A that invalidates a run rather than degrading it.
+- The decoder's refusal-vs-ignorance distinction (`KnownMask`, `trainer/env.py`)
+  is not hygiene. Knowing what it *did not observe* is something the agent is
+  entitled to under A, and it is half of Objective E.
+
+Enforcement belongs in `scanObjects`, in the mod — never in Python and never by
+asking a policy to ignore what it was handed. An agent trusted to discard
+information it received is not a benchmark.
+
 ## The env is validated: defaults are clean and observation is passive
 
 Two checks, both on the merged tree, both reusing the 12-jump sequence. They

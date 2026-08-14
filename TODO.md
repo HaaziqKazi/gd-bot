@@ -12,6 +12,12 @@ below.
 > player's own collision proxy as a SOLID block on top of the player**, on every
 > frame, on every level.
 >
+> **THE BENCHMARK IS DECIDED: Benchmark A, true sightreading** (2026-08-14, by
+> Rex). Read "Open decisions → 0" before writing any agent code. It rules out
+> engine cloning and lookahead beyond the sensor horizon, promotes
+> `GDRL_ENV_WIN_*` from performance knobs to the **sensor definition** enforced
+> in the mod, and makes Objectives D and E load-bearing.
+>
 > **Two claims in this file turned out to be false when written** — see L1 (the
 > vacuous-test claim was true of one assertion, not the enclosing test) and M3
 > (`COND step=` was *not* 0 in every log; it reads 416 in six lines of one). Both
@@ -1417,40 +1423,57 @@ actionable: delete the block.** Its mutant `D8` should then be removed too.
 
 ### Queue for next session, in order
 
-**Everything on the previous queue is done.** Items 1-4 closed in sections N
-(fixture fidelity + the mutation harness) and M (the dead back-off, `MODE`,
-`COND tick=`). What follows is the new queue.
+> **RESUME HERE.** Items 1 and 2 were dispatched on 2026-08-14 and **stopped
+> before either produced anything** — the viewport agent was killed at "now I'll
+> write the probe", so `mod/` is untouched and no measurement exists. Start both
+> from scratch; nothing is half-done and nothing needs unpicking. Item 3 landed
+> and is closed. Tree is green at **235 tests**, `trainer/mutate.py` at
+> **46/46 killable (47 run)**, mod builds universal.
 
-0. **The benchmark question in "Open decisions" is still unanswered** and still
-   outranks everything below. It decides whether the next phase is planning or
-   learning, and therefore whether Objectives D and E are load-bearing or
-   decorative. Items 1-3 are worth doing under *either* answer; 4 onward is not.
 
-1. **Delete `publish()`'s copy of the right-edge back-off** (N5). The mod's copy
-   is gone as of this commit, so the `DELETE THIS BLOCK once the mod's deletion
-   lands` marker in `env.py` is now actionable. Remove mutant `D8` with it. One
-   minute of work; left undone only because the two halves landed in different
-   agents.
+**Re-scoped 2026-08-14 by the Benchmark A decision.** Items 1 and 2 did not exist
+before it and now outrank everything else: under A the sensor definition *is* the
+benchmark, and ours has never been justified.
 
-2. **Check `conditioning.py` against what the mod actually emits** (Track 1.3,
-   the open half). The mod side is now evidenced end to end — `COND` and `MODE`
-   both fire on a real cube→ship crossing — but **the Python side has never been
-   compared against it**. This is the difference between Objective A being tested
-   and merely being written, and it is the last thing standing between the
-   conditioning work and "validated".
+1. **Measure what is actually on screen** — the camera viewport in world units,
+   x and y, at 1x and at the other speed buckets. `GDRL_ENV_WIN_AHEAD` is
+   currently **1400** units, chosen for convenience before Benchmark A existed.
+   At 1x the player covers ~311.6 units/second, so 1400 ahead is ~4.5 seconds of
+   lookahead — **plausibly far more than the screen shows**, which would mean the
+   agent is already reading geometry the player cannot see. If so, every value
+   below the horizon needs re-deriving and any prior run is not a Benchmark A
+   run. Measure it; do not reason about it.
 
-3. **Identify `GameObjectType 6`** (M3). Four `MODE type=6` lines fire per level
-   load and nobody knows what they are. The id→vehicle map is confirmed only for
-   `5 -> ship`; `19 -> ufo` and a branch at `0x29` are disassembly-only, and
-   conditioning needs the map regardless.
+2. **Rule on every field the agent receives.** Go through `GdrlObservation` and
+   `env.py`'s decode and classify each as legitimate under A, forbidden, or
+   needs-measurement — with a reason per field, not a blanket verdict. Known
+   hard cases: `levelLength` (a human sees the progress bar → probably fair),
+   whole-level `objectCount` (a human does not → probably not), `sectionColumns`,
+   and anything derived from `m_sections` outside the window. The output is a
+   written contract, and it should say what a *human player* can perceive, since
+   that is the standard A appeals to.
 
-4. **Measure the four speed buckets properly** (Track 1.2). Beware the
-   float32-binade quantisation: measure where it is smallest, or use a method
-   robust to it. The H table is **not** it — it is ±1 ulp sampled at different
-   binades. Note M3 gives you a real tick clock now, which is what this
-   measurement was always missing.
+3. ~~**Delete `publish()`'s copy of the right-edge back-off**~~ — **DONE**
+   2026-08-14. Block removed from `publish()`, mutant `D8` retired with a note
+   saying why, and the `telemetry.cpp` citations refreshed for the ~+21-line
+   shift `efc32e9` caused (`:688` → `:710`, verified). Harness now reports
+   **46/46 killable, 47 run**.
 
-5. Then Track 0.2 (predictor spec + test-tier audit).
+4. **Check `conditioning.py` against what the mod actually emits** (Track 1.3,
+   the open half). The mod side is evidenced end to end; the Python side has
+   never been compared against it. Under A this matters more, not less — the
+   regime is part of what the agent perceives.
+
+5. **Identify `GameObjectType 6`** (M3). Four `MODE type=6` lines per level load,
+   unidentified. The id→vehicle map is confirmed only for `5 -> ship`.
+
+6. **Measure the four speed buckets properly** (Track 1.2). Beware float32-binade
+   quantisation; the H table is ±1 ulp sampled at different binades, not
+   constants. M3 gives a real tick clock now, which this always needed. Note
+   item 1 may make this urgent: if the horizon is defined in *seconds of
+   lookahead* rather than units, it changes per bucket.
+
+7. Then Track 0.2 (predictor spec + test-tier audit), and only then Track 4.
 
 **A standing item, not a task:** `python3 trainer/mutate.py` should be re-run
 after any change to `env.py`, and its result quoted rather than "tests pass".
@@ -1574,68 +1597,80 @@ suggestive rather than closing 2.3 — but it is real, and it was free.
 
 ## Open decisions (need a human)
 
-### 0. THE BENCHMARK QUESTION — answer this before Track 4, it reframes 1–4
+### 0. THE BENCHMARK — **DECIDED 2026-08-14: Benchmark A, true sightreading**
 
-Raised 2026-08-13. Two different problems have been sharing one codebase:
+**Decided by Rex.** The project targets **true sightreading**. The agent receives
+only what it is legitimately allowed to observe. It may **not** inspect geometry
+beyond its sensor horizon, may **not** clone the engine to try alternate futures,
+and may **not** read trigger state that has not yet occurred. Attempt 1 really is
+attempt 1.
 
-**Benchmark A — true sightreading.** The agent receives only what it is
-legitimately allowed to observe. It cannot inspect geometry beyond its sensor
-horizon, cannot clone the engine to try alternate futures, cannot read future
-trigger states. Attempt 1 really is attempt 1. This is the few-shot /
-in-context-learning problem.
+The rejected alternative, recorded so it is not re-litigated: **Benchmark B**,
+simulator-assisted minimum-attempt play — inspect ahead, read engine state, clone
+the game, roll out invisible futures, discard the ones that die. Legitimate as an
+engineering problem, but its answer is known in advance: GD is deterministic with
+a 1-bit action per tick, so with cloning it is a search problem that search wins,
+and the only real unknown is throughput.
 
-**Benchmark B — simulator-assisted minimum-attempt play.** The agent may inspect
-collision geometry ahead, read engine state, clone the game, roll out invisible
-futures and discard the ones that die. It may finish on its first *visible*
-attempt having internally performed thousands of hidden ones.
+#### What this decides, immediately
 
-Both are legitimate. They are not the same problem, and **the current MCTS
-sketch in Track 2 assumes B** — it proposes cloning the game and trying branches
-without counting them as attempts.
+- **The MCTS sketch in Track 2 is out of scope as *the agent*.** It assumed
+  cloning and not counting hidden branches as attempts. It survives only as an
+  **oracle**: B's solved trajectories are the ground truth needed to *score* A
+  and to generate training targets. B is the teacher and the upper bound, A is
+  the claim. Keep it as a parameter, never a fork.
+- **Objectives D (in-context failure memory) and E (uncertainty policy) are now
+  load-bearing**, not nice-to-haves. Under B you re-search; under A, memory of
+  your own deaths and calibrated knowledge of what you cannot see *are* the
+  agent.
+- **Objective B (forward projection) survives intact and is legitimate.**
+  Predicting where a *visible* moving block will be is perception plus
+  extrapolation, which is what a human does. The line is not "no simulation" —
+  it is (1) the sensor horizon and (2) whether a failed future costs an attempt.
+  The three sessions spent validating `trajectory.py` are not wasted.
 
-**Why this decides the architecture.** Under B, planning is central and RL is
-nearly decorative: GD is deterministic with a 1-bit action per tick, so with
-cloning it is a search problem whose answer is known in advance — search wins,
-and the only hard part is throughput (Track 2.1 checkpoint/restore becomes
-*essential*). Under A, search is unavailable by construction, and Objectives D
-(in-context failure memory) and E (uncertainty policy) stop being nice-to-haves
-and become the whole substance of the project.
+#### The metric is attempts-to-completion, not attempt-1 success
 
-**The three dials are separable**, and collapsing them into a binary hides the
-interesting middle:
+Stated so nobody later mistakes the goal for something superhuman: **humans do
+not sightread Geometry Dash.** A human clearing Stereo Madness takes roughly
+5–30 attempts; hard levels take tens of thousands. "Attempt 1 really is attempt
+1" defines the *information* rule, not the success criterion. The benchmark
+metric is the **learning curve — attempts-to-completion** — which is exactly
+where in-context failure memory earns its place. First-attempt success is a
+stretch goal, not the definition.
 
-1. **Sensor horizon** — how far ahead, and through what occlusion, the agent
-   may observe.
-2. **Rollout budget** — how many futures it may evaluate per visible attempt.
-3. **Attempt accounting** — whether hidden rollouts count against the score.
+#### The enforcement rule, and it is not negotiable
 
-A = tight horizon, zero hidden rollouts. B = full horizon, unbounded hidden
-rollouts. **A′ = tight horizon, small bounded rollout budget over only what is
-visible** — which is much closer to what a strong human player actually does
-(they *do* simulate the next jump; they cannot simulate past the screen edge,
-and a failed rehearsal does not rewind the attempt).
+**The horizon is enforced in the mod, in `scanObjects` — never in Python, and
+never by asking the policy to ignore what it was handed.** An agent trusted to
+discard information it received is not a benchmark; it is an honour system. This
+promotes `GDRL_ENV_WIN_BEHIND / _AHEAD / _VERT` from performance knobs to **the
+sensor definition**, and they must be justified against what is actually on
+screen rather than chosen for convenience. Current values (400 / 1400 / 600) were
+picked before this decision existed and are **UNVERIFIED as a sensor** — see the
+queue.
 
-Note that forward projection (Objective B) is **legitimate under A**. Predicting
-where a visible moving block will be is perception plus extrapolation, which is
-what a human does. The line is not "no simulation" — it is (1) the sensor
-horizon and (2) whether a failed future costs an attempt.
+Two consequences that reach backwards:
 
-**Recommendation on the table (not yet decided):** make **A the headline claim**
-and keep **B as an oracle**. B's solved trajectories are the ground truth needed
-to score A's play and to generate training targets — B becomes the teacher, A
-the student. That way the restriction is a parameter, not a fork of the
-codebase, and B falls out as A's ablation and upper bound.
+- **L2 was benchmark-invalidating, not a nuisance.** For the whole life of the
+  ENV transport the observation contained a phantom solid block on the player.
+  Under A that is not noise — **the sensor was lying**, and any run on it would
+  have been invalid rather than merely degraded.
+- **L4's refusal-vs-ignorance distinction is not hygiene.** It is the primitive
+  that lets the agent know what it does not know, which under A is half of
+  Objective E.
 
-**Architectural consequence if A is chosen — this one is load-bearing.** The
-horizon must be enforced **in the mod, in `scanObjects`**, not in Python and not
-by asking the policy to ignore what it was handed. An agent trusted to discard
-information it received is not a benchmark. That makes the object window
-(`GDRL_ENV_WIN_*`) the sensor definition rather than a performance knob, and it
-makes L2 retroactively serious: for the whole life of the ENV transport the
-observation contained a phantom solid block on the player, i.e. **the sensor was
-lying**, which under A is a benchmark-invalidating defect rather than a nuisance.
-L4's refusal-vs-ignorance distinction is likewise not hygiene under A — it is
-the primitive that lets the agent know what it does not know.
+#### Still to settle under A (these are now real questions, not philosophy)
+
+1. **What is actually on screen?** The horizon must be measured, not assumed.
+2. **Is a global level fact observable?** A human sees GD's progress bar, so
+   level length is arguably fair; `objectCount` over the whole level is
+   arguably not. Each field needs a ruling.
+3. **Does the agent get audio?** GD is heavily rhythm-cued and human players
+   lean on it. Currently we emit none. Excluding it is a defensible choice but
+   should be a *stated* one.
+4. **Attempt-boundary memory.** What persists between attempts is the whole
+   substance of Objective D, and it needs a spec before it needs code.
 
 ### 0b. The tier-(iii) evidence is not in the repo (found 2026-08-13)
 

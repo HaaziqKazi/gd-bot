@@ -569,7 +569,7 @@ def test_the_fixture_publishes_the_window_the_mod_would(
 def test_a_column_primary_left_edge_is_a_different_window(loop):
     """The agreement test above is not vacuous: the two formulations differ.
 
-    Window-primary (``minX = px - g_winBehind``, telemetry.cpp:688) and
+    Window-primary (``minX = px - g_winBehind``, telemetry.cpp:710) and
     column-primary (``col0 * secW``, what publish() used to advertise) coincide
     only when minX lands exactly on a column boundary. Over the placements above
     they disagree on most, by up to a full section.
@@ -974,7 +974,7 @@ def test_the_first_covered_column_is_included(loop):
     assert first_col.any(), "no cell in view indexes to the first covered column"
 
     # Only the cells the advertised window actually admits. Since windowMinX is
-    # `player_x - win_behind` (telemetry.cpp:688) and col0 is floor(minX * sxf)
+    # `player_x - win_behind` (telemetry.cpp:710) and col0 is floor(minX * sxf)
     # (:664), the first covered column starts LEFT of the window: the mod walks
     # the whole of column col0 but advertises a window that begins partway into
     # it. So a cell can index to section 0 and still, correctly, be outside the
