@@ -3,8 +3,56 @@
 Single place for what is left. Companion to `README.md`, which records what has
 been **established**; this file records what has **not**.
 
-Status as of commit `f3821a7` + the 2026-08-13 (L), 2026-08-14 (M/N) and
-2026-08-15 (O/P) sessions below.
+Status as of commit `fbc13ea` + the 2026-08-13 (L), 2026-08-14 (M/N),
+2026-08-15 (O/P) and **2026-08-16** sessions below.
+
+> ## RESUME HERE — 2026-08-16 wrap. Read this box before anything else.
+>
+> **Rex's goal is unchanged: an agent that plays Stereo Madness all the way
+> through.** This session ran the game for the first time since both deliverables
+> landed. Read "Session 2026-08-16" below in full — it is the only session whose
+> findings change the plan rather than extend it.
+>
+> **Two findings reorder everything:**
+>
+> 1. **The throughput knob does nothing.** `advanceSteps` is deterministic at
+>    every stride and buys **0%** wall clock — ~14 s per 3048-tick attempt at
+>    strides 1, 8, 32 and 64 alike, ~822 rendered frames every time. The game is
+>    frame-limited at ~1× real time. The `~1.8 s/attempt` figure recorded at the
+>    last wrap is wrong by **7.8×**; it measured Python, which was never the
+>    constraint. **`GDRL_ENV_DELTA_TICKS` — the knob that actually rewrites dt —
+>    was never tested.** It is now the highest-value measurement in the project:
+>    the arithmetic at the end of the session section puts a full clear at
+>    **12–20 h** today, **~2 h** if that knob proves deterministic at N=8.
+>
+> 2. **Stereo Madness ends in a ship section** (portals at x=7995 ship, 12555
+>    cube, 22935 ship, 24045 ship, none back to cube; last object x=26384).
+>    **A cube-only action space cannot clear this level.** Best-ever reach x=3959
+>    is 49.5% of the way to the *first* ship portal. Ship is a scoping decision
+>    Rex has not yet made — but the sensor is probably already adequate (see Q5a),
+>    so this is likely policy work, not sensor work.
+>
+> **Do this first, in one held GD slot (~10 min, invocations are written out
+> verbatim under "Operational notes"):**
+> 1. **Re-run Q2** against the current binary — it passed 9/9 but against an
+>    artifact that no longer exists, and #22 has since changed `scanObjects`.
+>    Validate #22 in the same pass: `uniqueID=2410` must be gone, the 19 `id 8`
+>    spikes with x ≤ 4320 must all survive, `id 8` total 167 → **166**.
+> 2. **Sweep `GDRL_ENV_DELTA_TICKS`**, N ∈ {1,2,4,8,16,32}. **One launch per N** —
+>    it is a load-time `const` with no wire field, so it cannot be interleaved,
+>    and every launch must hit the same binary or the sweep is void. Report the
+>    largest bit-identical N, the first divergent N, wall clock and `frames=`.
+> 3. **Compose check + EXP determinism.** The two dt rewriters do **not**
+>    compose (`telemetry.cpp:1363`); this is pick-one. EXP is 2× faster and its
+>    determinism has never been established.
+>
+> **Then** #20 (window pinning) before any acceptance run: sensor width drifts
+> **569 → 493** between launches of the same binary, and under Benchmark A that
+> means two runs are not the same benchmark.
+>
+> **Do not trust any run without checking provenance** — see #23. A run this
+> session had some switches arrive and others not, wandered onto *Bloodbath*, and
+> reported `input[clean]` throughout.
 
 > **Read sections L and M first.** Between them they close I, J and K, harden
 > the observation decoder, and delete one loop that could never have done
@@ -60,8 +108,8 @@ decided yet.
 | In-context failure memory (Objective D) | **Nothing** |
 | Uncertainty policy (Objective E) | **Substrate only** (coverage mask + certainty channel) |
 | Reward function | **Does not exist** |
-| Search algorithm | **`trainer/sightread.py` built 2026-08-15** — best-first over hold *intervals*, real backtracking, A-legality enforced by construction. Solves a 7-hazard puppet level in 12 attempts. **Never run against GD**; acceptance criterion not met |
-| Env-loop throughput | **Measured (loopback)**: ~0.4 ms/round-trip empty, ~0.86 ms with 120 objects — Python is not the bottleneck. Stride-hybrid replay projected at ~1.8 s per 3048-tick attempt, **UNVERIFIED against the game** |
+| Search algorithm | **`trainer/sightread.py` built 2026-08-15** — best-first over hold *intervals*, real backtracking, A-legality enforced by construction. Solves a 7-hazard puppet level in 12 attempts. **Never run against GD**; acceptance criterion not met. Its interval premise is now **confirmed live** (hold auto-repeats, landing +1 tick, 6/6) — but that is a *cube* law, and Stereo Madness ends in **ship**, which this action space cannot fly |
+| Env-loop throughput | **Measured against the game 2026-08-16, and the projection was wrong by 7.8×.** ~14 s per 3048-tick attempt at strides 1/8/32/64 alike, ~822 rendered frames every time — the stride cut round-trips 63× and bought **0%**. The game is frame-limited at ~1× real time; the loopback ~0.4 ms figure measured Python, which was never the constraint. EXP path is **~6.5 s (~2×)**. `GDRL_ENV_DELTA_TICKS`, the only knob that rewrites dt, is **still untested** |
 | Policy / training loop | **Does not exist** |
 
 Deepest reach: 12 jumps, `maxX=3959.183837891`, `deathTick=3048`, ~14.8% of
@@ -1617,7 +1665,434 @@ per-attempt `maxX` log line that produced `3959.183837891`. At stride 1 they can
 differ by one tick of travel (~1.30 units); outside the watch window, by a whole
 stride. **Grade against the mod's log line.**
 
-### Queue for next session, in order
+---
+
+## Session 2026-08-16 — the game was finally run, and the cost model was wrong
+
+The first session in which both 2026-08-15 deliverables met Geometry Dash. Five
+questions were put to the live game (Q1–Q5). Four came back clean. The fifth
+found that **the throughput knob this project has been planning around does
+nothing**, and that Stereo Madness cannot be cleared by the action space we
+have.
+
+Nothing was committed by the agents; every number below is from the live game or
+from a level string the game itself dumped.
+
+### Q1. Holding jump auto-repeats — **CONFIRMED, tier (iv)**
+
+The bet the entire interval action space rests on is real, and the toy level's
+circular tests are no longer the only evidence.
+
+Decisive attempt `hold1000@60`: press at tick 60, release scheduled for 1060,
+attempt died at 783 — **the release never fired, so the whole arc came from one
+press.**
+
+| landing (`isOnGround` 0→1) | — | 163 | 268 | 373 | 478 | 583 | 688 |
+|---|---|---|---|---|---|---|---|
+| next jump onset (`yVelocity` 0→11.18) | 60 | 164 | 269 | 374 | 479 | 584 | 689 |
+
+**Seven jumps from one press. Onset is landing + 1 tick, 6 of 6.** Period 105
+ticks (first arc 104, from `y=105.000` against the `y=107.516` it settles to).
+
+Controls: `hold8@100` → `maxX=507.615234375`, identical to null input;
+`hold400@100` → `maxX=523.194458008`, reproduced bit-identically on repeat.
+
+**Still UNVERIFIED:** constant across *speeds* (lvl 1 has no speed portals, so
+untestable there) and across *heights* (all six landings on one surface).
+**And it is a cube law** — in a ship, holding is continuous thrust, not a
+re-triggered jump, so this does not transfer. See Q5.
+
+### Q2. Default-off byte-identity — **PASS, tier (iv), but against a dead binary**
+
+Gameplay half, 9/9 attempts, every one:
+`maxX=3959.183837891 deathTick=3048 t=12.700000662 push=12 rel=12
+input[clean blocked=0 leaked=0 ui=0 uiTot=0]`, **`VIEWPORT` count 0**, zero gdrl
+WARN/ERROR. Baseline was 3/3; got 9/9. Menu half, no `GDRL_*` at all: the entire
+mod output was two `ISOLATION` lines and `forced windowed mode`.
+
+**Caveat that must not be lost.** This was measured against
+`29f7eef7…` (Aug 15 23:14). That artifact **no longer exists** — the binary was
+rebuilt during the session. The tester's own ruling, and the right one: *re-run
+rather than argue it forward*, because Q2's whole value is that it is measured
+rather than reasoned. **Q2 must be re-run against the post-#22/#23 binary before
+it is quoted again.** ~70 seconds.
+
+### Q3. **The knob was wrong, and the cost model collapsed**
+
+Two knobs were being conflated, including in the brief that requested this
+measurement:
+
+- **`advanceSteps`** — a *wire field*, observation stride. Cannot touch physics.
+- **`GDRL_ENV_DELTA_TICKS`** — an *env var* (`telemetry.cpp:196`, namespace-scope
+  `const`, read **once at load**) that rewrites the dt fed to
+  `GJBaseGameLayer::update`, packing N physics steps into one rendered frame.
+
+**Only the second can buy throughput, and it was never tested.** What was tested
+is `advanceSteps`, and it is deterministic:
+
+| attempt | 3 | 4 | 5 | 6 | 7 | 9 | 10 |
+|---|---|---|---|---|---|---|---|
+| stride | 1 | 32 | 1 | 32 | 8 | 32 | **64** |
+| published obs | 3292 | 103 | 3288 | 103 | 412 | 103 | 52 |
+| maxX | all seven `3959.183837891` | | | | | | |
+
+Interleaved in one process so drift cancels; graded against the mod's `ATTEMPT`
+line, not a sampled max; `env[timeouts=0 protoErr=0]` throughout.
+
+**Inputs fire on every physics step regardless of stride — confirmed
+empirically, not read off the comment.** At stride 32 the published ticks are
+1, 33, 65 … and **not one of the twelve jump ticks** (326, 713, 1075, 1163, 1267,
+1799, 1935, 2155, 2319, 2483, 2687, 2879) is published — 326 mod 32 = 6 — yet the
+trajectory is bit-identical to stride 1.
+
+**THE FINDING THAT MATTERS.** Wall clock per full-length (3048-tick) replay:
+
+| stride | 1 | 32 | 1 | 32 | 8 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| wall clock | 14 s | 13 s | 14 s | 15 s | 14 s | 14 s | 14 s |
+| rendered frames | ~822 every time | | | | | | |
+
+**~13–15 s at every stride. The stride cut round-trips 63× (3292 → 52) and
+bought 0%.** The game is frame-limited at ~1× real time, not protocol-limited.
+3048 ticks / 240 Hz = 12.7 s of game time.
+
+The **~1.8 s per 3048-tick attempt** projection recorded at the 2026-08-15 wrap
+is wrong by **7.8×**. It was a loopback measurement of Python's cost, and Python
+was never the constraint.
+
+For contrast the older EXP path (`GDRL_ADAPTIVE=1 GDRL_DELTA_TICKS=8
+GDRL_FAST_RESET=1`) ran the same 3048 ticks in **388 frames / ~6.5 s — ~2×
+faster**. So `env.py:936`'s claim that `advanceSteps` is *"a strictly better knob
+than experiments.cpp's adaptive-dt scheme"* needs **reversing, not
+qualifying**: equal-and-safer on correctness, 1.0× against 2.2× on throughput.
+The honest claim is that `advanceSteps` is correctness-preserving with **no**
+throughput effect — a smaller claim than the docstring makes.
+
+**They do not compose.** `telemetry.cpp:1363-1368` already warns that setting
+both `GDRL_ENV_DELTA_TICKS` and `GDRL_DELTA_TICKS` leaves the effective dt to
+whichever `$modify GJBaseGameLayer::update` hook is innermost — a linker detail.
+This is a **pick-one** decision, not a stacking opportunity.
+
+**Consequence for the sweep design:** `g_envDeltaT` is read once at load and has
+no wire field, so an N-sweep **cannot be interleaved in one process** — it is one
+launch per N, and all of them must hit the same binary or the sweep is void.
+
+### Q4 (amended). The camera sensor is right, but the width **drifts between launches**
+
+The original Q4 verdict ("the object scan is correct") should read: *correct for
+collision geometry; blind to non-touch triggers; and it reports one false HAZARD
+at the origin early in every episode.*
+
+**The width is not stable: 569.0 world units on one launch, 493.0 on another,
+same binary, identical physics.** Two independent observers, tier (iv) each.
+Proposed mechanism, **UNVERIFIED**: GD's persisted window size escaping the
+sandbox via `cfprefsd`, which `scripts/run_sandbox.sh`'s own header caveat #2
+already warns ignores `CFFIXED_USER_HOME` — *"File I/O is redirected; the
+preferences system is not."*
+
+**Under Benchmark A the sensor definition IS the benchmark**, so two runs at
+different widths are not the same benchmark and their attempts-to-completion
+numbers are not comparable. **This promotes item 1b from hygiene to a blocker on
+the acceptance run.**
+
+### Q4a. The phantom is GD's **anti-cheat spike** — a third injected object
+
+Not the collision proxy `8dd5ceb` identified and filtered; that filter does not
+cover this one. `m_anticheatSpike` is a real binding
+(`bindings/2.2081/GeometryDash.bro:8219`). It is a real `GameObject` at
+`(0, 105)` with `objectType` Hazard, so `collapseKind` maps it to **HAZARD** —
+a false hazard for the first ~210 ticks of **every episode**, for as long as the
+camera's behind-window still contains x=0. The player spawns inside its rect and
+does not die, which is why it survived this long.
+
+Corroborated two independent ways: live `m_objects` vs `m_sections`, and
+re-derived from the dumped level string — `id 8` counts **166** in the string
+against **167** live.
+
+Filtered by **pointer identity**, not id or position: `id 8` is the ordinary
+spike and the other 166 must all still be reported.
+
+### Q5. **Stereo Madness ends in a ship section**
+
+Tier (iii), from the game's own dumped level string.
+`DUMP_LEVEL 1: 2291 objects, 0 move triggers`. Runtime y = level y + 90.
+
+| id | x | y (runtime) | mode | ≈ tick @ 1.298250437 u/tick |
+|---|---|---|---|---|
+| 13 | **7995** | 255 | ship | ~6158 |
+| 12 | **12555** | 239 | cube | ~9671 |
+| 13 | **22935** | 239 | ship | ~17666 |
+| 13 | **24045** | 405 | ship | ~18521 |
+
+**Speed portals: 200/201/202/203/1334 → all count 0.** Max object id in the
+level is 142.
+
+`README.md:1066`'s *"ship at x=7995, cube at x=12555"* is **confirmed exactly**
+and **incomplete** — it omits the ship portals at 22935 and 24045. Its *"speed
+portals: none at all"* is confirmed.
+
+**The load-bearing consequence: the last cube portal is at 12555, ship portals
+follow at 22935 and 24045, and there is no cube portal after. Last object
+x=26384, `levelLength` 26724. The level ENDS IN SHIP, so a cube-only action
+space cannot clear it.** Deepest reach `3959.183837891` ≈ tick 3050 is 49.5% of
+the way to the *first* ship portal.
+
+Id→vehicle mapping rests on the repo's own `kIdShipPortal = 13`
+(`mod/src/synth.cpp:41`), not re-measured live.
+
+### Q5a. Ship mode is probably NOT a second sensor project
+
+Accidental tier (iv) evidence, salvaged from the contaminated run below —
+*Bloodbath* starts in ship and the mod tracked it correctly:
+
+```
+COND tick=0   x=0.000   ship grav=dn size=1.00 spd=0.90 gmul=0.96 ...
+COND tick=452 x=586.055 ship grav=dn size=1.00 spd=0.70 gmul=0.94 ...
+ATTEMPT 1 lvl=10565740 maxX=687.566162109 t=2.287500119 frames=300
+MODE tick=549 x=0.000 from=ship cleared=cube type=6 p1
+```
+
+Vehicle correctly reported, tick clock consistent (`t=2.2875` → tick 549 under
+`lround(t*240)`), `maxX` accumulating, gravity multiplier tracking, a speed
+portal firing. `MODE`/`COND` read the same `PlayerObject` fields the ENV wire
+does, so the plumbing is not vehicle-specific. `GdrlPlayerState`
+(`gdrl_schema.hpp:189-202`) already publishes `yVelocity`, `gravity`, `rotation`,
+`vehicleSize`, `isUpsideDown`, `isSideways`, `isOnGround`, plus an uncollapsed
+`vehicleFlags` bitfield. **No field is missing.**
+
+Three things UNVERIFIED, and one is a real risk:
+1. `yVelocity` semantics in ship — same field, and ship is vertical-velocity
+   driven, so it should be *more* informative. Never observed in ship.
+2. **`isOnGround` in ship.** A ship can rest against floor *or* ceiling and
+   `m_isOnGround` is one bit. If it cannot distinguish them, a ship policy
+   cannot tell "landed" from "hit the ceiling" from that field alone.
+   `rotation` and `yVelocity` sign may disambiguate — that is the difference
+   between a **sensor gap** and **decoder work**.
+3. Whether Q1's auto-repeat law survives. It almost certainly does not.
+
+Cheapest close, no new code: `GDRL_SYNTH=1` already builds a level with a ship
+portal near the start (`kIdShipPortal = 13`). One launch answers all three.
+
+### The move-trigger census is **void**, and this was already known
+
+`README.md:1066` claims **4** move triggers total across all 21 main levels, all
+in lvl 21, all `touch=1`. Measured this session by two independent parsers (the
+level string directly, and the mod's own C++ extraction) agreeing exactly:
+
+| dump | records | `id 901` | key 11 (touch) |
+|---|---|---|---|
+| `level-1.txt` | 2291 | **0** | — |
+| `level-21.txt` | 27283 | **177** | **absent on all 177** |
+
+Level 21 alone holds **177**, spanning **x=1.0 to 24993.5**, and **none is
+touch-triggered** — so the claim is wrong in *both* directions, and 7 (not 4)
+fall inside the quoted 7813–8455 window. Per the measured rule that only
+`touch=1` objects get sectioned, 0 of 177 should have been sectioned, yet the
+census reported 4. **Treat the whole census row as void, not merely
+undercounted.**
+
+**And `probes.cpp:1014-1020` already documented this exact 44× undercount** —
+*"The section walk below is not a valid instrument for triggers... Every
+conclusion about whether a synthetic object 'loaded' that rested on the section
+walk is therefore unfounded."* The finding existed in the C++ and never
+propagated to the README or to the synth-track justification. **This is a
+distribution failure, not a discovery.**
+
+**Consequence for `mod/src/main.cpp:412-415`** (*"the main levels contain no
+reachable move trigger and no speed portals at all"*): the speed-portal half
+stands, verified on lvl 1. **The move-trigger half does not** — 177 exist on lvl
+21, starting at x=1.0, so reachability is no longer obviously the binding
+constraint. The synth track may still be justified; **not on this number.**
+
+### Triggers, and why the sensor's blindness is nearly moot here
+
+`scanObjects` reads `m_sections`, and GD never registers non-touch-triggered
+triggers there. Across 21 levels **every** missing id is a trigger id (22–33,
+56–59, 105, 744, 899, 900, 901, 915, 1006, 1007, 1049); **not one solid, hazard,
+portal, pad, ring or slope is ever missing.** So the agent loses no collision
+geometry.
+
+Whether an A-legal agent may see triggers at all is an **open scoping decision**
+— triggers are the level's *future* rather than its present, and they are not
+rendered, so a human sightreading cannot see them either. But note
+`probes.cpp:958-959`: **Stereo Madness is a 2013 level, from long before 2.0
+introduced triggers**, and its dump confirms `0 move triggers`. For the current
+goal the question is nearly moot.
+
+### A contamination mode that the methodology rules already predicted
+
+Both the tester and the debugger independently hit a run in which the `GDRL_*`
+vars never reached the game and something walked GD into *Bloodbath*. Each
+nearly misdiagnosed it as the defect they were hunting. Every health signal
+stayed quiet: `input[clean]`, `ui=0`, `uiTot=0` all looked fine while a human
+played a different level. The run produced a complete, plausible, worthless data
+set.
+
+**This file's own "Methodology rules earned the hard way" already records the
+identical failure** — *"`input[clean]` meant clean-of-buttons and said nothing
+about which level was loaded — the game silently drifted to Back On Track and
+kept reporting clean."* The rule was written down and the guard was never built,
+so it happened again with a different level name. See #23.
+
+**Diagnosis (investigation only — no code was written).** `GDRL_PIN_LEVEL` has
+no logic defect. `g_pinLevel` (`main.cpp:121`, duplicated at `telemetry.cpp:254`)
+is `const bool` read once at static-init; both read the same string so they
+cannot disagree. The full enforcement path was read — the wrong-level check at
+`main.cpp:451`, the `WRONG_LEVEL` status wiring at `telemetry.cpp:1189`, and
+`sightread.py`'s `FrameGate` refusing `GdrlStatus.WRONG_LEVEL` — **and the
+`GDRL_ENV` channel already refuses correctly.** If the var never reached the
+process, the guard was `false` by correct, intended design. *The off-state
+operating correctly on a var that silently never arrived is the whole failure.*
+
+The real gap is on the **log** path, which runs regardless of `GDRL_ENV`:
+between wrong-level detection and the queued scene-replace landing on the next
+frame, `resetLevel()` can still fire and emit an ordinary-looking
+`ATTEMPT … input[clean blocked=0 leaked=0 ui=0 uiTot=0]` line for the wrong
+level — distinguishable only by `lvl=`, which nobody greps. The comment at
+`main.cpp:449-450` already describes this exact failure from a *previous*
+incident; the guard built in response only covers "wandered via menu mid-run",
+not "never had the var at all".
+
+**Unresolved contradiction, and it sharpens the root cause.** `inputVerdict()`
+returns `"clean"` only when `GDRL_BLOCK_INPUT` was observed as `1`. The
+contaminated run's line reads `input[clean …]`, **not `UNGUARDED`** — so
+`GDRL_BLOCK_INPUT` *did* reach that process. That makes the incident **partial
+propagation, not total**: some switches arrived and some did not, which is a
+different and more alarming root cause than "the env was lost". Settle this
+before building the guard; it changes where the fix belongs.
+
+**Design settled, not written:** (1) stamp every `GDRL_*` switch the process
+actually observed — 39 distinct names are read across `mod/src/*.cpp` — into a
+startup log line, so "did the vars arrive" is answerable from the log with zero
+inference; (2) tag any attempt produced while pinned-and-wrong as a distinct
+`log::error` `ATTEMPT-REFUSED` line so a naive scan cannot mistake it for data.
+**Note (2) would not have caught this incident** — with `g_pinLevel` false the
+branch is never entered. **(1) is the one that closes it.**
+
+### What this session did NOT do
+
+- **No agent played anything.** The acceptance criterion is untouched.
+- Q2 not re-run against the current binary; **it is stale by construction.**
+- `GDRL_ENV_DELTA_TICKS` **never set** — determinism and throughput both
+  UNVERIFIED, and it is now the highest-value measurement in the project.
+- EXP path determinism never established, though it is 2× faster.
+- Item 1b (#20) still not implemented, and now blocking.
+- Ship: nothing built, nothing decided.
+
+### The arithmetic that should drive next session
+
+Calculation from measured inputs, **not** a measurement — inputs solid,
+conclusion an order of magnitude:
+
+- 26724 units ÷ 1.298250437 ≈ **20,585 ticks ≈ 86 s of game time** for one
+  complete run.
+- Frame-limited at ~1× real time, so an attempt costs ≈ `deathTick/240` seconds.
+- Best-ever is 3048 ticks / 12 jumps → a full clear is ~80–120 jump decisions.
+- The driver solved a 7-hazard puppet in 12 attempts (~1.7/hazard); real
+  geometry with backtracking will be worse — call it 10–20 attempts per decision.
+
+→ order of **1,000–2,000 attempts averaging ~40 s ≈ 12–20 hours** at today's
+throughput. At EXP's measured 2×, ~6–10 h. If `GDRL_ENV_DELTA_TICKS=8` proves
+deterministic at ~8×, ~2 h.
+
+**So the dt sweep is not tuning. It is the difference between "run it overnight"
+and "not feasible in this project's current shape."**
+
+### Operational notes — read before the next live run
+
+**Preserved evidence** (`backups/2026-08-16/`, gitignored but durable — the
+originals live in the sandbox save dir and are one `rm -rf sandbox/` from gone):
+`level-1.txt` (2292 records, **0** `id 901`), `level-21.txt` (27284 records,
+**177** `id 901` — reproduced by a third independent parser at wrap),
+`level-21-move-901.txt`, and `telemetry_repaired.cpp`.
+
+**Verbatim invocations**, from the repo root. Record the binary hash first,
+every session:
+```sh
+shasum -a 256 "sandbox/Geometry Dash.app/Contents/geode/mods/gdrl.probe.geode" \
+              mod/build/gdrl.probe.geode
+```
+
+Q2 / EXP determinism — **unshifted** ticks (this path is the origin of the `+1`
+convention):
+```sh
+GDRL_AUTOPLAY=1 GDRL_EXP=1 GDRL_BLOCK_INPUT=1 GDRL_PIN_LEVEL=1 \
+GDRL_FAST_RESET=1 GDRL_ADAPTIVE=1 GDRL_DELTA_TICKS=8 \
+GDRL_INJECT_SEQ="325,712,1074,1162,1266,1798,1934,2154,2318,2482,2686,2878" \
+./scripts/run_sandbox.sh
+```
+
+ENV path (#22 validation, id-8 census) — **+1-shifted** ticks
+`326,713,1075,1163,1267,1799,1935,2155,2319,2483,2687,2879`, hold 8 each:
+```sh
+GDRL_ENV=1 GDRL_AUTOPLAY=1 GDRL_PIN_LEVEL=1 GDRL_BLOCK_INPUT=1 ./scripts/run_sandbox.sh
+```
+
+dt sweep — **one launch per N**, N ∈ {1,2,4,8,16,32}, N=1 and N=32 repeated last:
+```sh
+GDRL_ENV=1 GDRL_ENV_DELTA_TICKS=N GDRL_AUTOPLAY=1 GDRL_PIN_LEVEL=1 \
+GDRL_BLOCK_INPUT=1 ./scripts/run_sandbox.sh
+```
+
+Compose check (both dt rewriters on, deliberately): add `GDRL_ENV_DELTA_TICKS=8`
+to the EXP invocation and watch the `telemetry.cpp:1363` warning plus
+`header.dtIn`/`dtUsed` to see which hook won.
+
+Synth ship — **omit `GDRL_PIN_LEVEL`**, it pins level 1 and the synth level is
+not level 1:
+```sh
+GDRL_SYNTH=1 GDRL_ENV=1 GDRL_AUTOPLAY=1 GDRL_BLOCK_INPUT=1 ./scripts/run_sandbox.sh
+```
+
+**Provenance check for every run above, until #23 exists:**
+```sh
+grep "gdrl\] autoplay ->" "sandbox/Geometry Dash.app/Contents/geode/logs/$(ls -t 'sandbox/Geometry Dash.app/Contents/geode/logs' | head -1)"
+```
+
+#### Things that cost runs
+
+- **`GDRL_MAX_ACTIONS = 8`.** `Channel.respond()` raises on >8 actions, so a
+  12-jump plan must span ≥2 responses.
+- **`env.py` clients SIGSEGV when the game dies while they hold the mmap** —
+  numpy reads unmapped pages. **Any driver must write results incrementally, per
+  attempt.** An end-of-run dump is a dump that never happens. Cost two full runs.
+- **A timed-launch wrapper collided with itself** — an earlier wrapper's `pkill`
+  timer killed a *later* run's game 37 s in. Whatever wraps `run_sandbox.sh`
+  needs single-instancing too, not just the game.
+
+#### Looked wrong, was not
+
+- **`objectCount=1` on Stereo Madness** was nearly filed as a failure. The level
+  string says exactly 1 object in that window. **The level dump is a cheap
+  oracle for the object scan — make it the first check, not the last.**
+- **The 569→493 width variance is not caused by any switch.**
+  `GDRL_PROBE_VIEWPORT` was suspected and ruled out: probe-on run = 493,
+  probe-off runs = 569 *and* 493. It tracks the OS window only.
+
+#### The methodological one worth carrying forward
+
+**A null result needs a positivity control.** The first Q1 design returned
+`hold8`/`hold400`/`hold2000` → identical `maxX=542.668640137`, i.e. "holding
+does nothing". That was **false**: the cube died airborne at tick 418 and the
+hold never spanned a landing. The control that rescued it — *"did the cube land
+at all during the hold?"* — is trivial and was missing. This nearly went into a
+report as a finding that would have collapsed `sightread.py`'s action space.
+
+#### Counter and field gotchas
+
+- **`ENV a=… steps=` is published observations, not physics steps** — it reads
+  `103` for a 3048-tick attempt at stride 32.
+- The `ENV a=` and `ATTEMPT` counters are separate statics in different
+  translation units. They agreed in every observed run; do not assume it.
+- **`level-1-move-901.txt` is 0 bytes** — correct (lvl 1 has none), but
+  indistinguishable from a failed write.
+- **`frames=` is the honest throughput number**: ~822 per 3048-tick attempt on
+  the ENV path at *every* stride, ~388 on the EXP path. That invariance is the
+  mechanism behind 14 s vs 6.5 s.
+
+---
+
+### Queue for the session after next (superseded by the RESUME box above)
 
 > **RESUME HERE — 2026-08-15 (second wrap). Read this box before anything else.**
 >

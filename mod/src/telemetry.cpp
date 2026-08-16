@@ -1003,6 +1003,31 @@ void scanObjects(GJBaseGameLayer* layer, GdrlObservation* o, double px, double p
                 if (obj == layer->m_player1CollisionBlock ||
                     obj == layer->m_player2CollisionBlock) continue;
 
+                // The THIRD object GD injects that is not level geometry:
+                // GJBaseGameLayer::m_anticheatSpike. Measured on Stereo
+                // Madness (GDRL_PROBE_PHANTOM=1, 2026-08-16):
+                //
+                //   PH-AC tick=1 GRID-HIT col=0 ptr=0x95ebcd200 uid=2410 oid=8
+                //       pos=(0.000000000,105.000000000)
+                //   PH-CB tag=acspike uid=2410 oid=8 otype=2
+                //       rect=(-3.000,99.000,6.000,12.000) inObjects=2398
+                //
+                // i.e. a real objectID=8 spike with a hazard rect, parked at
+                // the origin forever, appended to m_objects as its LAST element
+                // (2398 of 2399 -- so unlike the collision blocks the census
+                // does see it: id 8 counts 167 in m_objects against 166 in the
+                // level string) and registered in section column 0. It is
+                // GameObjectType::Hazard, so collapseKind maps it to HAZARD and
+                // every consumer was told there is a spike at x=0 for the
+                // ~210 ticks the camera's behind-window still contains the
+                // origin. The player starts at (0,105), inside that rect, and
+                // does not die -- it is not a hazard in play.
+                //
+                // Filtered by POINTER for the same reason as the blocks: id 8
+                // is the ordinary spike and every other one of the 166 must be
+                // reported.
+                if (obj == layer->m_anticheatSpike) continue;
+
                 if (obj->m_positionY < minY || obj->m_positionY > maxY) continue;
                 if (obj->m_positionX < minX || obj->m_positionX > maxX) continue;
                 if (n >= GDRL_MAX_OBJECTS) {

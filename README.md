@@ -948,19 +948,154 @@ with telemetry against 3.4 s without), a naive per-tick loop costs ~5.5 s per
 attempt at the current frontier — ~650 attempts/hour, nearly all of it spent
 observing a prefix whose outcome is already known.
 
-**The fix needs no mod work.** `advanceSteps` is an *observation* stride, and the
-mod fires scheduled inputs on every physics step regardless, so a committed
-prefix can replay in a handful of round trips with the loop dropping to stride 1
-only near the frontier. The per-attempt floor then becomes the game's own replay
-speed, `prefix_ticks / (GDRL_ENV_DELTA_TICKS × 60 fps) + reset` ≈ **1.8 s for a
-3048-tick prefix at `DELTA_TICKS=32`**, or ~2000 attempts/hour. **That figure is
-arithmetic over recorded numbers and is UNVERIFIED against the game** — in
-particular, nothing has yet confirmed that replay stays deterministic at a large
-stride, and the whole cost model rests on it.
+~~**The fix needs no mod work.**~~ **↓ MEASURED AGAINST THE GAME 2026-08-16. THE
+FIX BUYS NOTHING, AND THE 1.8 s FIGURE WAS WRONG BY 7.8×.**
+
+The reasoning was: `advanceSteps` is an *observation* stride, the mod fires
+scheduled inputs on every physics step regardless, so a committed prefix replays
+in a handful of round trips and the per-attempt floor becomes
+`prefix_ticks / (GDRL_ENV_DELTA_TICKS × 60 fps) + reset` ≈ **1.8 s at
+`DELTA_TICKS=32`**, ~2000 attempts/hour.
+
+**Both halves of that were tested. The correctness half holds; the throughput
+half does not.**
+
+*Correct:* `advanceSteps` is deterministic — seven attempts interleaved in one
+process at strides 1, 8, 32 and 64 all produced `maxX=3959.183837891`,
+bit-identical. And inputs really do fire on every physics step regardless of
+stride, confirmed **empirically** rather than from the comment: at stride 32 the
+published ticks are 1, 33, 65 … and **not one of the twelve jump ticks is
+published** (326 mod 32 = 6), yet the trajectory is identical.
+
+*Wrong:* it buys **nothing**.
+
+| stride | 1 | 32 | 1 | 32 | 8 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| published obs | 3292 | 103 | 3288 | 103 | 412 | 103 | 52 |
+| wall clock | 14 s | 13 s | 14 s | 15 s | 14 s | 14 s | 14 s |
+| rendered frames | ~822 in every single case | | | | | | |
+
+**A 63× reduction in round trips bought 0%.** The game is **frame-limited at ~1×
+real time**, not protocol-limited: 3048 ticks / 240 Hz = 12.7 s of game time, and
+the measured cost is ~14 s. The loopback table above is accurate and irrelevant —
+it measured Python, and **Python was never the constraint.** `frames=` is the
+honest throughput number, not round trips.
+
+**The knob was also the wrong knob**, and this file helped cause the confusion.
+There are two:
+
+- **`advanceSteps`** — a *wire field*, observation stride, cannot touch physics.
+  This is what was measured, and it is correctness-preserving with **no**
+  throughput effect.
+- **`GDRL_ENV_DELTA_TICKS`** — an *env var* (`telemetry.cpp:196`, namespace-scope
+  `const`, read **once at load**, no wire field) that rewrites the dt fed to
+  `GJBaseGameLayer::update`. **This is the only one that can buy throughput, and
+  it has never been set.** Because it is load-time, an N-sweep needs one launch
+  per N and cannot be interleaved.
+
+For contrast, the older EXP path (`GDRL_ADAPTIVE=1 GDRL_DELTA_TICKS=8
+GDRL_FAST_RESET=1`) ran the same 3048 ticks in **388 frames / ~6.5 s — ~2×
+faster**. So `env.py:936`'s claim that `advanceSteps` is *"a strictly better knob
+than experiments.cpp's adaptive-dt scheme"* needs **reversing, not qualifying**:
+equal-and-safer on correctness, **1.0× against 2.2×** on throughput. And they do
+not compose — `telemetry.cpp:1363-1368` already warns that with both set the
+effective dt is decided by whichever `$modify` hook is innermost, a linker
+detail. **Pick one.**
+
+**What this costs the goal.** Calculation from measured inputs, order of
+magnitude only: ~20,585 ticks ≈ 86 s of game time for a complete run; attempts
+cost ≈ `deathTick/240` s; ~80–120 jump decisions at 10–20 attempts each →
+**1,000–2,000 attempts averaging ~40 s ≈ 12–20 hours** at today's throughput,
+~6–10 h at EXP's 2×, **~2 h** if `GDRL_ENV_DELTA_TICKS=8` proves deterministic.
+The dt sweep is therefore not tuning — it is the difference between "run it
+overnight" and "not feasible in this project's current shape."
 
 Related and already recorded: the "~3.9 attempts/sec" figure elsewhere in this
 file came from a 391-tick attempt with **no env loop**. It does not carry to a
 3048-tick prefix.
+
+## Holding the jump button auto-repeats — measured, tier (iv)
+
+The claim the entire interval action space rests on, confirmed against the live
+game 2026-08-16. Until then the only evidence was a toy level that had been
+*written* to auto-repeat, which is circular by construction.
+
+Decisive attempt: `HOLD` at tick 60 with `hold_ticks=1000`, which the mod expands
+into `press@60` + `release@1060`. The attempt died at tick 783, so **the release
+never fired and the whole arc came from a single press.**
+
+| landing (`isOnGround` 0→1) | — | 163 | 268 | 373 | 478 | 583 | 688 |
+|---|---|---|---|---|---|---|---|
+| next jump onset (`yVelocity` 0→11.18) | 60 | 164 | 269 | 374 | 479 | 584 | 689 |
+
+**Seven jumps from one press. The next jump begins on landing + 1 tick, 6 of 6.**
+Period 105 ticks; the first arc is 104 because the player starts at `y=105.000`
+against the `y=107.516` it settles to.
+
+Controls: `hold8@100` → `maxX=507.615234375`, identical to null input;
+`hold400@100` → `maxX=523.194458008`, reproduced bit-identically.
+
+**Scope of the claim.** Constant across 6 consecutive landings *at one speed and
+one height*. UNVERIFIED across speeds (Stereo Madness has no speed portals) and
+across heights (all six landings on the same surface). **And it is a cube law** —
+in a ship, holding is continuous thrust rather than a re-triggered jump, so it
+does not transfer.
+
+**The near-miss worth recording.** The first design of this measurement returned
+`hold8`, `hold400` and `hold2000` all at an identical `maxX=542.668640137` — a
+clean, consistent "holding does nothing" that would have collapsed the action
+space. It was false: the cube died airborne at tick 418 and no hold ever spanned
+a landing. **A null result needs a positivity control** — here, *"did the cube
+land at all during the hold?"* — and it was missing.
+
+## A third injected object: GD's anti-cheat spike
+
+`8dd5ceb` identified the player's collision proxy being emitted as a SOLID block.
+There is a **second, distinct** injected object, and that filter does not cover
+it: `GJBaseGameLayer::m_anticheatSpike` (a real binding,
+`bindings/2.2081/GeometryDash.bro:8219`).
+
+It is a genuine `GameObject`, `objectID=8`, parked at `(0, 105)` forever with a
+hazard rect, appended as the **last** element of `m_objects` — so unlike the
+collision blocks the census does see it: `id 8` counts **167** in `m_objects`
+against **166** in the level string. It is `GameObjectType::Hazard`, so
+`collapseKind` maps it to **HAZARD**, and every consumer was told there is a
+spike at x=0 for the **~210 ticks the camera's behind-window still contains the
+origin — on every episode of every level.** The player spawns inside that rect
+and does not die; it is not a hazard in play.
+
+Filtered by **pointer identity**, not by id or position: `id 8` is the ordinary
+spike and the other 166 must all still be reported.
+
+## The sensor window is not stable across launches
+
+**569.0 world units on one launch, 493.0 on another — same binary, identical
+physics.** Two independent observers, tier (iv) each.
+
+Proposed mechanism, **UNVERIFIED**: GD's persisted window size escaping the
+sandbox through `cfprefsd`, which `scripts/run_sandbox.sh`'s own header caveat
+already warns ignores `CFFIXED_USER_HOME` — *"File I/O is redirected; the
+preferences system is not."* Ruled out: any `GDRL_*` switch (a probe-on run gave
+493; probe-off runs gave 569 **and** 493). It tracks the OS window only.
+
+**Under Benchmark A the sensor definition *is* the benchmark**, so two runs at
+different widths are not the same benchmark and their attempts-to-completion
+numbers are not comparable. This is the same class of defect as the 3.9×
+overreach, just smaller and harder to see — and it blocks any acceptance run.
+
+## `scanObjects` is blind to non-touch triggers — and loses no collision geometry
+
+It reads `m_sections`, and GD registers only *touch-triggered* objects there.
+Measured across 21 levels: **every** missing id is a trigger id (22–33, 56–59,
+105, 744, 899, 900, 901, 915, 1006, 1007, 1049), and **not one solid, hazard,
+portal, pad, ring or slope is ever missing.** On Stereo Madness the 17
+untouched-triggered objects missing from `m_sections` match the level string
+exactly, object for object.
+
+Whether an A-legal agent may see triggers at all is an **open scoping decision**:
+triggers are not rendered, so a human sightreading cannot see them either, and
+they describe the level's *future* rather than its present. Largely moot for the
+current goal — Stereo Madness dumps `0 move triggers`.
 
 ## A search driver exists: `trainer/sightread.py`
 
@@ -1058,17 +1193,57 @@ trajectory.
 
 ## The main levels cannot serve the remaining trigger work
 
-Censused all 21 main levels in one launch (`GDRL_CENSUS=1 GDRL_CENSUS_SWEEP=21`).
-The content needed to close the trigger measurements is not reachable:
+> ### ⚠️ THE MOVE-TRIGGER ROW BELOW IS VOID (2026-08-16). The instrument was invalid.
+>
+> Censused all 21 main levels in one launch (`GDRL_CENSUS=1
+> GDRL_CENSUS_SWEEP=21`) — **off the section grid, which is not a valid
+> instrument for triggers.** GD registers only *touch-triggered* objects in
+> `m_sections`, so a section walk cannot count triggers at all.
+>
+> Measured 2026-08-16 by **three independent parsers** (the mod's own C++
+> extraction, and two separate reads of the dumped level string):
+>
+> | dump | records | `id 901` | key 11 (touch) |
+> |---|---|---|---|
+> | `level-1.txt` | 2292 | **0** | — |
+> | `level-21.txt` | 27284 | **177** | **absent on all 177** |
+>
+> So the claimed "**4**, all `touch=1`" is wrong in **both** directions: level 21
+> alone holds **177**, spanning **x=1.0 to 24993.5**, and **none** is
+> touch-triggered (7, not 4, fall inside the quoted 7813–8455 window). Under the
+> measured sectioning rule, 0 of 177 should have been sectioned — yet the census
+> reported 4, so its number is unexplained in both directions. **Treat the row as
+> void, not as an undercount.**
+>
+> **This was already known.** `mod/src/probes.cpp:1014-1020` documents the
+> identical 44× undercount and states that *"every conclusion... that rested on
+> the section walk is therefore unfounded."* It never propagated here. A finding
+> written down in one file and not in another is a finding the project does not
+> have.
+>
+> **Consequence for `mod/src/main.cpp:412-415`** (*"the main levels contain no
+> reachable move trigger and no speed portals at all"*, the stated justification
+> for the whole synth-level track): the **speed-portal half stands**; the
+> **move-trigger half does not.** 177 exist on lvl 21 starting at x=1.0, so
+> reachability is no longer obviously the binding constraint. The synth track may
+> still be justified — but not on this number.
+>
+> Dumps preserved at `backups/2026-08-16/`.
 
 | needed for | what exists | reachable? |
 |---|---|---|
-| live `GroupCommandObject2` (Probe A) | **4** move triggers total, all in lvl 21 (Fingerdash) at x=7813–8455, all `touch=1` | no — best sequence reaches x=3959 on lvl 1 |
-| a vehicle portal by input (lvl 1) | ship at x=7995, cube at x=12555 | no — ~2× current reach |
-| speed portals (lvl 1) | none at all | n/a |
+| live `GroupCommandObject2` (Probe A) | ~~**4** move triggers total, all in lvl 21 at x=7813–8455, all `touch=1`~~ **VOID — 177 on lvl 21, none touch-triggered, from x=1.0** | **unknown; reachability was never the constraint it was claimed to be** |
+| a vehicle portal by input (lvl 1) | ship at x=7995, cube at x=12555 — **confirmed exactly 2026-08-16, and incomplete: further ship portals at 22935 and 24045** | no — ~2× current reach |
+| speed portals (lvl 1) | none at all — **confirmed 2026-08-16** (ids 200/201/202/203/1334 all count 0) | n/a |
 
-These are pre-2.0 levels; they barely use triggers. And the four that exist are
-touch-triggered, which forward projection classifies as *not* computable anyway.
+These are pre-2.0 levels; Stereo Madness in particular is a 2013 level from long
+before 2.0 introduced triggers, and its dump confirms `0 move triggers`.
+
+**Also established from the same dump, and it changes the goal:** the last cube
+portal on Stereo Madness is at x=12555; ship portals follow at 22935 and 24045
+with **none back to cube**, and the last object is at x=26384 (`levelLength`
+26724). **The level ends in ship, so a cube-only action space cannot clear it.**
+Best-ever reach x=3959 is 49.5% of the way to the *first* ship portal.
 
 **So the trigger measurements need synthetic levels** — a generated level string
 with a spawn-triggered move trigger near x≈300, speed portals at known x, and
