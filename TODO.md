@@ -1423,35 +1423,170 @@ actionable: delete the block.** Its mutant `D8` should then be removed too.
 
 ### Queue for next session, in order
 
-> **RESUME HERE.** Items 1 and 2 were dispatched on 2026-08-14 and **stopped
-> before either produced anything** — the viewport agent was killed at "now I'll
-> write the probe", so `mod/` is untouched and no measurement exists. Start both
-> from scratch; nothing is half-done and nothing needs unpicking. Item 3 landed
-> and is closed. Tree is green at **235 tests**, `trainer/mutate.py` at
-> **46/46 killable (47 run)**, mod builds universal.
+> **RESUME HERE — 2026-08-15 wrap-up. Read this box before anything else.**
+>
+> **Start with queue item 8 (`trainer/sightread.py`). It does not exist.** The
+> agent was stopped at "I'll start by reading the required documents" and wrote
+> nothing; `trainer/` is untouched this session. Start from scratch — nothing is
+> half-done. Item 8 carries the full spec.
+>
+> **Then finish item 1's ruling, which is NOT implemented.** The viewport was
+> measured and the ruling was made — the window must become camera-derived — but
+> the agent was stopped mid-refactor and **`telemetry.cpp` was never touched**.
+> `scanObjects()` still uses the old constants, so *the sensor is still 3.9× too
+> wide right now*. What did land: `mod/src/viewport.cpp` + `viewport.hpp` (probe
+> V, `GDRL_PROBE_VIEWPORT`, default off), wired into `mod/CMakeLists.txt`. The
+> `viewport.hpp` extraction exists so `telemetry.cpp` can call
+> `cameraWorldRect()`; the caller was never written.
+>
+> Tree state at wrap: **builds clean, `lipo` → `x86_64 arm64`, 235 tests pass.**
+> `env.py` unchanged this session, so `mutate.py`'s **46/46 killable** stands
+> without a re-run.
+>
+> Two loose ends from the interrupted refactor, both small and both real:
+> - `viewport.cpp:451` memcpy's a `CCNode` for a byte-comparison and warns
+>   (`-Wdynamic-class-memaccess`). It is diagnostic code added while checking
+>   whether `nodeToWorldTransform()` perturbs cocos caches. Harmless as a
+>   read-only compare; silence it with a `(void*)` cast or delete it.
+> - **The default-off guarantee was verified BEFORE that refactor, not after.**
+>   The probe measured 0 VIEWPORT lines and 3/3 baseline attempts at
+>   `maxX=3959.183837891`, but the file has changed since. Re-verify before
+>   trusting any run.
+>
+> Items 1, 2 and 3 are otherwise closed. Details below.
+>
+> **The headline: item 1 measured the real viewport and the sensor was 3.9× too
+> wide ahead, 3.75× too tall. No run before 2026-08-15 is a Benchmark A run.**
+> The window is now derived from the live camera rather than from three
+> constants. Item 2 shipped `docs/observation-contract.md`. Both spawned
+> follow-ons — **1b** (pin the aspect ratio), **1c** (what item 1 still did not
+> measure), **2b** (enforce the contract; it is currently held by nothing).
+>
+> **The project's priority has shifted from measurement to play.** The goal is
+> now an agent that clears Stereo Madness within budget, and the biggest gap is
+> that *there is no search driver at all* — the 12-jump best came from a human
+> hand-picking ticks. `trainer/sightread.py` (item 8 below) is the highest-value
+> item in this file.
+>
+> A **Benchmark B oracle track** opened 2026-08-15 alongside A (state
+> snapshot/restore, `GDRL_SNAPSHOT`). It is an oracle only — ground truth to
+> score A against, **a parameter and never a fork**, and its knowledge must not
+> be reachable from the A observation path. See "Open decisions → 0".
 
 
 **Re-scoped 2026-08-14 by the Benchmark A decision.** Items 1 and 2 did not exist
 before it and now outrank everything else: under A the sensor definition *is* the
 benchmark, and ours has never been justified.
 
-1. **Measure what is actually on screen** — the camera viewport in world units,
-   x and y, at 1x and at the other speed buckets. `GDRL_ENV_WIN_AHEAD` is
-   currently **1400** units, chosen for convenience before Benchmark A existed.
-   At 1x the player covers ~311.6 units/second, so 1400 ahead is ~4.5 seconds of
-   lookahead — **plausibly far more than the screen shows**, which would mean the
-   agent is already reading geometry the player cannot see. If so, every value
-   below the horizon needs re-deriving and any prior run is not a Benchmark A
-   run. Measure it; do not reason about it.
+1. ~~**Measure what is actually on screen**~~ — **MEASURED** 2026-08-15 with
+   `GDRL_PROBE_VIEWPORT` (`mod/src/viewport.cpp`, default off). Stereo Madness,
+   1x, zoom 1.0.
 
-2. **Rule on every field the agent receives.** Go through `GdrlObservation` and
-   `env.py`'s decode and classify each as legitimate under A, forbidden, or
-   needs-measurement — with a reason per field, not a blanket verdict. Known
-   hard cases: `levelLength` (a human sees the progress bar → probably fair),
-   whole-level `objectCount` (a human does not → probably not), `sectionColumns`,
-   and anything derived from `m_sections` outside the window. The output is a
-   written contract, and it should say what a *human player* can perceive, since
-   that is the standard A appeals to.
+   **The visible viewport is 569.0 × 320.0 world units**, player 36.8% across it.
+   Against the config — and note `_VERT` is a *half*-extent
+   (`telemetry.cpp:652-653`), so its overreach is larger than it looks:
+
+   | axis | configured | visible | overreach |
+   |---|---|---|---|
+   | ahead | 1400 | **359.5** | **3.9×** |
+   | behind | 400 | **209.5** | 1.9× |
+   | vertical | ±600 (1200 tall) | **320 tall** (+215 / −105) | **3.75×** |
+
+   **The suspicion is confirmed: no run to date is a Benchmark A run.** The real
+   lookahead is ~1.15 s at 1x, not ~4.5 s. The real vertical field is also
+   **asymmetric** where ours was symmetric — the player sits low on screen.
+
+   Believable because three *independent* sources agree on 569×320: the inverted
+   `m_objectLayer->nodeToWorldTransform()`, the design resolution, and GD's own
+   `m_cameraWidth/Height`. The probe also emits `pscr=` (the player mapped
+   *forward* into screen points) so a screenshot can falsify it without trusting
+   the mod.
+
+   **Ruling: the window is now camera-derived, not constant.** Retuning the three
+   numbers would have been wrong — zoom varies across levels and no constant
+   tracks it, and `kResolutionFixedHeight` means the visible *width* is a
+   function of the OS window's aspect ratio, so a constant is not imprecise but
+   *undefined*. `scanObjects()` should take the live camera rect each step;
+   `GDRL_ENV_WIN_*` survive as optional off-by-default overrides for ablations
+   and the B oracle.
+
+   **⚠ THE RULING IS NOT IMPLEMENTED.** The agent was stopped mid-refactor and
+   `telemetry.cpp` was never modified. `scanObjects()` still uses the constants,
+   so **the sensor is still 3.9× too wide as of this commit** and any run made
+   before the fix lands is still not a Benchmark A run. `viewport.hpp` exists to
+   expose `cameraWorldRect()` for exactly this call; the caller is missing. When
+   implementing, check the coverage-mask clamp at `telemetry.cpp:670` — a
+   569-wide window needs ~7 of the 64 columns, so a previously load-bearing
+   clamp goes slack, and TODO N2 records what happened last time that went
+   unnoticed. Also still UNVERIFIED, and now on the hot path rather than in a
+   probe: that `nodeToWorldTransform()`'s cocos cache recomputation cannot
+   perturb what is rendered.
+
+1b. **Pin the aspect ratio, or accept that runs are not comparable** (new,
+   created by item 1). Visible width follows window aspect. A camera-derived
+   sensor is *correct* at any aspect — a human in that window really does see
+   that much — but two runs at different aspects are not the same benchmark.
+   Nothing enforces it; `GDRL_WINDOWED` merely happens to keep ~16:9. Decide
+   between forcing a fixed design width and asserting the aspect at attempt
+   start.
+
+1c. **Still unmeasured after item 1**, and worth not forgetting: every speed
+   bucket other than 1x, every level other than Stereo Madness, anything past
+   tick 391, any non-16:9 aspect, any *varying* zoom (this run held 1.0
+   throughout), and any nonzero camera angle — the four-corner bounding path is
+   untested against a rotated camera. The probe measures **geometry, not
+   perceptibility**: fades, effects and draw order are not modelled, so the rect
+   is an upper bound on what a human sees. Also UNVERIFIED and now on the hot
+   path: that `nodeToWorldTransform()`'s cocos cache recomputation cannot perturb
+   what is rendered.
+
+2. ~~**Rule on every field the agent receives.**~~ — **DONE** 2026-08-15.
+   `docs/observation-contract.md`. Every wire field ruled ALLOWED / FORBIDDEN /
+   NEEDS-MEASUREMENT against what a human player can perceive, on two axes
+   (verdict, and audience: POLICY vs EXPERIMENTER) plus an enforcement tier
+   (MOD / PYTHON / **DOC**).
+
+   The predicted hard cases resolved as guessed — `levelLength` **allowed** (the
+   progress bar gives `playerX / levelLength` directly), whole-level
+   `objectCountTotal` **forbidden for the policy** but kept as the run gate. Four
+   rulings were *not* predicted and they change what gets built:
+
+   - **`groups[]` is FORBIDDEN for the policy.** Group membership is invisible on
+     screen; its only use is predicting which objects a trigger will move. Narrow
+     exception for attributing an *already-observed* motion.
+   - **`commands[]` should never be populated for the agent.** The struct carries
+     the *script* (`duration`, `actionValue1/2`, easing), not the motion — a
+     block's entire future before it happens. The `GJEffectManager` container
+     hunt that has blocked it is moot for the agent; if ever populated it is
+     EXPERIMENTER-only, to *score* projection, never to feed it.
+   - **`pending[]` must never be populated at all.** Benchmark A's own definition
+     names it: "cannot inspect future trigger states that have not occurred."
+     `PENDING_UNAVAILABLE` is now **permanent by policy, not blocked by
+     engineering** — nobody should finish the trigger-objectID → kind mapping
+     expecting to fill this table.
+   - **`speedSegs[]` legitimacy attaches to the collection site**, not the
+     struct: window-limited is allowed, whole-level is forbidden, and `startX` +
+     `bucket` looks identical either way. Whoever populates it (item 6) must
+     window-limit exactly as `scanObjects()` does and say so at the call site.
+
+   And one that bounds a future claim rather than changing code: **`isHazard` is
+   a granted prior, not a learned fact** — a deliberate concession, argued in the
+   doc rather than asserted. Any result resting on the agent having *discovered*
+   what kills it is invalid under the contract as written.
+
+   **The gap the contract names about itself:** rulings 1–4 are tier **DOC** —
+   held by nothing. The mod still emits `objectCountTotal` and `groups[]`, and
+   `env.py` still hands the whole record over. A policy-facing view that
+   structurally withholds the FORBIDDEN fields (the way `KnownMask` already
+   withholds a refused mask) is the follow-on task; until it exists the contract
+   is an intention, not a constraint. Also unaudited: whether `env.py`'s derived
+   accessors leak, since a combination of allowed fields is not automatically
+   allowed.
+
+2b. **Enforce the contract structurally** (new, created by item 2). Build the
+   policy-facing view; move rulings 1–4 from tier DOC to tier PYTHON or MOD.
+   Audit `level_length_agrees_with_section_count()` and `column_span()` for
+   combination leaks. Mutation-grade whatever lands.
 
 3. ~~**Delete `publish()`'s copy of the right-edge back-off**~~ — **DONE**
    2026-08-14. Block removed from `publish()`, mutant `D8` retired with a note
@@ -1474,6 +1609,72 @@ benchmark, and ours has never been justified.
    lookahead* rather than units, it changes per bucket.
 
 7. Then Track 0.2 (predictor spec + test-tier audit), and only then Track 4.
+
+8. **`trainer/sightread.py` — the A-legal search driver. HIGHEST VALUE IN THIS
+   FILE.** Opened 2026-08-15 when the project's goal shifted from measuring the
+   environment to clearing a level with it.
+
+   **There is no search driver.** The 12-jump / `maxX=3959.183837891` / ~14.8%
+   best on record came from a human hand-picking tick numbers and feeding them
+   through `GDRL_INJECT_SEQ`. Nothing in this repo chooses an action.
+
+   Acceptance criterion, deliberately falsifiable: **autonomously reach or beat
+   `maxX=3959.183837891` from zero hardcoded tick numbers**, reporting the
+   attempt count it took — *including every failed probe*. An attempt count that
+   quietly excludes exploration is the Benchmark B number wearing an A label.
+
+   Design points that decide whether it works:
+
+   - **Replaying a known-good prefix is A-legal**, and must be, or the search is
+     impossible. A human replays from the start every attempt; only the tail past
+     their best is uncertain. Determinism makes the prefix reproducible. What is
+     forbidden is rewinding *without paying for the replay* — that is B.
+   - **Backtracking is the whole task.** The old greedy approach stalls on
+     coordinated jumps, where the right action at decision *n* only pays off
+     given a specific choice at *n−1*. A driver that only pushes the frontier
+     forward will reproduce that stall exactly.
+   - **The action space is intervals, not points** — see the HOLD note below.
+   - **Episodic memory is the main information source, not a nice-to-have.** With
+     the horizon now measured at ~277 ticks, the driver cannot see what killed it
+     until it is nearly on top of it. What it remembers from last attempt is most
+     of what it knows. Objective D is load-bearing in the strongest sense.
+   - **A-legality must be structural**, not remembered: route observation reads
+     through one accessor layer that *cannot* return the contract's FORBIDDEN
+     fields (`objectCountTotal`, `groups[]`). Copy `KnownMask`'s posture — refuse
+     rather than return something misleading. This discharges part of 2b.
+   - **Measure env-loop throughput before building on it.** Stereo Madness is
+     ~20,600 ticks; a per-tick Python round trip against `GDRL_ENV_WAIT_US`
+     (250 ms) may be far too slow for thousands of attempts. Hybrid fallback:
+     committed prefix mod-side via `GDRL_INJECT_SEQ`, env loop only near the
+     frontier. The ~3.9 attempts/sec on record came from a different path.
+
+### Holding the jump button auto-repeats — the action space is intervals
+
+Recorded 2026-08-15 (from Rex; **confirm by measurement before relying on it**,
+per this repo's standing rule). **Holding jump makes the cube jump again each
+time it lands.** A held input is a *chain* of jumps, not one jump, and large
+stretches of GD levels are cleared by simply holding through them. This is
+standard play.
+
+Two consequences, both load-bearing for item 8:
+
+- **Model actions as intervals (start tick, release tick), not as taps.** Tap
+  modelling searches a combinatorial space of individual jump ticks — roughly
+  what the hand-tuned 12-jump sequence was. With holds, whole sections collapse
+  to two tolerant parameters.
+- **It may explain the "coordinated jumps" stall.** A run of jumps that appears
+  to need several precisely-coordinated taps may be one hold with forgiving start
+  and end ticks. Worth testing directly; it is a far easier target.
+
+The transport already supports this end to end — `GdrlAction.holdTicks`, expanded
+into push/release at `telemetry.cpp:456`, and `GDRL_INJECT_SEQ`'s `tick:hold`
+syntax at `experiments.cpp:180`. **No mod work needed.**
+
+Open and unmeasured: whether the re-jump fires on the landing tick or some ticks
+after (exactly what a search would exploit); whether holding through a **ring/orb**
+activates it or a discrete tap is required; and what a held input means in the
+**ship** section, where control is continuous altitude rather than auto-repeat —
+the action representation has to survive that change of meaning at the portal.
 
 **A standing item, not a task:** `python3 trainer/mutate.py` should be re-run
 after any change to `env.py`, and its result quoted rather than "tests pass".
@@ -1619,6 +1820,69 @@ and the only real unknown is throughput.
   **oracle**: B's solved trajectories are the ground truth needed to *score* A
   and to generate training targets. B is the teacher and the upper bound, A is
   the claim. Keep it as a parameter, never a fork.
+
+  **Opened 2026-08-15 as a parallel track**, on that footing exactly. First
+  deliverable is the foundation everything else in B needs: **state snapshot and
+  restore** (`GDRL_SNAPSHOT`) — capture the physics-relevant state at tick N, run
+  forward, rewind, try a different action. Without it there are no hidden
+  rollouts, only real attempts.
+
+  Two design constraints that are not negotiable and were stated at dispatch:
+
+  1. **A parameter, never a fork.** No B copy of `trainer/` or `mod/src/`. If a
+     file is being duplicated, the design is wrong.
+  2. **The oracle's knowledge must be unreachable from A's observation path.** If
+     B knows a branch dies at tick 4000, that fact must not be able to travel to
+     the A policy by any route. Nothing B builds may feed `GdrlObservation` or
+     `env.py`'s decode.
+
+  The acceptance test is unusually strong here and should not be softened:
+  **snapshot at N, run to M, restore to N, run to M again — bit-identical, tick
+  for tick.** Determinism is already proven (~550 null-input attempts, 1473 with
+  input, zero divergent), so any divergence is a field the snapshot failed to
+  capture, and the first divergent tick names the subsystem. An almost-correct
+  snapshot is worse than none: it yields rollouts that silently diverge, which
+  makes the oracle produce wrong ground truth — and wrong ground truth would
+  corrupt the A scores it exists to provide.
+
+  **Deferred 2026-08-15, same day, when the project reprioritised toward playing
+  a level.** No snapshot code was ever written. But the layout research that ran
+  first produced `docs/snapshot-notes.md`, and it changes how this should be
+  resumed:
+
+  **GD already contains a complete state snapshot and nobody here had looked at
+  it.** Practice mode must do exactly this job. `PlayerCheckpoint` declares
+  **185 members** — RobTop's own answer to "which `PlayerObject` fields are
+  physics-relevant", including a tail a hand-built list would have missed:
+  collision history (`m_lastCollisionTop/Bottom/Left/Right`), and consumed
+  ring/pad sets (`m_touchedRings`, `m_ringRelatedSet`, `m_touchedPad`). That tail
+  *is* the almost-correct failure mode made concrete — a position-and-velocity
+  snapshot restores a player who can spend a ring they already used.
+  `CheckpointObject` carries `GJGameState` by value plus `EffectManagerState`,
+  and `createCheckpoint` / `loadFromCheckpoint` are live in the binary
+  (bl-counted against `otool -tV`, and they nest).
+
+  **So the first move on resume is to call GD's own checkpoint functions and run
+  the divergence test — not to hand-build a 500-field capture.** Either it comes
+  back bit-identical and the problem evaporates, or the first divergent field
+  yields a small, evidenced patch list.
+
+  Suspected gaps in GD's own snapshot, each a candidate first-divergence:
+  `m_attemptTime` is **not** in `CheckpointObject` (this promotes backlog item 8),
+  nor are `m_extraDelta`, the RNG seeds, `m_queuedButtons`, or the section grid —
+  where any copy-assign shares the buckets.
+
+  Two independent corroborations fell out of it: `SavedObjectStateRef` stores
+  position **doubles** rather than the CCNode position, confirming the move-pipeline
+  finding from GD's own save path; and `EffectManagerState::m_vectorGroupCommandObject2`
+  being a `vector<GroupCommandObject2>` corroborates the `m_unkVector560`
+  identification — which is the container the `commands[]` table was blocked on.
+  (That table is now forbidden to the policy anyway; this matters only for the
+  oracle.)
+
+  **Evidence tier: (h) headers and (d) disassembly. The game was run zero times.**
+  "GD contains a complete state snapshot" is a claim about what the struct
+  *declares*, not about what restoring it *does*.
 - **Objectives D (in-context failure memory) and E (uncertainty policy) are now
   load-bearing**, not nice-to-haves. Under B you re-search; under A, memory of
   your own deaths and calibrated knowledge of what you cannot see *are* the

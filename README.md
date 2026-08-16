@@ -737,7 +737,7 @@ struct GdrlSpeedSegment {        // one speed portal boundary ahead
 **Do not** design around hooking `GJBaseGameLayer::processCommands` (0
 references of any kind) or resampling in `update` (per frame, not per step).
 
-## The observation window is now the sensor definition, and it is UNVERIFIED
+## The observation window is the sensor definition, and it was 3.9× too wide
 
 **Project decision, 2026-08-14: gd-rl targets Benchmark A — true sightreading.**
 The agent may receive only what it could legitimately observe: no geometry beyond
@@ -750,14 +750,71 @@ The consequence for anyone reading this file: **`GDRL_ENV_WIN_BEHIND`,
 `400` / `1400` / `600`) are no longer performance knobs.** They define what the
 agent is allowed to perceive, and therefore they are part of the benchmark.
 
-**Those three numbers have never been checked against what is actually on
-screen.** They were chosen for convenience long before this decision existed. At
-1x the player advances ~311.6 units/second, so `_AHEAD = 1400` is roughly **4.5
-seconds** of lookahead, which is plausibly well beyond the visible viewport — and
-if it is, the observation has been handing the agent off-screen geometry, and no
-run so far qualifies as a Benchmark A run. **This is a suspicion, not a
-measurement**; it is stated here so nobody treats the current values as
-justified. Measuring the real viewport is queue item 1.
+### Measured 2026-08-15: the sensor was seeing several times the screen
+
+Those three numbers had never been checked against what is actually on screen.
+They have now been, with `GDRL_PROBE_VIEWPORT` (`mod/src/viewport.cpp`), on
+Stereo Madness at 1x and zoom 1.0.
+
+| axis | configured | actually visible | overreach |
+|---|---|---|---|
+| ahead of player | 1400 | **359.5** | **3.9×** |
+| behind player | 400 | **209.5** | 1.9× |
+| vertical | ±600 (1200 tall) | **320 tall** (+215 up, −105 down) | **3.75×** |
+
+The visible viewport is **569.0 × 320.0 world units**, with the player **36.8%
+across** it. Note `GDRL_ENV_WIN_VERT` is a *half*-extent (`telemetry.cpp:652-653`),
+which is why the vertical overreach is larger than it first looks — and the real
+viewport is **asymmetric** about the player, where ours was symmetric. The player
+sits low on screen, which is what one would expect of a game about ground.
+
+**The conclusion the previous version of this section called a suspicion is now a
+measurement: no run to date is a Benchmark A run.** 359.5 units at ~311.6
+units/second is **~1.15 seconds** of lookahead, not the ~4.5 the old config
+implied.
+
+Why the number is believable: three *independent* sources agree on 569.0 × 320.0
+— the inverted `m_objectLayer->nodeToWorldTransform()`, the view's design
+resolution, and GD's own `m_cameraWidth`/`m_cameraHeight`. Those are not the same
+computation, so the agreement is a check rather than self-consistency. The probe
+also emits `pscr=`, the player mapped *forward* through the same transform into
+screen points, so the claim can be falsified from a screenshot without trusting
+the mod at all.
+
+### The horizon is now derived from the camera, not from constants
+
+Retuning the three constants to the measured values would have been the wrong
+fix, for two reasons the measurement itself exposes:
+
+- **Zoom.** GD changes camera zoom during and across levels, and a zoomed-out
+  camera genuinely shows more. No constant can track that. (This run happened to
+  hold `zoom=1.0` throughout, so a varying-zoom case remains **unobserved**.)
+- **`kResolutionFixedHeight`.** The design *height* is fixed at 320 units; the
+  design *width* is recomputed from the OS window's aspect ratio. So the
+  horizontal horizon is not merely imprecise as a constant — it is *undefined*
+  until the launch configuration is fixed. The probe crossed two window sizes
+  (960×540 and 396×223 under `GDRL_WINDOWED`) and both yielded 569, matching
+  cocos's formula to the unit.
+
+So `scanObjects()` takes its window from the **live camera rect each step**, and
+`GDRL_ENV_WIN_*` survive only as optional, off-by-default overrides — useful for
+deliberately widening the sensor in an ablation, or for the B oracle. The sensor
+horizon is thereby self-maintaining under zoom, and stops depending on three
+numbers nobody could justify.
+
+**Open, and it affects the benchmark's definition rather than its
+implementation:** because visible width follows the window's aspect ratio, two
+runs at different aspect ratios are not strictly the same benchmark. A
+camera-derived sensor is *correct* in both — a human in that window really does
+see that much — but the results are not comparable unless the aspect is pinned.
+Nothing enforces it today; `GDRL_WINDOWED` happens to keep ~16:9.
+
+**Not measured:** any speed bucket other than 1x, any level other than Stereo
+Madness, anything past tick 391 (input was blocked, so the player died at ~1.6 s),
+any non-16:9 aspect, any varying zoom, and any nonzero camera angle — the
+four-corner bounding path is untested against a rotated camera. The probe also
+measures **geometry, not perceptibility**: fades, effects and draw order are not
+modelled, so the rect is an upper bound on what a human actually sees.
 
 Two things already established reach backwards under this decision:
 
@@ -771,6 +828,41 @@ Two things already established reach backwards under this decision:
 Enforcement belongs in `scanObjects`, in the mod — never in Python and never by
 asking a policy to ignore what it was handed. An agent trusted to discard
 information it received is not a benchmark.
+
+### The per-field ruling: `docs/observation-contract.md`
+
+Added 2026-08-15. The window is only half the question — it bounds *where* the
+agent may look, not *what* it is told about what it finds there. The contract
+rules on every field of `GdrlObservation` individually, against one standard: **a
+human player at a keyboard**, who sees the screen, hears the music, reads the
+progress bar, and remembers previous attempts.
+
+Two axes, deliberately kept apart. A **verdict** (ALLOWED / FORBIDDEN /
+NEEDS-MEASUREMENT) and an **audience** — `POLICY` vs `EXPERIMENTER`. Reading
+`objectCountTotal` to refuse a frame where the level never loaded is not
+cheating; it is deciding whether the *experiment* is valid, outside the agent's
+loop and never returned to it. That same field is forbidden to the policy, and
+those two facts are not in tension.
+
+What the contract establishes that was not obvious going in:
+
+- **`pending[]` may never be populated.** Benchmark A's definition names this
+  table almost field for field — `activationX` is where a trigger *will* fire.
+  `PENDING_UNAVAILABLE` is now permanent by policy, not blocked by engineering.
+- **`commands[]` carries the script, not the motion.** `duration`,
+  `actionValue1/2` and the easing terms are a block's entire future before it
+  happens; a human sees position and infers velocity. Forbidden as specified —
+  which retires, for the agent's purposes, the `GJEffectManager` container hunt
+  that has blocked that table.
+- **`groups[]` is invisible on screen** and forbidden to the policy, with a
+  narrow exception for attributing an already-observed motion.
+- **`isHazard` is a granted prior, not a learned fact** — a concession the
+  contract argues for rather than assumes, and one that bounds what any future
+  result may claim the agent discovered.
+
+Read the "enforcement tier" column before relying on any of it. Most rulings are
+currently tier **DOC**: written down and held by nothing. The mod still emits the
+forbidden fields and `env.py` still hands the record over whole.
 
 ## The env is validated: defaults are clean and observation is passive
 
