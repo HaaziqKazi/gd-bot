@@ -3,8 +3,8 @@
 Single place for what is left. Companion to `README.md`, which records what has
 been **established**; this file records what has **not**.
 
-Status as of commit `8dd5ceb` + the 2026-08-13 (L) and 2026-08-14 (M) sessions
-below.
+Status as of commit `f3821a7` + the 2026-08-13 (L), 2026-08-14 (M/N) and
+2026-08-15 (O/P) sessions below.
 
 > **Read sections L and M first.** Between them they close I, J and K, harden
 > the observation decoder, and delete one loop that could never have done
@@ -60,7 +60,8 @@ decided yet.
 | In-context failure memory (Objective D) | **Nothing** |
 | Uncertainty policy (Objective E) | **Substrate only** (coverage mask + certainty channel) |
 | Reward function | **Does not exist** |
-| Search algorithm | **Hand-rolled greedy script** — stalls on coordinated jumps |
+| Search algorithm | **`trainer/sightread.py` built 2026-08-15** — best-first over hold *intervals*, real backtracking, A-legality enforced by construction. Solves a 7-hazard puppet level in 12 attempts. **Never run against GD**; acceptance criterion not met |
+| Env-loop throughput | **Measured (loopback)**: ~0.4 ms/round-trip empty, ~0.86 ms with 120 objects — Python is not the bottleneck. Stride-hybrid replay projected at ~1.8 s per 3048-tick attempt, **UNVERIFIED against the game** |
 | Policy / training loop | **Does not exist** |
 
 Deepest reach: 12 jumps, `maxX=3959.183837891`, `deathTick=3048`, ~14.8% of
@@ -1421,52 +1422,269 @@ actionable: delete the block.** Its mutant `D8` should then be removed too.
   2026-08-12 dump, via `MEASURED_*`); the arithmetic exercising them is ours.
 
 
+## Session 2026-08-15 (second) — the sensor became camera-derived, and a search driver exists
+
+Two implementer agents, run in parallel under the orchestrator split. Neither ran
+Geometry Dash. Everything below is code-and-fixture evidence — **tier (i)/(ii)** —
+and the honest summary is that the session converted unknowns into *testable*
+hypotheses rather than into measurements.
+
+Verified in the main thread rather than taken from the agents' reports: `geode
+build` green, `lipo -archs` → `x86_64 arm64`, `python3 -m pytest trainer/ -q` →
+**269 passed**, `python3 trainer/mutate.py` → **49 of 49 killable killed, 50 run**.
+
+### O. The camera-derived sensor (item 1's ruling, implemented)
+
+**First, the correction, because it is worth more than the feature.**
+`gdrl::cameraWorldRect()` was **declared and never defined**. The previous
+session's wrap-up box, and the task brief written from it, both asserted it was
+"already implemented in `viewport.cpp`". It was not; the tree built because
+nothing called it. Likewise `readWorldTransformNeutrally()` — the state-neutral
+transform reader `viewport.hpp` devotes a paragraph to — was **dead code**;
+`sampleViewport()` called `nodeToWorldTransform()` directly, so the 2026-08-15
+viewport numbers were taken through the non-neutral path and `GDRL_VERIFY_XFORM`
+had never verified the path it was written for.
+
+*The measurements survive — it was a probe, and perturbation there is harmless.
+The safety argument does not: it was documented where it was not applied.* The
+generalisable lesson, and it is this repo's recurring one wearing yet another
+costume: **a header's prose describes intent, and intent is not implementation.**
+`grep` for the definition, not the declaration.
+
+What now exists:
+
+- **`cameraWorldRect()` implemented** (`viewport.cpp`), taking `GJBaseGameLayer*`
+  — no `PlayLayer::get()` on the hot path — and routed through
+  `readWorldTransformNeutrally()`, which now has a caller. It never logs and
+  never touches the probe's accumulators, so probe and observation path cannot
+  perturb each other's numbers.
+- **`scanObjects()` uses it every physics step.** The window is the live camera
+  rect (~569 × 320 at zoom 1), not `px ± 400/1400/600`.
+- **`rotated` refuses; `sizeMismatch` warns.** The asymmetry is deliberate. A
+  rotated camera makes the four-corner rect a *bounding box*, which **overstates**
+  what is visible — lookahead the player does not have, so the scan refuses.
+  `sizeMismatch` is a failed cross-check against `m_cameraWidth/Height`, but the
+  rect is still correct-by-construction under zoom, so it is used and warned
+  about. `rotated` is OR'd from two independent witnesses (`m_cameraAngle`, and
+  the transform's off-diagonal shear); if they disagree, one of them is not
+  describing the render transform, which is itself worth reporting.
+- **`valid == false` claims nothing.** Extracted into `refuseScan()`, shared with
+  the bad-`m_sectionXFactor` path so both refusals emit a byte-identical frame.
+  No fallback to the old constants, ever — matching the posture of the deleted
+  `: 100.f` default.
+- **`GDRL_ENV_WIN_*` are now per-axis, detected by presence rather than value**,
+  with the `envInt` fallback changed to `0` so a stale 400 cannot be resurrected
+  by a later refactor. Setting one warns, once, that the run is not Benchmark A.
+  `_VERT` remains a **half**-extent; old ablation command lines still mean what
+  they meant.
+- **The coverage clamp stays and now reports when it binds.** ~7 of 64 columns
+  are needed at 569 units, so it is slack on Stereo Madness at zoom 1 — but
+  `secW` is *read from the game*, and a finer grid or a zoomed-out camera needs
+  more. Binding now means the sensor is being silently narrowed below the screen,
+  so it warns with columns-wanted vs columns-held. (N2 is why this is not left
+  silent.)
+- **Python needed no decoder change** — `known_mask()` has only ever read the
+  four window bounds off the header, so an asymmetric window already worked. What
+  was wrong was the *naming*: `MOD_WIN_*` invited reading 400/1400/600 as the
+  mod's window and is now `FIXTURE_WIN_*`, with `MEASURED_CAM_*` added as a
+  record of the probe numbers and explicitly not a definition.
+
+**The guarantee, stated precisely.** "`GDRL_*` unset == unmodded run" is
+**untouched**: `cameraWorldRect` has exactly one caller, inside the `g_envOn`
+gate. "`GDRL_ENV=1` perturbs nothing" is **weakened** — under `GDRL_ENV` the scan
+now additionally walks the object layer's parent chain once per physics step.
+That claim was already UNVERIFIED (item 4); it is now UNVERIFIED **(7)**, with
+the `GDRL_VERIFY_XFORM` run that would settle it named in the file header.
+
+**Not verified, and this list is the point of the section:**
+
+- That the sensor is correct live. **No attempt was run.** The stale default-off
+  byte-identity check is now staler, not fresher.
+- Every viewport number (569.0 × 320.0, 359.5/209.5, +215/−105, 6146/6146
+  samples) is **inherited from the earlier probe log**. The implementing agent
+  measured none of them and did not open the log.
+- That `nodeToWorldTransform()`'s cache write cannot perturb rendering. Restored
+  by construction; never measured; **now on the hot path.**
+- The 1e-4° / 1e-6 rotation thresholds are reasoned from the float noise floor,
+  not measured, and `m_cameraAngle` has never been observed nonzero — so the
+  refusal branch is untested against anything. **If any part of Stereo Madness
+  rotates the camera, the agent goes blind there by design.** Nobody has checked
+  whether it does. This is the highest-risk unknown in section O.
+- Per-step cost of the transform walk. Not measured.
+- **UNVERIFIED (8), introduced deliberately:** object membership is a *centre*
+  test against the window. At ±600 the slack was irrelevant; at +215/−105 an
+  object whose centre is up to half its height outside is dropped while part of
+  it is on screen. It **understates**, which is safe under A, but has never been
+  counted. Rect-overlap was rejected for now because it would report objects
+  outside the advertised window while Python intersects the object list *with*
+  that window — changing both descriptions at once is how they drift apart.
+
+### P. `trainer/sightread.py` — the A-legal search driver
+
+**The throughput measurement, which is the most decision-relevant result of the
+session.** Loopback only, this machine:
+
+| GIL switch interval | objects | stride 1 | stride 64 |
+|---|---|---|---|
+| 0.005 (default) | 0 | 155 rt/s | 157 rt/s |
+| 0.00005 | 0 | **2,524 rt/s** | 2,531 rt/s |
+| 0.00005 | 120 | **1,165 rt/s** | 1,217 rt/s |
+
+**Python is not the bottleneck; the game is.** Decode+respond costs ~0.4 ms
+empty, ~0.86 ms with 120 objects, and is flat in the stride.
+
+Two measurement artifacts had to be removed first, and **either one alone gives a
+confident wrong answer** — worth remembering next time this is re-measured:
+
+- **The 155/s figure is the GIL, not the protocol.** `1/0.0065 s` ≈ the 5 ms
+  switch interval. The loopback writer is a *thread*; against the mod it is
+  another process and this does not apply. Re-measuring on the loopback without
+  sweeping `setswitchinterval` concludes the transport is 16× slower than it is.
+- `SyntheticGame._accumulated_attempt_time` is O(tick) **per publish**, a Python
+  loop, and dominates everything at large strides. Fixture cost, not protocol
+  cost — the mod gets `m_attemptTime` free.
+
+**The consequence for a full clear.** Against README's game-attached figures
+(~500 rt/s; 5.5 s per 3054-tick attempt with telemetry vs 3.4 s without), the
+naive per-tick loop costs ~5.5 s/attempt at the current frontier — ~650
+attempts/hour, and nearly all of it buys observations of a prefix whose outcome
+is already known. The **stride hybrid needs no mod work**: `advanceSteps` is an
+observation stride, and the mod fires scheduled inputs on every physics step
+regardless (`telemetry.cpp:1064`), so a committed prefix replays in a handful of
+round trips and the loop drops to stride 1 only near the frontier. The
+per-attempt floor becomes the game's own replay speed,
+`prefix_ticks / (GDRL_ENV_DELTA_TICKS × 60fps) + reset`, ≈ **1.8 s for a
+3048-tick prefix at `DELTA_TICKS=32`** — ~2000 attempts/hour. **That last figure
+is arithmetic over recorded numbers, UNVERIFIED against the game.**
+
+**What is real in the driver:** the A-legal accessor (`Sight` copies the allowed
+fields and **drops the record** — there is no `.header` to reach through;
+`groups` / `objectCountTotal` / `commands` / `pending` / `speedSegs` raise
+`ForbiddenField` carrying the contract's reason, and the objects array's dtype
+physically lacks `groups`/`groupCount`). The interval action space
+(`Interval`/`Plan`), which **refuses overlapping holds** because two overlapping
+HOLDs expand to push,push,release,release and the *first* release ends the chain.
+`AttemptLedger`, which has no decrement, is opened before the first action
+reaches the wire, and is audited against the game's own attempt field. `Runner`
+with the stride hybrid. `Sightreader`, a best-first search whose priority is
+`subtree_best_x − patience·attempts_at_node`, which is the term that makes
+ancestors resurface instead of the frontier running away.
+
+Against the puppet: a 7-hazard level solved in **12 attempts with 4 nodes having
+more than one child** — genuine backtracking, clean ledger audit. Bounds are read
+from the observation header only, so it is already correct under section O's
+window.
+
+**Corrections to the docs, found by building against them:**
+
+- **`header.attempt` is an attempt *id*, not a count.** Playing ids 7–10 is four
+  attempts and a difference of three, and the last is not reset while you are
+  still in it. The first audit reported an unexplained off-by-one on every clean
+  run — which is precisely how a real discrepancy gets trained out of a reader.
+  Count is `last − first + 1`, minus one if the game has begun an attempt nobody
+  used. **Anyone counting attempts from this field needs the same correction.**
+- **A design defect worth recording, because it is the old greedy stall in a new
+  costume.** A node whose last hold is still down when the attempt ends has no
+  room to append. The first version happily proposed intervals *after* the death,
+  growing plans into the far future forever — every probe scoring identically
+  while the priority kept re-picking that node. **It looked like a search and was
+  a loop.** The fix: such a node yields nothing and goes exhausted, because *the
+  backtrack is the correct response to "there is nothing left to append".*
+- README's "~3.9 attempts/sec came from a different path" is right and
+  load-bearing: that was a 391-tick attempt with no env loop, and it does not
+  carry to a 3048-tick prefix.
+
+**Not verified:**
+
+- **Hold auto-repeat — the whole interval design is a bet on it.** The puppet was
+  *written* to auto-repeat, so the test that a cluster no single hop clears is
+  crossed by one interval is **circular as evidence about GD**, and says so in
+  its docstring. The first live run is the measurement.
+- Replay determinism under the stride hybrid; that a large `advanceSteps` is safe
+  across a death; that the level-complete screen is distinguishable from a
+  stalled publisher (**it currently is not, and the driver says so rather than
+  guessing**).
+- The candidate *ordering* is a heuristic prior (jump starts ~half a hop before
+  the death tick), unmeasured; only one candidate is shaped by the sensor.
+  `FALLBACK_AIRTIME_TICKS=60` / `FALLBACK_HORIZON_TICKS=240` are used only until
+  the calibration attempt measures them and are labelled UNVERIFIED.
+- Solvability of the puppet measures the search against a level chosen to suit
+  it.
+
+**Grading caution for whoever runs it:** the driver reports **observed max x**,
+sampled from the frames it was given — a *different instrument* from the mod's
+per-attempt `maxX` log line that produced `3959.183837891`. At stride 1 they can
+differ by one tick of travel (~1.30 units); outside the watch window, by a whole
+stride. **Grade against the mod's log line.**
+
 ### Queue for next session, in order
 
-> **RESUME HERE — 2026-08-15 wrap-up. Read this box before anything else.**
+> **RESUME HERE — 2026-08-15 (second wrap). Read this box before anything else.**
 >
-> **Start with queue item 8 (`trainer/sightread.py`). It does not exist.** The
-> agent was stopped at "I'll start by reading the required documents" and wrote
-> nothing; `trainer/` is untouched this session. Start from scratch — nothing is
-> half-done. Item 8 carries the full spec.
+> **THE NEXT SESSION'S GOAL, set by Rex: an agent that plays Stereo Madness all
+> the way through.** Everything below is ordered to serve that and nothing else.
 >
-> **Then finish item 1's ruling, which is NOT implemented.** The viewport was
-> measured and the ruling was made — the window must become camera-derived — but
-> the agent was stopped mid-refactor and **`telemetry.cpp` was never touched**.
-> `scanObjects()` still uses the old constants, so *the sensor is still 3.9× too
-> wide right now*. What did land: `mod/src/viewport.cpp` + `viewport.hpp` (probe
-> V, `GDRL_PROBE_VIEWPORT`, default off), wired into `mod/CMakeLists.txt`. The
-> `viewport.hpp` extraction exists so `telemetry.cpp` can call
-> `cameraWorldRect()`; the caller was never written.
+> **The single most valuable thing you can do first is RUN THE GAME.** Both of
+> this session's deliverables — the camera-derived sensor and the search driver —
+> are complete, green and **have never been run against Geometry Dash**. Between
+> them they carry six live hypotheses that one afternoon of running settles and
+> no amount of further coding does. Do not write more code before this.
 >
-> Tree state at wrap: **builds clean, `lipo` → `x86_64 arm64`, 235 tests pass.**
-> `env.py` unchanged this session, so `mutate.py`'s **46/46 killable** stands
-> without a re-run.
+> The first live run must measure, in this order:
+> 1. **Does holding jump auto-repeat, and on which tick after landing?** The
+>    entire interval action space is a bet on this. The toy level was *written*
+>    to auto-repeat, so every passing test about it is circular as evidence about
+>    GD and says so in its own docstring.
+> 2. **Re-verify the default-off byte-identity guarantee.** It was last checked
+>    before two large refactors of `telemetry.cpp` and `viewport.cpp`. It is now
+>    stale twice over. Baseline to reproduce: 3/3 attempts at
+>    `maxX=3959.183837891`, 0 VIEWPORT lines with no `GDRL_*` set.
+> 3. **Is replay deterministic under the stride hybrid?** The driver's whole
+>    throughput argument rests on replaying a committed prefix at
+>    `GDRL_ENV_DELTA_TICKS=32` and getting the same trajectory as at stride 1.
+>    Untested. If it is false the search cost model collapses.
+> 4. **Does the camera-derived window behave live?** Sensor width should be
+>    ~569 units, not 1800. Watch for the new one-time warnings (coverage clamp
+>    binding, `sizeMismatch`) and for the `rotated` refusal — if any part of
+>    Stereo Madness rotates the camera the agent goes **blind** there by design,
+>    and nobody has checked whether it does.
+> 5. **Then, and only then, run the driver for real.** Acceptance criterion:
+>    autonomously reach or beat `maxX=3959.183837891` with zero hardcoded tick
+>    numbers, reporting every attempt including failed probes.
 >
-> Two loose ends from the interrupted refactor, both small and both real:
-> - `viewport.cpp:451` memcpy's a `CCNode` for a byte-comparison and warns
->   (`-Wdynamic-class-memaccess`). It is diagnostic code added while checking
->   whether `nodeToWorldTransform()` perturbs cocos caches. Harmless as a
->   read-only compare; silence it with a `(void*)` cast or delete it.
-> - **The default-off guarantee was verified BEFORE that refactor, not after.**
->   The probe measured 0 VIEWPORT lines and 3/3 baseline attempts at
->   `maxX=3959.183837891`, but the file has changed since. Re-verify before
->   trusting any run.
+> Tree state at wrap: **builds clean, `lipo` → `x86_64 arm64`, 269 tests pass,
+> `mutate.py` 49 of 49 killable killed** (all three verified in the main thread,
+> not taken from an agent's report).
 >
-> Items 1, 2 and 3 are otherwise closed. Details below.
+> **Two claims in the PREVIOUS version of this box were false**, and the way they
+> were false is the reusable lesson:
+> - It said `viewport.hpp` "exists so `telemetry.cpp` can call
+>   `cameraWorldRect()`". **`cameraWorldRect()` had no implementation at all** —
+>   declared at `viewport.hpp:83`, defined nowhere. The tree built only because
+>   nothing called it. A header carrying 80 lines of confident prose about how a
+>   function behaves is not evidence the function exists.
+> - `readWorldTransformNeutrally()`, the state-neutral reader that header
+>   promises the observation path uses, was **dead code with no caller**.
+>   `sampleViewport()` called `nodeToWorldTransform()` directly. So the
+>   2026-08-15 viewport measurements were taken through the *non*-neutral path,
+>   and `GDRL_VERIFY_XFORM` had never verified anything on the path it was
+>   written for. The measurements stand (it was a probe); the safety argument did
+>   not apply where it was claimed to.
 >
-> **The headline: item 1 measured the real viewport and the sensor was 3.9× too
-> wide ahead, 3.75× too tall. No run before 2026-08-15 is a Benchmark A run.**
-> The window is now derived from the live camera rather than from three
-> constants. Item 2 shipped `docs/observation-contract.md`. Both spawned
-> follow-ons — **1b** (pin the aspect ratio), **1c** (what item 1 still did not
-> measure), **2b** (enforce the contract; it is currently held by nothing).
+> Both are now really implemented and really wired in. See sections O and P.
 >
-> **The project's priority has shifted from measurement to play.** The goal is
-> now an agent that clears Stereo Madness within budget, and the biggest gap is
-> that *there is no search driver at all* — the 12-jump best came from a human
-> hand-picking ticks. `trainer/sightread.py` (item 8 below) is the highest-value
-> item in this file.
+> **Throughput is the binding constraint on a full clear, not intelligence.**
+> Measured this session: Python decode+respond is ~0.4 ms empty / ~0.86 ms with
+> 120 objects — **Python is not the bottleneck, the game is.** A full Stereo
+> Madness attempt is ~20,600 ticks (~86 s of game time), and under Benchmark A a
+> search must **replay the prefix every attempt** — rewinding without paying for
+> the replay is Benchmark B by definition. So attempt cost grows with depth. The
+> stride hybrid is the answer and needs no mod work; see section P.
+>
+> Still open and now urgent: **1b** is RULED but not implemented (pin the window
+> size, not the design width — see item 1b), **2b** (enforce the contract; the
+> driver's `Sight` layer discharges part of it for the driver only, nothing else),
+> **1c** (what item 1 still did not measure).
 >
 > A **Benchmark B oracle track** opened 2026-08-15 alongside A (state
 > snapshot/restore, `GDRL_SNAPSHOT`). It is an oracle only — ground truth to
@@ -1510,25 +1728,49 @@ benchmark, and ours has never been justified.
    `GDRL_ENV_WIN_*` survive as optional off-by-default overrides for ablations
    and the B oracle.
 
-   **⚠ THE RULING IS NOT IMPLEMENTED.** The agent was stopped mid-refactor and
-   `telemetry.cpp` was never modified. `scanObjects()` still uses the constants,
-   so **the sensor is still 3.9× too wide as of this commit** and any run made
-   before the fix lands is still not a Benchmark A run. `viewport.hpp` exists to
-   expose `cameraWorldRect()` for exactly this call; the caller is missing. When
-   implementing, check the coverage-mask clamp at `telemetry.cpp:670` — a
-   569-wide window needs ~7 of the 64 columns, so a previously load-bearing
-   clamp goes slack, and TODO N2 records what happened last time that went
-   unnoticed. Also still UNVERIFIED, and now on the hot path rather than in a
-   probe: that `nodeToWorldTransform()`'s cocos cache recomputation cannot
-   perturb what is rendered.
+   **THE RULING IS NOW IMPLEMENTED** (2026-08-15, second session). See section O
+   for what landed and what it cost. In one line: `scanObjects()` takes
+   `gdrl::cameraWorldRect()` each step, refuses rather than falls back, and
+   `GDRL_ENV_WIN_*` survive as per-axis opt-in overrides that warn the run is not
+   Benchmark A. **It has not been run against the game.**
 
-1b. **Pin the aspect ratio, or accept that runs are not comparable** (new,
-   created by item 1). Visible width follows window aspect. A camera-derived
-   sensor is *correct* at any aspect — a human in that window really does see
-   that much — but two runs at different aspects are not the same benchmark.
-   Nothing enforces it; `GDRL_WINDOWED` merely happens to keep ~16:9. Decide
-   between forcing a fixed design width and asserting the aspect at attempt
-   start.
+1b. **Pin the aspect ratio** — **RULED 2026-08-15, NOT IMPLEMENTED.**
+
+   The facts: `viewport.cpp:168-176`. The resolution policy is
+   `kResolutionFixedHeight`, so the design **height** is pinned at 320 world
+   units and the design **width** is recomputed as
+   `ceil(screenW / (screenH / 320))`. Two different OS window sizes in the
+   2026-08-15 run both produced 569 world units, because both are ~16:9:
+
+   | window | `screenW/(screenH/320)` | design width |
+   |---|---|---|
+   | 960×540 (fullscreen) | 568.89 | 569 |
+   | 396×223 (`GDRL_WINDOWED`) | 568.30 | 569 |
+
+   So the vertical world extent is invariant and the horizontal one is a function
+   of the OS window's aspect ratio. UNVERIFIED at any non-16:9 aspect — the
+   formula predicts it, no run has been done.
+
+   **The ruling: pin the window size, not the design width.** Rejected: forcing a
+   fixed design width by overriding the resolution policy. That decouples the
+   sensor from the screen — the agent would receive a window that is not what is
+   rendered, which is the exact defect item 1 just fixed. A camera-derived sensor
+   is *correct* at any aspect; the only problem is that two runs at different
+   aspects are not the same benchmark. Two mechanisms, both wanted:
+
+   1. **Pin the OS window size for benchmark runs** (`scripts/run_sandbox.sh` and
+      the `GDRL_WINDOWED` path at `main.cpp:389`). Today `GDRL_WINDOWED` merely
+      *happens* to keep ~16:9 — it inherits whatever the display gives it, so a
+      fullscreen run on a non-16:9 display silently changes the sensor width.
+   2. **Assert the derived design width at attempt start and stamp it into the
+      observation header**, so a run is checkable from its own log rather than
+      from a claim about how it was launched. Mismatch should be loud — refuse,
+      do not substitute.
+
+   Not merely hygiene: under A the sensor definition *is* the benchmark, so an
+   unpinned aspect means attempts-to-completion is measured against a sensor of
+   unstated width. Same class of defect as the 3.9× overreach, just smaller and
+   harder to see.
 
 1c. **Still unmeasured after item 1**, and worth not forgetting: every speed
    bucket other than 1x, every level other than Stereo Madness, anything past
@@ -1610,11 +1852,13 @@ benchmark, and ours has never been justified.
 
 7. Then Track 0.2 (predictor spec + test-tier audit), and only then Track 4.
 
-8. **`trainer/sightread.py` — the A-legal search driver. HIGHEST VALUE IN THIS
-   FILE.** Opened 2026-08-15 when the project's goal shifted from measuring the
-   environment to clearing a level with it.
+8. **`trainer/sightread.py` — the A-legal search driver.** **BUILT 2026-08-15
+   (second session); the acceptance criterion is NOT met because it has never
+   been run against the game.** See section P. The spec below is retained
+   because it is what the implementation was graded against, and because the
+   parts marked "design points" are still the parts most likely to be wrong.
 
-   **There is no search driver.** The 12-jump / `maxX=3959.183837891` / ~14.8%
+   **There was no search driver.** The 12-jump / `maxX=3959.183837891` / ~14.8%
    best on record came from a human hand-picking tick numbers and feeding them
    through `GDRL_INJECT_SEQ`. Nothing in this repo chooses an action.
 

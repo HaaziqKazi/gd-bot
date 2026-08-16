@@ -374,10 +374,25 @@ def _mod_scan_window(player_x: float, player_y: float, sxf_f32: float, *,
     only reading the C will. What it does catch is publish() drifting away from
     scanObjects() again, which is exactly how L5 happened.
 
-    Every constant comes from the mod: g_winBehind / g_winAhead / g_winVert
-    default to 400 / 1400 / 600 at telemetry.cpp:184-186, and the clamp at :670
-    is GDRL_COVERAGE_COLS (``coverage_cols`` here is publish()'s stand-in for it,
-    so a test can hand the decoder a narrower mask).
+    THE WINDOW SOURCE MOVED ON 2026-08-15 AND THIS FUNCTION DID NOT. The mod no
+    longer builds its window from g_winBehind / g_winAhead / g_winVert; it takes
+    the live camera rect each physics step (telemetry.cpp:828-832), and those
+    three survive only as off-by-default GDRL_ENV_WIN_* overrides. So the
+    ``player_x -/+ win_*`` form below is no longer the mod's default shape --
+    it is the shape the mod produces WHEN THOSE OVERRIDES ARE SET, which is
+    still a configuration the mod supports, and it is the shape publish()
+    produces. What this function grades is unchanged: that publish() and this
+    restatement agree about everything DOWNSTREAM of the four bounds. It never
+    graded where the bounds came from, and it cannot -- there is no camera in a
+    unit test.
+
+    The clamp at :874 is GDRL_COVERAGE_COLS (``coverage_cols`` here is
+    publish()'s stand-in for it, so a test can hand the decoder a narrower
+    mask). Note that in the real game that clamp is now slack -- the measured
+    569-unit camera spans ~7 of 64 columns -- so the parametrisations below that
+    force it to bind (``win_ahead=8000``) are exercising an override
+    configuration, deliberately, and are the only thing keeping mutants D5/D6/D7
+    killable (TODO N2).
 
     The coverage array covers only the states the fixture can reach. The mod has
     two more: ABSENT for a null ``m_sections[col]`` (:712) and TRUNCATED when the
@@ -459,7 +474,7 @@ def _f32_neighbours_of_player_x(min_x: float) -> tuple[float, float]:
     the game -- and the column boundary always falls strictly BETWEEN two of them
     at these magnitudes, which is what makes the pair straddle the tick-over.
     """
-    exact = min_x + envmod.MOD_WIN_BEHIND
+    exact = min_x + envmod.FIXTURE_WIN_BEHIND
     hi = np.float32(exact)
     if float(hi) < exact:
         hi = np.nextafter(hi, np.float32(np.inf))
@@ -480,13 +495,13 @@ def _agreement_placements():
         267, where window-primary and column-primary arithmetic diverge most.
     """
     out = [
-        pytest.param(500.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD, 4,
+        pytest.param(500.0, envmod.FIXTURE_WIN_BEHIND, envmod.FIXTURE_WIN_AHEAD, 4,
                      id="the-default-mask-placement"),
-        pytest.param(450.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD, 4,
+        pytest.param(450.0, envmod.FIXTURE_WIN_BEHIND, envmod.FIXTURE_WIN_AHEAD, 4,
                      id="px-450"),
-        pytest.param(12345.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD, 4,
+        pytest.param(12345.0, envmod.FIXTURE_WIN_BEHIND, envmod.FIXTURE_WIN_AHEAD, 4,
                      id="px-12345-start-col-119"),
-        pytest.param(500.0, envmod.MOD_WIN_BEHIND, 8000.0, sg.GDRL_COVERAGE_COLS,
+        pytest.param(500.0, envmod.FIXTURE_WIN_BEHIND, 8000.0, sg.GDRL_COVERAGE_COLS,
                      id="window-wide-enough-that-the-64-col-clamp-binds"),
         # THE CONFIGURATION THE MOD ACTUALLY RUNS: all 64 columns available and
         # the mod's own 1400 ahead, so the WINDOW binds at 19 columns and the
@@ -494,26 +509,26 @@ def _agreement_placements():
         # coverage_cols small enough that the clamp wins, which makes the
         # requested edge, the +1 on col1 and the clamp itself unobservable --
         # three mutants survived on exactly that (D5, D6, D7).
-        pytest.param(500.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD,
+        pytest.param(500.0, envmod.FIXTURE_WIN_BEHIND, envmod.FIXTURE_WIN_AHEAD,
                      sg.GDRL_COVERAGE_COLS, id="mod-defaults-window-binds"),
-        pytest.param(12345.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD,
+        pytest.param(12345.0, envmod.FIXTURE_WIN_BEHIND, envmod.FIXTURE_WIN_AHEAD,
                      sg.GDRL_COVERAGE_COLS, id="mod-defaults-window-binds-deep"),
         # Past the end of m_sections (268 columns, Stereo Madness), where the
         # fixture's own ABSENT branch is the only thing that can be right.
-        pytest.param(26900.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD,
+        pytest.param(26900.0, envmod.FIXTURE_WIN_BEHIND, envmod.FIXTURE_WIN_AHEAD,
                      sg.GDRL_COVERAGE_COLS, id="past-the-end-of-m-sections"),
-        pytest.param(100.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD, 4,
+        pytest.param(100.0, envmod.FIXTURE_WIN_BEHIND, envmod.FIXTURE_WIN_AHEAD, 4,
                      id="window-reaches-left-of-x-zero"),
-        pytest.param(0.0, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD, 4,
+        pytest.param(0.0, envmod.FIXTURE_WIN_BEHIND, envmod.FIXTURE_WIN_AHEAD, 4,
                      id="level-start"),
-        pytest.param(500.0, 0.0, envmod.MOD_WIN_AHEAD, 4,
+        pytest.param(500.0, 0.0, envmod.FIXTURE_WIN_AHEAD, 4,
                      id="no-window-behind"),
     ]
     for k in (1, 5, 119, 267):
         lo, hi = _f32_neighbours_of_player_x(_column_tickover_x(k))
-        out.append(pytest.param(lo, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD, 8,
+        out.append(pytest.param(lo, envmod.FIXTURE_WIN_BEHIND, envmod.FIXTURE_WIN_AHEAD, 8,
                                 id=f"just-below-column-{k}"))
-        out.append(pytest.param(hi, envmod.MOD_WIN_BEHIND, envmod.MOD_WIN_AHEAD, 8,
+        out.append(pytest.param(hi, envmod.FIXTURE_WIN_BEHIND, envmod.FIXTURE_WIN_AHEAD, 8,
                                 id=f"just-above-column-{k}"))
     return out
 
@@ -528,7 +543,7 @@ def test_the_fixture_publishes_the_window_the_mod_would(
     """publish() must emit scanObjects()'s window, field for field.
 
     TIER (i), and deliberately so: both sides are this repo's transcription of
-    telemetry.cpp:649-691, so agreement proves the transcription is consistent,
+    telemetry.cpp:718-921, so agreement proves the transcription is consistent,
     not that either matches the game. It is worth having anyway -- the fixture
     silently drifted from the mod once already (L5) and every other test in this
     file was blind to it, because they all recompute their expectations from
@@ -548,7 +563,7 @@ def test_the_fixture_publishes_the_window_the_mod_would(
                             coverage_cols=coverage_cols,
                             n_cols=envmod.MEASURED_SECTION_COLUMNS,
                             win_behind=win_behind, win_ahead=win_ahead,
-                            win_vert=envmod.MOD_WIN_VERT)
+                            win_vert=envmod.FIXTURE_WIN_VERT)
 
     for field in ("coverageStartCol", "sectionColumns"):
         assert int(h[field]) == want[field], field
@@ -569,7 +584,8 @@ def test_the_fixture_publishes_the_window_the_mod_would(
 def test_a_column_primary_left_edge_is_a_different_window(loop):
     """The agreement test above is not vacuous: the two formulations differ.
 
-    Window-primary (``minX = px - g_winBehind``, telemetry.cpp:710) and
+    Window-primary (``minX`` is the window's own left edge, published at
+    telemetry.cpp:928) and
     column-primary (``col0 * secW``, what publish() used to advertise) coincide
     only when minX lands exactly on a column boundary. Over the placements above
     they disagree on most, by up to a full section.
@@ -586,7 +602,7 @@ def test_a_column_primary_left_edge_is_a_different_window(loop):
                              coverage_cols=coverage_cols,
                              n_cols=envmod.MEASURED_SECTION_COLUMNS,
                              win_behind=win_behind, win_ahead=win_ahead,
-                             win_vert=envmod.MOD_WIN_VERT)
+                             win_vert=envmod.FIXTURE_WIN_VERT)
         gaps[p.id] = w["windowMinX"] - w["snapped_min_x"]
 
     differing = [k for k, v in gaps.items() if v != 0.0]
@@ -725,7 +741,7 @@ def test_an_unusable_section_factor_is_refused_not_substituted(loop, sxf):
     # OBJECTS_UNAVAILABLE, so a count of 0 reads as 'did not look'.
     assert "objects" in obs.unavailable_tables()
     # And the frame this test stands on is the mod's refusal frame -- claim
-    # nothing (telemetry.cpp:620-634 as of 8dd5ceb): a zero-area window and all
+    # nothing (refuseScan, telemetry.cpp:651-669): a zero-area window and all
     # 64 columns UNKNOWN. Nothing checked that, so publish() could have left a
     # real window here and every assertion above would still hold while the
     # frame had stopped being the one the docstring describes (mutation-measured
@@ -904,16 +920,16 @@ def test_refused_and_looked_but_knew_nothing_are_distinguishable(loop):
 
 @pytest.mark.parametrize("player_x,player_col,cell_size,scanned,win_ahead", [
     # start_col == 0; the case every pre-existing test used.
-    pytest.param(500.0, 12, 30.0, 4, envmod.MOD_WIN_AHEAD, id="start-col-zero"),
+    pytest.param(500.0, 12, 30.0, 4, envmod.FIXTURE_WIN_AHEAD, id="start-col-zero"),
     # A cell straddling the right window edge: centre outside, left edge inside.
-    pytest.param(450.0, 12, 30.0, 4, envmod.MOD_WIN_AHEAD, id="cell-straddles-the-edge"),
+    pytest.param(450.0, 12, 30.0, 4, envmod.FIXTURE_WIN_AHEAD, id="cell-straddles-the-edge"),
     # Deep into the level, so coverageStartCol is 119 rather than 0, and the
     # leftmost cells the WINDOW admits land in the FIRST covered column
     # (section == 0). Note the window starts at 11945, partway into column 119,
     # so the cells at 11880..11940 are in that column but outside the window --
     # which is the left-edge disagreement, and it resolves to UNKNOWN.
-    pytest.param(12345.0, 16, 30.0, 4, envmod.MOD_WIN_AHEAD, id="nonzero-start-col"),
-    pytest.param(12345.0, 12, 30.0, 4, envmod.MOD_WIN_AHEAD, id="nonzero-start-col-shifted"),
+    pytest.param(12345.0, 16, 30.0, 4, envmod.FIXTURE_WIN_AHEAD, id="nonzero-start-col"),
+    pytest.param(12345.0, 12, 30.0, 4, envmod.FIXTURE_WIN_AHEAD, id="nonzero-start-col-shifted"),
     # The full 64-column array with cells wide enough to reach its far end. This
     # needs a window that actually reaches column 63: with the mod's default
     # 1400 ahead the window binds at 19 columns and the 64-column clamp never
@@ -974,8 +990,8 @@ def test_the_first_covered_column_is_included(loop):
     assert first_col.any(), "no cell in view indexes to the first covered column"
 
     # Only the cells the advertised window actually admits. Since windowMinX is
-    # `player_x - win_behind` (telemetry.cpp:710) and col0 is floor(minX * sxf)
-    # (:664), the first covered column starts LEFT of the window: the mod walks
+    # the window's own left edge (telemetry.cpp:928) and col0 is
+    # floor(minX * sxf) (:842), the first covered column starts LEFT of the window: the mod walks
     # the whole of column col0 but advertises a window that begins partway into
     # it. So a cell can index to section 0 and still, correctly, be outside the
     # window. Asserting over those was testing the old fixture's snapped-left
@@ -1004,13 +1020,19 @@ def test_columns_past_the_end_of_the_coverage_array_are_unknown(loop):
     index an upper bound written ``<=`` would let through. A coarser raster can
     step straight over it and the mutant lives.
 
-    ``win_ahead`` is 8000 (a value of GDRL_ENV_WIN_AHEAD, telemetry.cpp:185, not
-    a fabricated header) because the whole array has to actually be SCANNED for
-    the out-of-range read to be distinguishable. It was NOT, from the moment the
-    fixture started binding col1 to the requested window (L5): with the mod's
-    default 1400 ahead only 19 columns are SCANNED and coverage[63] is UNKNOWN,
-    so the clipped read returned UNKNOWN and the ``<=`` mutant survived while
-    this test stayed green. The guard below is the part that would have said so.
+    ``win_ahead`` is 8000 (a value of GDRL_ENV_WIN_AHEAD, telemetry.cpp:241,
+    not a fabricated header) because the whole array has to actually be SCANNED
+    for the out-of-range read to be distinguishable. It was NOT, from the moment
+    the fixture started binding col1 to the requested window (L5): at the old
+    1400 ahead only 19 columns are SCANNED and coverage[63] is UNKNOWN, so the
+    clipped read returned UNKNOWN and the ``<=`` mutant survived while this test
+    stayed green. The guard below is the part that would have said so.
+
+    That gap WIDENED on 2026-08-15. The mod's window is now the camera's, ~569
+    units, i.e. ~7 columns of 64 -- so an even smaller fraction of the array is
+    SCANNED on a real frame and this test depends on the override even more
+    heavily than it did. It is a deliberate non-default configuration, and it
+    has to be, because the branch it reaches is only reachable that way.
     """
     game, chan = loop
     game.publish(tick=1, player_x=450.0, coverage_cols=sg.GDRL_COVERAGE_COLS,
@@ -1119,6 +1141,64 @@ def test_both_window_edges_are_inclusive_in_both_axes(loop):
     assert set(np.nonzero(mask.any(axis=0))[0].tolist()) == set(range(lo_col, hi_col + 1))
 
 
+def test_the_measured_camera_window_is_not_symmetric_about_the_player(loop):
+    """The real window puts the player LOW on screen, and the mask must show it.
+
+    The mod stopped deriving its window from three constants on 2026-08-15 and
+    started taking the live camera rect each physics step. The camera measured
+    569.0 x 320.0 world units, +215 above the player and -105 below -- so the
+    vertical field is asymmetric, where every constant this repo ever used was
+    symmetric. This publishes a frame with that shape and checks that nothing
+    downstream quietly re-symmetrises it.
+
+    MIXED TIER, and the parts are worth separating:
+
+    * The four numbers are TIER (iii) -- read off the GDRL_PROBE_VIEWPORT run of
+      2026-08-15 (backups/reference-logs/viewport-probe-20260815-171406.log),
+      one level, one speed, one zoom, one aspect ratio. They are a recorded
+      measurement, not a definition; the mod does not use them and must not.
+    * The mask assertions are TIER (i), regression only. publish() writes the
+      window and known_mask() reads it back, and both are ours. What this
+      catches is a decoder that assumes symmetry -- and one could: every other
+      vertical test in this file is symmetric about the player, so a decoder
+      that used ``+-(playerY - windowMinY)`` would pass all of them.
+
+    It does NOT check that the mod publishes these numbers. Nothing in Python
+    can; that needs the game, and it is the tester's run, not this file's.
+    """
+    game, chan = loop
+    px, py = 500.0, 105.0
+    game.publish(tick=1, player_x=px, player_y=py, coverage_cols=8,
+                 win_behind=envmod.MEASURED_CAM_BEHIND,
+                 win_ahead=envmod.MEASURED_CAM_AHEAD,
+                 win_up=envmod.MEASURED_CAM_UP,
+                 win_down=envmod.MEASURED_CAM_DOWN)
+    obs = chan.poll(timeout=1.0)
+    h = obs.header
+
+    # The screen, as measured. 209.5 + 359.5 = 569.0 and 105 + 215 = 320.0.
+    assert float(h["windowMaxX"]) - float(h["windowMinX"]) == 569.0
+    assert float(h["windowMaxY"]) - float(h["windowMinY"]) == 320.0
+    assert float(h["windowMaxY"]) - py == envmod.MEASURED_CAM_UP
+    assert py - float(h["windowMinY"]) == envmod.MEASURED_CAM_DOWN
+    # The guard against the whole test being vacuous: if these were equal the
+    # asymmetry assertion below would hold for a symmetric window too.
+    assert envmod.MEASURED_CAM_UP != envmod.MEASURED_CAM_DOWN
+
+    height, width, cell, player_col = 16, 48, 30.0, 12
+    mask = obs.known_mask(height=height, width=width, cell_size=cell,
+                          player_col=player_col).grid()
+    rows = np.nonzero(mask.any(axis=1))[0]
+    assert rows.size, "the frame was refused or knows nothing; nothing to grade"
+
+    player_row = height // 2
+    above = int((rows > player_row).sum())
+    below = int((rows < player_row).sum())
+    assert above > below, (
+        f"known rows {rows.tolist()} are symmetric about row {player_row} "
+        f"({above} above, {below} below) -- the asymmetry was lost")
+
+
 # -- the factor itself, against the live measurement -------------------------
 
 def test_the_section_factor_reproduces_the_measured_section_count(loop):
@@ -1148,7 +1228,7 @@ def test_the_level_length_cross_check_agrees_on_both_measured_levels(loop):
 
     Tier (iii) in its inputs: 26724 -> 268 (Stereo Madness) and 6340 -> 64 (the
     synth test level) were both dumped from the running game on 2026-08-12
-    (telemetry.cpp:597-600), and they are the ONLY two levels this identity has
+    (telemetry.cpp:685-688), and they are the ONLY two levels this identity has
     ever been measured on -- which is exactly why L6 made it a diagnostic and not
     a gate. The arithmetic being checked is this repo's, so the check itself is
     tier (i); what is tier (iii) is that it has to close on those numbers.

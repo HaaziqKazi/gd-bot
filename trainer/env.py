@@ -543,7 +543,7 @@ class Observation:
           been measured on exactly two levels -- Stereo Madness (m_levelLength
           26724, m_sections.size() 268) and the synth test level (6340, 64), both
           from the 2026-08-12 section-grid dump, recorded at telemetry.cpp:
-          597-600. Two points do not establish that ``m_sections`` is sized from
+          685-688. Two points do not establish that ``m_sections`` is sized from
           ``m_levelLength`` at all; it may be sized from the rightmost object, a
           rounded-up level bound, or something else that merely happened to
           agree twice.
@@ -606,7 +606,7 @@ class Observation:
         Two whole-frame refusals come first, and neither yields a grid:
 
         * ``OBJECTS_UNAVAILABLE`` set -> ``MaskRefusal.OBJECTS_UNAVAILABLE``. The
-          mod raises it on the no-player path (``telemetry.cpp:889``) *without*
+          mod raises it on the no-player path (``telemetry.cpp:1173``) *without*
           calling ``scanObjects``, so on that frame ``coverage`` and the window
           bounds are whatever the previous frame left there. Reading them would
           be reporting last frame's geometry as this frame's observation.
@@ -640,7 +640,7 @@ class Observation:
         in_y = (rows_y >= float(h["windowMinY"])) & (rows_y <= float(h["windowMaxY"]))
 
         # floor(x * sxf) -- a MULTIPLY, and the same expression the mod indexes
-        # with (telemetry.cpp:664). Not a divide: sxf is 0.01, so dividing lands
+        # with (telemetry.cpp:842). Not a divide: sxf is 0.01, so dividing lands
         # the index 1e4 too high and every column falls outside the mask, which
         # is how this silently reported "nothing is known" everywhere.
         start_col = int(h["coverageStartCol"])
@@ -649,11 +649,13 @@ class Observation:
         # WHY A WINDOW THAT IS TOO WIDE CANNOT LIE.
         #
         # The advertised window and the coverage mask DO disagree at the left
-        # edge, and not rarely: the mod publishes windowMinX = px - g_winBehind
-        # (telemetry.cpp:710) but derives col0 = floor(minX * sxf) (:664), so the
-        # window starts partway INTO column col0 -- by up to a full section, and
-        # by exactly 100 units at the default fixture player_x of 500. So the two
-        # descriptions of "the scanned region" are not the same set of x.
+        # edge, and not rarely: the mod publishes windowMinX as the window's own
+        # left edge (telemetry.cpp:928) -- since 2026-08-15 that is the LIVE
+        # CAMERA's left edge, previously px - g_winBehind -- but derives
+        # col0 = floor(minX * sxf) (:842), so the window starts partway INTO
+        # column col0, by up to a full section. Nothing below depends on which
+        # of the two the left edge came from; that is the point of deriving the
+        # column from the window rather than the reverse.
         #
         # That disagreement can never manufacture knowledge, and the reason is
         # structural rather than empirical: `state` below is looked up from the
@@ -1043,27 +1045,57 @@ MEASURED_SECTION_Y_FACTOR = 0.0
 MEASURED_LEVEL_LENGTH = 26724.0
 MEASURED_SECTION_COLUMNS = 268
 
-# The synth test level from the same dump (telemetry.cpp:598-599): 6340 -> 64.
+# The synth test level from the same dump (telemetry.cpp:686-687): 6340 -> 64.
 # Kept because it is the SECOND of the only two levels the section-count identity
 # has ever been measured on, and because it is the one where that identity is
 # weakest -- see Observation.level_length_agrees_with_section_count().
 MEASURED_SYNTH_LEVEL_LENGTH = 6340.0
 MEASURED_SYNTH_SECTION_COLUMNS = 64
 
-# The mod's observation window, world units around the player, read straight off
-# telemetry.cpp:184-186:
+# ---------------------------------------------------------------------------
+# THE WINDOW IS NO LONGER THREE CONSTANTS. Read this before using the four
+# below for anything except shaping a fixture frame.
 #
-#   const int g_winBehind = envInt("GDRL_ENV_WIN_BEHIND", 400);
-#   const int g_winAhead  = envInt("GDRL_ENV_WIN_AHEAD", 1400);
-#   const int g_winVert   = envInt("GDRL_ENV_WIN_VERT",  600);
+# Until 2026-08-15 the mod's observation window was px +- GDRL_ENV_WIN_BEHIND /
+# _AHEAD / _VERT, defaulting to 400 / 1400 / 600, and this file's constants were
+# a faithful copy of those defaults. They are not any more. The mod now derives
+# the window from the LIVE CAMERA every physics step (telemetry.cpp:828-832,
+# gdrl::cameraWorldRect); GDRL_ENV_WIN_* survive only as off-by-default
+# overrides for ablations and the Benchmark B oracle, and telemetry.cpp:233-243
+# says in as many words that setting one makes the run non-A.
 #
-# These are the mod's own defaults, not a fixture invention. publish() takes them
-# as parameters for the same reason the mod takes them from the environment: they
-# are tunable there, so a test that varies them is exercising a configuration the
-# mod supports rather than fabricating one.
-MOD_WIN_BEHIND = 400.0
-MOD_WIN_AHEAD = 1400.0
-MOD_WIN_VERT = 600.0
+# Consequences for anything Python-side that wants to know "how big is the
+# window":
+#
+#   * There is no answer available from a constant. It depends on camera zoom
+#     and, under kResolutionFixedHeight, on the OS window's aspect ratio.
+#   * The answer IS available per frame, on the wire, and always was:
+#     windowMinX / windowMaxX / windowMinY / windowMaxY are whatever the mod
+#     actually used. known_mask() has only ever read those, which is why the
+#     decoder needed no change for any of this.
+#   * The real window is NOT symmetric vertically. The player sits low on
+#     screen: +215 above, -105 below.
+#
+# MEASURED_CAM_* are the 2026-08-15 probe numbers (GDRL_PROBE_VIEWPORT, Stereo
+# Madness, 1x, zoom 1.0, ~16:9 -- backups/reference-logs/viewport-probe-
+# 20260815-171406.log). They are a RECORD OF ONE MEASUREMENT, not a definition:
+# nothing may reconstruct a window from them, because the whole reason the mod
+# stopped using constants is that a constant cannot track zoom or aspect. They
+# exist so a fixture can publish a frame shaped like one the game produces.
+MEASURED_CAM_BEHIND = 209.5
+MEASURED_CAM_AHEAD = 359.5
+MEASURED_CAM_UP = 215.0
+MEASURED_CAM_DOWN = 105.0
+
+# The fixture's default window shape. NOT the mod's window -- see above -- and
+# named so that nothing reads it as one. It is the pre-2026-08-15 geometry,
+# retained verbatim because ~60 mask tests are built on it and re-shaping them
+# would change what those tests mean without testing anything new. It also
+# remains a shape the mod can still be asked for, via the GDRL_ENV_WIN_*
+# overrides, so it is not a fabricated configuration.
+FIXTURE_WIN_BEHIND = 400.0
+FIXTURE_WIN_AHEAD = 1400.0
+FIXTURE_WIN_VERT = 600.0
 
 
 class SyntheticGame:
@@ -1127,22 +1159,38 @@ class SyntheticGame:
                 layout_x_factor: float | None = None,
                 level_length: float = MEASURED_LEVEL_LENGTH,
                 section_columns: int = MEASURED_SECTION_COLUMNS,
-                win_behind: float = MOD_WIN_BEHIND,
-                win_ahead: float = MOD_WIN_AHEAD,
-                win_vert: float = MOD_WIN_VERT) -> int:
+                win_behind: float = FIXTURE_WIN_BEHIND,
+                win_ahead: float = FIXTURE_WIN_AHEAD,
+                win_vert: float = FIXTURE_WIN_VERT,
+                win_up: float | None = None,
+                win_down: float | None = None) -> int:
         """Write one observation and advance the sequence, seqlock and all.
 
         ``coverage_cols`` is the fixture's stand-in for ``GDRL_COVERAGE_COLS``
-        in the clamp at telemetry.cpp:670 -- how many columns the mask is
+        in the clamp at telemetry.cpp:874 -- how many columns the mask is
         allowed to speak for. It is an UPPER bound, not a promise: the requested
-        window can bind first, exactly as it does in the mod (with the mod's own
-        defaults, 400 behind + 1400 ahead is 18 columns, so in the real game the
-        window binds and the 64-column clamp never does). Read
-        ``self.scanned_cols`` for how many entries actually came out SCANNED.
+        window can bind first, exactly as it does in the mod. In the real game
+        it now ALWAYS binds first and by a wide margin: the measured camera is
+        569 world units wide, ~7 columns at the measured 100-unit section, so
+        the mod's 64-column clamp is slack. That is a change from the old
+        1400-ahead constant (18 columns, still slack) and it is recorded here
+        because a clamp that never binds is how a test quietly stops testing
+        what its name says (TODO N2). Read ``self.scanned_cols`` for how many
+        entries actually came out SCANNED.
 
-        ``win_behind`` / ``win_ahead`` / ``win_vert`` default to the mod's own
-        defaults (telemetry.cpp:184-186) and are parameters for the same reason
-        they are ``envInt`` there.
+        ``win_behind`` / ``win_ahead`` / ``win_vert`` DO NOT DESCRIBE THE MOD'S
+        WINDOW ANY MORE. Since 2026-08-15 the mod takes its window from the live
+        camera each step and these three survive there only as off-by-default
+        GDRL_ENV_WIN_* overrides -- see the FIXTURE_WIN_* comment above. Here
+        they are a way to shape the fixture's rectangle, nothing else. Every
+        mask test recomputes its expectation from the published header, so the
+        shape is exercise, not doctrine.
+
+        ``win_up`` / ``win_down`` make the vertical window ASYMMETRIC, which the
+        real one is: the player sits low on screen, +215 up and -105 down. Both
+        default to ``None``, meaning ``win_vert`` either side, which is the
+        symmetric shape every pre-existing test was written against. Pass
+        ``MEASURED_CAM_UP`` / ``MEASURED_CAM_DOWN`` for a camera-shaped frame.
 
         ``section_x_factor`` defaults to the measured 0.01 and is a parameter
         only so a test can inject an unusable value and check that the decoder
@@ -1210,13 +1258,24 @@ class SyntheticGame:
                       | extra_flags)
 
         # The window arithmetic is a TRANSCRIPTION of scanObjects(),
-        # telemetry.cpp:649-766, in the same order and the same form -- the
+        # telemetry.cpp:718-1051, in the same order and the same form -- the
         # WINDOW is primary and the columns are derived from it, never the other
         # way round. Each step below cites the line it mirrors. The one
         # substitution is `coverage_cols` where the mod writes
         # GDRL_COVERAGE_COLS, so a test can hand the decoder a narrow mask; with
         # coverage_cols == GDRL_COVERAGE_COLS this is the mod's expression
         # unchanged.
+        #
+        # ONE PLACE THE TRANSCRIPTION CANNOT BE LITERAL, since 2026-08-15. The
+        # mod's four window bounds are the live camera rect (telemetry.cpp:
+        # 828-832, `cam.left` / `cam.right` / `cam.bottom` / `cam.top`); there
+        # is no camera here, so the fixture builds a rectangle around the player
+        # from its parameters instead. Everything downstream of the four bounds
+        # -- col0, col1, the clamp, the right edge, the coverage loop -- is
+        # still statement-for-statement the mod's, and that is the part this
+        # transcription is for. The bounds themselves are graded by the header
+        # comparison, not by this arithmetic: whatever the mod computed arrives
+        # in windowMinX..windowMaxY and known_mask() reads it from there.
         #
         # It used to derive windowMinX from col0 instead (`col0 * sec_w`), which
         # snapped the advertised left edge DOWN to a column boundary and made the
@@ -1239,7 +1298,8 @@ class SyntheticGame:
                                else layout_x_factor))
         cov = self.obs["coverage"]
         if not (sxf > 0.0) or not np.isfinite(sxf):
-            # The mod's refusal path (telemetry.cpp:615-635): claim nothing.
+            # The mod's refusal path (refuseScan, telemetry.cpp:651-669):
+            # claim nothing.
             # Zero-area window, every column UNKNOWN, OBJECTS_UNAVAILABLE set so
             # a count of 0 reads as "did not look" rather than "looked and found
             # none".
@@ -1253,33 +1313,40 @@ class SyntheticGame:
             cov[:] = int(GdrlCoverage.UNKNOWN)
             self.scanned_cols = 0
         else:
-            sec_w = 1.0 / sxf                                    # :649
-            min_x = player_x - win_behind                        # :651
-            max_x_requested = player_x + win_ahead               # :652
-            min_y = player_y - win_vert                          # :653
-            max_y = player_y + win_vert                          # :654
-            n_cols = section_columns                             # :663 m_sections.size()
-            col0 = int(math.floor(min_x * sxf))                  # :664
-            col0 = max(0, col0)                                  # :665
-            col1 = int(math.floor(max_x_requested * sxf))        # :666
-            col1 = min(col1, col0 + coverage_cols - 1)           # :670
+            sec_w = 1.0 / sxf                                    # :718
+            min_x = player_x - win_behind                        # :828
+            max_x_requested = player_x + win_ahead               # :829
+            # Asymmetric when asked, symmetric by default. win_vert is exactly
+            # what GDRL_ENV_WIN_VERT still means in the mod -- a HALF-extent
+            # applied either side -- while the camera's own bounds are not
+            # symmetric at all.
+            below = win_vert if win_down is None else win_down
+            above = win_vert if win_up is None else win_up
+            min_y = player_y - below                             # :831
+            max_y = player_y + above                             # :832
+            n_cols = section_columns                             # :841 m_sections.size()
+            col0 = int(math.floor(min_x * sxf))                  # :842
+            col0 = max(0, col0)                                  # :843
+            col1 = int(math.floor(max_x_requested * sxf))        # :844
+            col1 = min(col1, col0 + coverage_cols - 1)           # :874
             # No right-edge back-off. A `std::nextafter` loop used to sit
             # between these two lines, mirroring 8dd5ceb:677-680; the mod
             # measured it dead over every float32 px in [-2048, 131072) at
             # sxf = 0.01f (2.37e9 values, stored float bit-identical with and
             # without it) and deleted it in efc32e9. Deleted here to match.
-            col_edge = (col1 + 1) * sec_w                        # :702
-            max_x = min(max_x_requested, col_edge)               # :703
-            h["coverageStartCol"] = col0                         # :708
-            h["sectionColumns"] = n_cols                         # :709
-            h["windowMinX"] = min_x                              # :710
-            h["windowMaxX"] = max_x                              # :711
-            h["windowMinY"] = min_y                              # :712
-            h["windowMaxY"] = max_y                              # :713
-            # The coverage loop, 8dd5ceb:696-808: UNKNOWN past col1, ABSENT past
-            # the end of GD's own section grid, SCANNED otherwise. (TRUNCATED is one
-            # state the fixture cannot reach -- it needs the object array to fill
-            # mid-column -- so tests that need it set it by hand.)
+            col_edge = (col1 + 1) * sec_w                        # :920
+            max_x = min(max_x_requested, col_edge)               # :921
+            h["coverageStartCol"] = col0                         # :926
+            h["sectionColumns"] = n_cols                         # :927
+            h["windowMinX"] = min_x                              # :928
+            h["windowMaxX"] = max_x                              # :929
+            h["windowMinY"] = min_y                              # :930
+            h["windowMaxY"] = max_y                              # :931
+            # The coverage loop, telemetry.cpp:936-1051: UNKNOWN past col1,
+            # ABSENT past the end of GD's own section grid, SCANNED otherwise.
+            # (TRUNCATED is one state the fixture cannot reach -- it needs the
+            # object array to fill mid-column -- so tests that need it set it by
+            # hand.)
             scanned = 0
             for c in range(GDRL_COVERAGE_COLS):
                 col = col0 + c

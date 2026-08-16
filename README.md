@@ -802,12 +802,21 @@ deliberately widening the sensor in an ablation, or for the B oracle. The sensor
 horizon is thereby self-maintaining under zoom, and stops depending on three
 numbers nobody could justify.
 
-**Open, and it affects the benchmark's definition rather than its
-implementation:** because visible width follows the window's aspect ratio, two
-runs at different aspect ratios are not strictly the same benchmark. A
-camera-derived sensor is *correct* in both — a human in that window really does
-see that much — but the results are not comparable unless the aspect is pinned.
-Nothing enforces it today; `GDRL_WINDOWED` happens to keep ~16:9.
+**The aspect ratio affects the benchmark's definition rather than its
+implementation, and it is now ruled.** Because visible width follows the window's
+aspect ratio, two runs at different aspect ratios are not strictly the same
+benchmark. A camera-derived sensor is *correct* in both — a human in that window
+really does see that much — but the results are not comparable unless the aspect
+is pinned. Nothing enforces it today; `GDRL_WINDOWED` merely happens to keep
+~16:9.
+
+**The ruling is to pin the window size, not the design width.** Forcing a fixed
+design width would mean overriding the resolution policy, which decouples the
+sensor from the screen — handing the agent a window that is not what is rendered,
+the exact defect this section is about. Instead: pin the OS window for benchmark
+runs, and assert the derived design width at attempt start with the value stamped
+into the observation header, so a run is checkable from its own log rather than
+from a claim about how it was launched. **Ruled, not yet implemented.**
 
 **Not measured:** any speed bucket other than 1x, any level other than Stereo
 Madness, anything past tick 391 (input was blocked, so the player died at ~1.6 s),
@@ -828,6 +837,46 @@ Two things already established reach backwards under this decision:
 Enforcement belongs in `scanObjects`, in the mod — never in Python and never by
 asking a policy to ignore what it was handed. An agent trusted to discard
 information it received is not a benchmark.
+
+### What landed, and a header that described a function nobody had written
+
+The camera-derived window is **implemented** (2026-08-15): `scanObjects()` calls
+`gdrl::cameraWorldRect()` every physics step, `GDRL_ENV_WIN_*` survive as
+per-axis opt-in overrides that warn the run is not Benchmark A, and an unreadable
+camera takes the same refusal path as an unusable `m_sectionXFactor` — zero-area
+window, `OBJECTS_UNAVAILABLE`, **never a fallback to the old constants**. A
+rotated camera also refuses, because the four-corner rect is then a bounding box
+that *overstates* what is visible, and overstating is the one direction Benchmark
+A cannot tolerate. **None of it has been run against the game.**
+
+Two decisions worth carrying forward:
+
+- **`rotated` refuses but `sizeMismatch` only warns.** The rect is derived from
+  the inverted render transform, so it is correct-by-construction under zoom;
+  a disagreement with `m_cameraWidth/Height` means the *cross-check* failed, not
+  the rect. Rotation is different in kind — it makes the answer wrong in the
+  unsafe direction.
+- **The coverage clamp was kept, not deleted**, even though 569 units needs only
+  ~7 of 64 columns and it is therefore slack today. `secW` is read from the game,
+  and a finer section grid or a zoomed-out camera needs more columns. What
+  changed is that binding is no longer silent: it warns with columns-wanted
+  against columns-held, because a constraint that goes slack unnoticed is how
+  this repo lost a mutation score once already.
+
+**The correction that cost the most to discover.** `cameraWorldRect()` was
+**declared in `viewport.hpp` and defined nowhere**; the tree built only because
+nothing called it. The header carried eighty lines of confident prose about how
+the function preserved cocos's transform caches. Separately,
+`readWorldTransformNeutrally()` — the state-neutral reader that prose is about —
+was **dead code with no caller**, because `sampleViewport()` called
+`nodeToWorldTransform()` directly. So the viewport measurements were taken
+through the *non*-neutral path, and `GDRL_VERIFY_XFORM` had never verified the
+path it was written for.
+
+The measurements stand: it was a probe, and perturbation there is harmless. The
+**safety argument** does not — it was documented where it was not applied. The
+lesson is this repo's oldest one in a new costume: *a header describes intent,
+and intent is not implementation.* Grep for the definition, not the declaration.
 
 ### The per-field ruling: `docs/observation-contract.md`
 
@@ -863,6 +912,99 @@ What the contract establishes that was not obvious going in:
 Read the "enforcement tier" column before relying on any of it. Most rulings are
 currently tier **DOC**: written down and held by nothing. The mod still emits the
 forbidden fields and `env.py` still hands the record over whole.
+
+## Search throughput: Python is not the bottleneck, the game is
+
+Measured 2026-08-15 against the loopback fixture, so this is a statement about
+the *transport and decoder*, not about the game:
+
+| GIL switch interval | objects | stride 1 | stride 64 |
+|---|---|---|---|
+| 0.005 (default) | 0 | 155 rt/s | 157 rt/s |
+| 0.00005 | 0 | **2,524 rt/s** | 2,531 rt/s |
+| 0.00005 | 120 | **1,165 rt/s** | 1,217 rt/s |
+
+Python decode+respond costs **~0.4 ms per round trip empty, ~0.86 ms with 120
+objects**, and is flat in the observation stride.
+
+**Two measurement artifacts had to be removed first, and either one alone yields
+a confident wrong answer.** Both are worth knowing before anyone re-measures:
+
+- **The 155/s row is the GIL, not the protocol.** `1/0.0065 s` ≈ Python's default
+  5 ms thread switch interval. The loopback writer is a *thread*; against the mod
+  it is a separate process and this ceiling does not apply. Measuring on the
+  loopback without sweeping `sys.setswitchinterval` concludes the transport is
+  16× slower than it is.
+- `SyntheticGame._accumulated_attempt_time` is O(tick) **per publish** — a Python
+  loop that dominates everything at large strides. That is fixture cost, not
+  protocol cost; the mod gets `m_attemptTime` free.
+
+**Why this decides the shape of a full-level search.** Stereo Madness is ~20,600
+ticks (~86 s of game time), and under Benchmark A a search must **replay the
+prefix on every attempt** — rewinding without paying for the replay is Benchmark
+B by definition. So attempt cost grows with depth. Against the game-attached
+figures recorded elsewhere in this file (~500 rt/s; 5.5 s per 3054-tick attempt
+with telemetry against 3.4 s without), a naive per-tick loop costs ~5.5 s per
+attempt at the current frontier — ~650 attempts/hour, nearly all of it spent
+observing a prefix whose outcome is already known.
+
+**The fix needs no mod work.** `advanceSteps` is an *observation* stride, and the
+mod fires scheduled inputs on every physics step regardless, so a committed
+prefix can replay in a handful of round trips with the loop dropping to stride 1
+only near the frontier. The per-attempt floor then becomes the game's own replay
+speed, `prefix_ticks / (GDRL_ENV_DELTA_TICKS × 60 fps) + reset` ≈ **1.8 s for a
+3048-tick prefix at `DELTA_TICKS=32`**, or ~2000 attempts/hour. **That figure is
+arithmetic over recorded numbers and is UNVERIFIED against the game** — in
+particular, nothing has yet confirmed that replay stays deterministic at a large
+stride, and the whole cost model rests on it.
+
+Related and already recorded: the "~3.9 attempts/sec" figure elsewhere in this
+file came from a 391-tick attempt with **no env loop**. It does not carry to a
+3048-tick prefix.
+
+## A search driver exists: `trainer/sightread.py`
+
+Built 2026-08-15. Before it, nothing in this repo chose an action — the best
+result on record (12 jumps, `maxX=3959.183837891`, ~14.8% of Stereo Madness) came
+from a human hand-picking tick numbers.
+
+**It has never been run against Geometry Dash.** Its acceptance criterion —
+autonomously reach or beat that `maxX` from zero hardcoded tick numbers, counting
+every attempt including failed probes — is made *reachable*, not met.
+
+What is structural rather than intended:
+
+- **A-legality is enforced by construction.** `Sight` copies the allowed fields
+  and **drops the observation record**, so there is no `.header` to reach through;
+  `groups`, `objectCountTotal`, `commands`, `pending` and `speedSegs` raise
+  `ForbiddenField` carrying the contract's own reason, and the objects array's
+  dtype physically lacks the group columns. This is `KnownMask`'s posture applied
+  to the contract: refuse rather than return something misleading.
+- **Actions are intervals, not taps**, and overlapping holds are *refused* —
+  two overlapping HOLDs expand to push,push,release,release and the **first**
+  release ends the jump chain, so an overlap does not mean what it looks like.
+- **The attempt ledger cannot decrement**, is opened before the first action
+  reaches the wire, and is audited against the game's own attempt field.
+
+**`header.attempt` is an attempt *id*, not a count** — playing ids 7–10 is four
+attempts and a difference of three, and the last is not reset while you are still
+in it. The count is `last − first + 1`, minus one if the game has begun an
+attempt nobody used. This surfaced as an unexplained off-by-one on every clean
+run, which is exactly how a real discrepancy gets rationalised away.
+
+**One defect worth recording because it is the old greedy stall in a new
+costume.** A node whose last hold is still down at death has no room to append.
+The first version proposed intervals *after* the death and grew plans into the
+far future forever — every probe scoring identically while the search kept
+re-selecting that node. It looked like a search and was a loop. The fix is that
+such a node yields nothing and goes exhausted: *backtracking is the correct
+response to "there is nothing left to append".*
+
+**The largest untested assumption is hold auto-repeat.** The interval design bets
+that holding jump makes the cube re-jump on each landing. The toy level used in
+testing was *written* to auto-repeat, so every passing test about it is circular
+as evidence about GD, and the tests say so in their own docstrings. The first
+live run is the measurement.
 
 ## The env is validated: defaults are clean and observation is passive
 

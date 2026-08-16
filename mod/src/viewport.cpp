@@ -448,7 +448,16 @@ CCAffineTransform readWorldTransformNeutrally(CCNode* leaf, bool& ok) {
         g_chainBytes.resize(g_chain.size());
         for (size_t i = 0; i < g_chain.size(); i++) {
             g_chainBytes[i].resize(sizeof(CCNode));
-            std::memcpy(g_chainBytes[i].data(), g_chain[i].node, sizeof(CCNode));
+            // The (const void*) cast is load-bearing for the BUILD, not for the
+            // semantics: CCNode is polymorphic, so memcpy'ing one warns under
+            // -Wdynamic-class-memaccess. The warning is about copying a vtable
+            // pointer into something that will later be USED as an object.
+            // Nothing here does -- these bytes are only ever memcmp'd against
+            // the same node's bytes a few lines below, and the buffer is never
+            // cast back to a CCNode. Casting silences the diagnostic without
+            // changing a byte of what is compared.
+            std::memcpy(g_chainBytes[i].data(),
+                        (const void*)g_chain[i].node, sizeof(CCNode));
         }
     }
 
@@ -658,6 +667,143 @@ void sampleViewport(const char* where, bool periodicSite) {
 }
 
 }   // namespace
+
+// ===========================================================================
+// THE SHARED ENTRY POINT: gdrl::cameraWorldRect()
+//
+// Everything above this line is the diagnostic probe. This is the same
+// derivation, minus the logging and minus PlayLayer, exposed for the
+// observation path (telemetry.cpp, scanObjects). One implementation, so the
+// number the probe reports and the sensor the agent gets cannot drift apart.
+//
+// Three differences from sampleViewport(), all deliberate:
+//
+//  1. It takes GJBaseGameLayer, not PlayLayer. Every field it needs
+//     (m_objectLayer, m_gameState, m_cameraWidth/Height) is declared on the
+//     base -- checked against the 2.2074 bindings, GJBaseGameLayer.hpp:3964,
+//     4169, 4253-4254 -- so the observation path does not have to reach for
+//     PlayLayer::get().
+//
+//  2. It goes through readWorldTransformNeutrally() rather than calling
+//     nodeToWorldTransform() directly. On a probe the cocos cache write was an
+//     argued-safe side effect; on the hot path of every benchmark run it is
+//     not a place for an argument. See the STATE-NEUTRAL block above.
+//
+//  3. It NEVER logs and never touches the probe's accumulators, so it is inert
+//     with GDRL_PROBE_VIEWPORT unset. The probe's per-frame state (g_samples,
+//     the Ranges, g_baseline) is untouched by this function, so enabling the
+//     probe alongside GDRL_ENV does not change what this returns and calling
+//     this does not change what the probe prints.
+//
+// Failure is always valid=false and never a guess. Every early return leaves
+// the rect zero-area, which telemetry.cpp turns into a refusal frame.
+// ===========================================================================
+
+namespace gdrl {
+
+namespace {
+
+// Camera angle, in degrees, below which the four-corner bounding box is the
+// visible region rather than an overstatement of it. A rotation of 1e-4 deg
+// displaces a corner of a 569-unit-wide rect by ~5e-4 units, which is under
+// the float-transform noise floor (~1e-4 relative, i.e. ~0.06 units at
+// x = 4000). Deliberately NOT `angle != 0`: a denormal angle is not a rotated
+// camera, and a comparison written this way also sends NaN to `rotated`, which
+// is the conservative direction.
+constexpr double kAngleEpsilon = 1e-4;
+
+// Off-diagonal magnitude in the render transform above which the map is not
+// axis-aligned. `b` and `c` are what make the corner bbox overstate; they are
+// the structural evidence of rotation or shear, independent of whatever
+// m_cameraAngle says. Scaled against the diagonal so this is a test of shape,
+// not of zoom.
+constexpr double kShearRelEpsilon = 1e-6;
+
+}   // namespace
+
+CameraRect cameraWorldRect(GJBaseGameLayer* layer) {
+    CameraRect r{};
+    if (!layer) return r;
+
+    CCNode* ol = layer->m_objectLayer;
+    if (!ol) return r;
+
+    auto* dir = CCDirector::sharedDirector();
+    if (!dir) return r;
+    auto* view = dir->getOpenGLView();
+    if (!view) return r;
+
+    // Raw camera state first, so a caller that refuses can still log WHY it
+    // refused. These are reported, never inputs to the rect.
+    r.zoom      = layer->m_gameState.m_cameraZoom;
+    r.angle     = layer->m_gameState.m_cameraAngle;
+    r.camWidth  = layer->m_cameraWidth;
+    r.camHeight = layer->m_cameraHeight;
+
+    bool ok = false;
+    const CCAffineTransform world = readWorldTransformNeutrally(ol, ok);
+    if (!ok) return r;
+
+    const Affine fwd = fromCC(world);
+    const Affine inv = invert(fwd);
+    if (!inv.ok) return r;
+
+    // Rotated, by EITHER witness, OR'd rather than picked. m_cameraAngle is
+    // GD's own claim; the off-diagonal terms are what actually bends the
+    // mapping this function inverts. If they disagree, one of the two is not
+    // describing the transform being used, and the honest response is to flag
+    // rather than to choose.
+    const double diag  = std::fabs(fwd.a) + std::fabs(fwd.d);
+    const double shear = std::fabs(fwd.b) + std::fabs(fwd.c);
+    const bool angleRotated = !(std::fabs((double)r.angle) < kAngleEpsilon);
+    const bool shearRotated = !(shear <= diag * kShearRelEpsilon);
+    r.rotated = angleRotated || shearRotated;
+
+    const ScreenRect vis = visibleRect(view);
+
+    double left  =  std::numeric_limits<double>::infinity();
+    double right = -std::numeric_limits<double>::infinity();
+    double bot   =  std::numeric_limits<double>::infinity();
+    double top   = -std::numeric_limits<double>::infinity();
+
+    const double cx[4] = { vis.x, vis.x + vis.w, vis.x,         vis.x + vis.w };
+    const double cy[4] = { vis.y, vis.y,         vis.y + vis.h, vis.y + vis.h };
+    for (int i = 0; i < 4; i++) {
+        double wx = 0.0, wy = 0.0;
+        applyAffine(inv, cx[i], cy[i], wx, wy);
+        if (!std::isfinite(wx) || !std::isfinite(wy)) return r;
+        left  = std::min(left,  wx);
+        right = std::max(right, wx);
+        bot   = std::min(bot,   wy);
+        top   = std::max(top,   wy);
+    }
+
+    // A degenerate rect is not a window. Returning valid=true on a zero-area
+    // rect would advertise "scanned, found nothing", which is the one thing
+    // this whole channel exists to distinguish from "did not look".
+    if (!(right > left) || !(top > bot)) return r;
+
+    r.left   = left;
+    r.right  = right;
+    r.bottom = bot;
+    r.top    = top;
+
+    // Cross-check against GD's own extent. Agreed on 6146/6146 samples of the
+    // 2026-08-15 log, so a mismatch is news. Skipped when m_cameraWidth /
+    // m_cameraHeight are not usable numbers -- an absent cross-check is not a
+    // failed one, and reporting it as a mismatch would cry wolf.
+    if (std::isfinite((double)r.camWidth)  && r.camWidth  > 0.f &&
+        std::isfinite((double)r.camHeight) && r.camHeight > 0.f) {
+        r.sizeMismatch =
+            std::fabs(r.width()  - (double)r.camWidth)  > kSizeCheckTolerance ||
+            std::fabs(r.height() - (double)r.camHeight) > kSizeCheckTolerance;
+    }
+
+    r.valid = true;
+    return r;
+}
+
+}   // namespace gdrl
 
 // ---------------------------------------------------------------------------
 // Sampling site 1: PlayLayer::postUpdate, AFTER the original.

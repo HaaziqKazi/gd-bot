@@ -100,6 +100,23 @@
 // first statement and touches nothing -- no allocation, no reads of game state,
 // no shared memory. That is not a nicety; every existing measurement has to
 // remain reproducible after this file lands.
+//
+// WHICH GUARANTEE THE 2026-08-15 CAMERA-WINDOW CHANGE TOUCHES, precisely,
+// because there are two and they are easy to conflate:
+//
+//   * "GDRL_* unset == unmodded run" -- NOT touched. scanObjects is reachable
+//     only from fillObservation, which is reachable only from stepProtocol,
+//     which runs only under g_envOn. With GDRL_ENV unset nothing below reads
+//     the camera, and gdrl::cameraWorldRect() is never called from this file.
+//     The viewport probe's own hooks are separately gated on
+//     GDRL_PROBE_VIEWPORT.
+//   * "GDRL_ENV=1 perturbs nothing" -- WEAKENED, and it was always an
+//     UNVERIFIED claim (see (4) at the bottom of this file). Under GDRL_ENV
+//     the scan now additionally walks m_objectLayer's parent chain and calls
+//     nodeToWorldTransform() once per physics step. viewport.cpp restores
+//     every cocos cache field around that call, so it is a pure read by
+//     construction -- but by construction is not by measurement. New
+//     UNVERIFIED (7), with the GDRL_VERIFY_XFORM run that settles it.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -122,6 +139,7 @@
 
 #include "gdrl_schema.hpp"
 #include "telemetry.hpp"
+#include "viewport.hpp"
 
 using namespace geode::prelude;
 
@@ -177,13 +195,55 @@ const char* g_shmSuffix   = envStr("GDRL_ENV_NAME", "gdrl.env");
 const int   g_waitBudget  = envInt("GDRL_ENV_WAIT_US", 250000);   // 250 ms
 const int   g_envDeltaT   = envInt("GDRL_ENV_DELTA_TICKS", 0);    // 0 = passthrough
 
-// Observation window, world units around the player. Sized to cover
-// TrajectoryRaster's default 48x32 cells at 30 units/cell with the player a
-// quarter of the way in: 360 behind, 1080 ahead, 480 either side vertically.
-// Rounded up so a raster change does not immediately outrun the wire.
-const int g_winBehind = envInt("GDRL_ENV_WIN_BEHIND", 400);
-const int g_winAhead  = envInt("GDRL_ENV_WIN_AHEAD", 1400);
-const int g_winVert   = envInt("GDRL_ENV_WIN_VERT", 600);
+// ---------------------------------------------------------------------------
+// Observation window OVERRIDES. Unset -- the default -- means the window is
+// taken from the LIVE CAMERA every physics step (gdrl::cameraWorldRect; see
+// scanObjects). These exist only so an ablation or the Benchmark B oracle can
+// pin an axis to a constant.
+//
+// THESE USED TO BE THE WINDOW, at 400 / 1400 / 600, and those numbers were
+// picked for convenience before Benchmark A existed -- sized to cover
+// TrajectoryRaster's 48x32 cells at 30 units/cell rather than to match a
+// screen. Measured 2026-08-15 the screen shows 359.5 ahead, 209.5 behind, and
+// +215 / -105 vertically, so the old constants were 3.9x too wide ahead and
+// 3.75x too tall, and symmetric where the real field is not.
+//
+// **SETTING ANY OF THESE MAKES THE RUN NOT A BENCHMARK A RUN.** Under A the
+// sensor definition IS the benchmark: a wider-than-screen window is lookahead
+// the player does not have, and a narrower one is a different (harder)
+// benchmark. Either way the result is not comparable with a camera-derived
+// run. The values are visible on the wire -- windowMinX/MaxX/MinY/MaxY are
+// whatever was actually used -- so Python sees the geometry, but it cannot see
+// the INTENT, which is why this is stated here and logged once at first scan.
+//
+// Each axis is independent: setting _AHEAD alone leaves behind and vertical
+// camera-derived. If and only if all three are set is the camera not needed at
+// all, and only then does an unreadable camera stop being fatal.
+//
+// Semantics when set: behind/ahead are distances from the player (minX =
+// px - behind, maxX = px + ahead) and _VERT is a HALF-extent applied
+// symmetrically (minY = py - vert, maxY = py + vert), all exactly as before,
+// so an old ablation command line still means what it used to mean.
+// ---------------------------------------------------------------------------
+bool envHas(const char* name) {
+    const char* v = std::getenv(name);
+    return v && *v;
+}
+
+const bool g_winBehindSet = envHas("GDRL_ENV_WIN_BEHIND");
+const bool g_winAheadSet  = envHas("GDRL_ENV_WIN_AHEAD");
+const bool g_winVertSet   = envHas("GDRL_ENV_WIN_VERT");
+
+// No meaningful fallback: these are read only when the corresponding *Set flag
+// is true. The 0 is deliberately NOT the old default -- a stale 400 sitting
+// here is exactly the kind of value that comes back to life during a later
+// refactor and silently reinstates a non-A sensor.
+const int g_winBehind = envInt("GDRL_ENV_WIN_BEHIND", 0);
+const int g_winAhead  = envInt("GDRL_ENV_WIN_AHEAD", 0);
+const int g_winVert   = envInt("GDRL_ENV_WIN_VERT", 0);
+
+const bool g_winAnyOverride = g_winBehindSet || g_winAheadSet || g_winVertSet;
+const bool g_winAllOverride = g_winBehindSet && g_winAheadSet && g_winVertSet;
 
 // These duplicate switches that live in main.cpp's anonymous namespace. They
 // are re-read rather than shared because main.cpp is owned elsewhere; the cost
@@ -580,6 +640,34 @@ uint8_t collapseKind(GameObjectType t, bool slopeIsHazard) {
     }
 }
 
+// Claim NOTHING for this step: zero-area window at the player, every column
+// UNKNOWN, no objects, OBJECTS_UNAVAILABLE set so Python reads objectCount == 0
+// as "not looked at" rather than "looked and found none".
+//
+// Extracted because there are now TWO reasons to refuse -- an unusable
+// m_sectionXFactor and an unreadable camera -- and they must produce the
+// IDENTICAL frame. A second hand-written copy is how one of them ends up
+// forgetting to clear the object array and shipping last step's geometry.
+void refuseScan(GJBaseGameLayer* layer, GdrlObservation* o, double px, double py) {
+    o->header.sectionXFactor   = layer->m_sectionXFactor;
+    o->header.sectionYFactor   = layer->m_sectionYFactor;
+    o->header.levelLength      = layer->m_levelLength;
+    o->header.coverageStartCol = 0;
+    o->header.sectionColumns   = (int)layer->m_sections.size();
+    o->header.windowMinX = (float)px;
+    o->header.windowMaxX = (float)px;
+    o->header.windowMinY = (float)py;
+    o->header.windowMaxY = (float)py;
+    for (int c = 0; c < GDRL_COVERAGE_COLS; c++) {
+        o->coverage[c] = (uint8_t)GdrlCoverage::UNKNOWN;
+    }
+    for (int i = 0; i < GDRL_MAX_OBJECTS; i++) o->objects[i].known = 0;
+    o->header.objectCount    = 0;
+    o->header.objectsDropped = 0;
+    o->header.flags |= (uint16_t)GdrlHeaderFlag::OBJECTS_UNAVAILABLE;
+    o->validity.objectsTruncated = 0;
+}
+
 // Walk the section grid, not m_objects. The grid is the whole point of the
 // grid: m_objects is every object in the level, and re-filtering ~2400 of them
 // every physics step would put the scan cost on the critical path.
@@ -613,26 +701,7 @@ void scanObjects(GJBaseGameLayer* layer, GdrlObservation* o, double px, double p
     // look, and saying "did not look" is the whole point of this channel.
     const float sxf = layer->m_sectionXFactor;
     if (!(sxf > 0.f) || !std::isfinite(sxf)) {
-        // Fail loudly and claim nothing: zero-area window, every column
-        // UNKNOWN, OBJECTS_UNAVAILABLE set so Python reads objectCount == 0 as
-        // "not looked at" rather than "looked and found none".
-        o->header.sectionXFactor   = layer->m_sectionXFactor;
-        o->header.sectionYFactor   = layer->m_sectionYFactor;
-        o->header.levelLength      = layer->m_levelLength;
-        o->header.coverageStartCol = 0;
-        o->header.sectionColumns   = (int)layer->m_sections.size();
-        o->header.windowMinX = (float)px;
-        o->header.windowMaxX = (float)px;
-        o->header.windowMinY = (float)py;
-        o->header.windowMaxY = (float)py;
-        for (int c = 0; c < GDRL_COVERAGE_COLS; c++) {
-            o->coverage[c] = (uint8_t)GdrlCoverage::UNKNOWN;
-        }
-        for (int i = 0; i < GDRL_MAX_OBJECTS; i++) o->objects[i].known = 0;
-        o->header.objectCount    = 0;
-        o->header.objectsDropped = 0;
-        o->header.flags |= (uint16_t)GdrlHeaderFlag::OBJECTS_UNAVAILABLE;
-        o->validity.objectsTruncated = 0;
+        refuseScan(layer, o, px, py);
 
         static bool warned = false;
         if (!warned) {
@@ -648,10 +717,119 @@ void scanObjects(GJBaseGameLayer* layer, GdrlObservation* o, double px, double p
     // again: sxf converts x -> column, secW converts column -> x.
     const double secW = 1.0 / (double)sxf;
 
-    const double minX = px - g_winBehind;
-    const double maxXRequested = px + g_winAhead;
-    const double minY = py - g_winVert;
-    const double maxY = py + g_winVert;
+    // -----------------------------------------------------------------------
+    // THE WINDOW IS THE CAMERA. This is the Benchmark A sensor definition, and
+    // it is derived per physics step rather than configured.
+    //
+    // It used to be px +- three constants (400 behind / 1400 ahead / +-600).
+    // Measured 2026-08-15 (backups/reference-logs/viewport-probe-20260815-171406.log,
+    // Stereo Madness, 1x, zoom 1.0) the screen actually shows 569.0 x 320.0
+    // world units: 359.5 ahead, 209.5 behind, +215 up, -105 DOWN. So the old
+    // sensor was 3.9x too wide ahead, 3.75x too tall, and symmetric about the
+    // player where the real field is not -- the player sits low on screen. No
+    // run before that fix landed is a Benchmark A run.
+    //
+    // RETUNING THE CONSTANTS WOULD HAVE BEEN WRONG, not merely worse: camera
+    // zoom varies within and across levels and no constant tracks it, and
+    // under kResolutionFixedHeight the visible WIDTH is a function of the OS
+    // window's aspect ratio, so a constant width is not imprecise but
+    // undefined until the launch geometry is pinned (TODO item 1b).
+    //
+    // gdrl::cameraWorldRect() inverts m_objectLayer's render transform over
+    // the visible design rect, so zoom, pan and any ancestor scaling enter
+    // structurally rather than by remembering to multiply. It restores every
+    // cocos transform-cache field it could perturb, so calling it here is a
+    // pure read by construction -- see viewport.hpp.
+    //
+    // WHAT THIS WINDOW STILL DOES NOT MODEL, and both understate rather than
+    // overstate, which is the safe direction under A:
+    //   * Perceptibility. The rect is geometry. Fades, effects and draw order
+    //     are not modelled, so it is an UPPER bound on what a human sees.
+    //   * Edge objects. The filters below are m_positionX/m_positionY CENTRE
+    //     tests, so an object whose centre is just outside the rect is dropped
+    //     even though part of it is on screen -- up to half an object, ~15
+    //     units. That was invisible at +-600 vertical and is not at +215/-105.
+    //     Deliberately left alone: a rect-overlap test would report objects
+    //     outside the advertised window, and Python intersects the object list
+    //     with that window (env.py known_mask). Changing both at once is how
+    //     the two descriptions drift. UNVERIFIED how many objects per step
+    //     this actually drops.
+    // -----------------------------------------------------------------------
+    if (g_winAnyOverride) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            log::warn("[gdrl] ENV window OVERRIDE active: behindSet={} behind={} "
+                      "aheadSet={} ahead={} vertSet={} vert={}. An axis whose "
+                      "Set flag is 0 stays camera-derived and its value above "
+                      "is unused. THIS RUN IS NOT A BENCHMARK A RUN -- the "
+                      "sensor is no longer what the screen shows. Intended "
+                      "only for ablations and the B oracle.",
+                      (int)g_winBehindSet, g_winBehind,
+                      (int)g_winAheadSet,  g_winAhead,
+                      (int)g_winVertSet,   g_winVert);
+        }
+    }
+
+    // Only read the camera if some axis actually needs it. With all three
+    // overridden the camera is not an input, so an unreadable one must not
+    // kill a run that never asked about it.
+    const gdrl::CameraRect cam =
+        g_winAllOverride ? gdrl::CameraRect{} : gdrl::cameraWorldRect(layer);
+
+    if (!g_winAllOverride && (!cam.valid || cam.rotated)) {
+        // NO FALLBACK TO THE OLD CONSTANTS, EVER. Falling back would make some
+        // steps of some runs secretly non-A while every byte on the wire still
+        // looked ordinary -- the exact failure mode the deleted `: 100.f`
+        // section-factor default used to have. An unreadable camera means we
+        // do not know what was on screen, and "did not look" is a reportable
+        // answer. A ROTATED camera is refused for a different reason: the rect
+        // is then the axis-aligned BOUNDING BOX of the visible region and
+        // OVERSTATES it, and an overstating sensor under A is lookahead the
+        // player does not have. Deriving the inscribed rect is unmeasured
+        // maths; refusing is honest and loud. m_cameraAngle has never been
+        // observed nonzero (TODO 1c), so this firing is itself news.
+        refuseScan(layer, o, px, py);
+
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            log::error("[gdrl] ENV camera window unusable (valid={} rotated={} "
+                       "angle={} zoom={} rect=[{:.3f},{:.3f}]x[{:.3f},{:.3f}]). "
+                       "Every step of this run is reported as NOT SCANNED "
+                       "rather than falling back to the pre-2026-08-15 "
+                       "constants, which were 3.9x wider than the screen.",
+                       (int)cam.valid, (int)cam.rotated, cam.angle, cam.zoom,
+                       cam.left, cam.right, cam.bottom, cam.top);
+        }
+        return;
+    }
+
+    if (cam.sizeMismatch) {
+        // NOT a refusal, and the distinction is substantive. The rect comes
+        // from the render transform, which is correct under zoom by
+        // construction; m_cameraWidth/Height is the cross-check, and it is the
+        // cross-check that is disagreeing. Most likely cause is a zoom this
+        // repo has never observed, under which m_cameraWidth stops tracking.
+        // Reported once rather than absorbed -- it agreed on 6146/6146 samples
+        // of the 2026-08-15 log, so any firing at all is news.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            log::warn("[gdrl] ENV camera size cross-check DISAGREES: derived "
+                      "{:.4f}x{:.4f} vs m_cameraWidth/Height {:.4f}x{:.4f} "
+                      "(zoom={:.6f}, tolerance {}). Using the transform-derived "
+                      "rect; this is a cross-check failing, not the rect.",
+                      cam.width(), cam.height(), cam.camWidth, cam.camHeight,
+                      cam.zoom, gdrl::kSizeCheckTolerance);
+        }
+    }
+
+    const double minX = g_winBehindSet ? px - (double)g_winBehind : cam.left;
+    const double maxXRequested =
+                       g_winAheadSet  ? px + (double)g_winAhead  : cam.right;
+    const double minY = g_winVertSet  ? py - (double)g_winVert   : cam.bottom;
+    const double maxY = g_winVertSet  ? py + (double)g_winVert   : cam.top;
 
     // m_sectionYFactor is measured 0 on every level dumped so far, and the
     // middle vector of m_sections is 1 deep in every dump ("max column (y) = 1"
@@ -664,10 +842,49 @@ void scanObjects(GJBaseGameLayer* layer, GdrlObservation* o, double px, double p
     int col0 = (int)std::floor(minX * (double)sxf);
     if (col0 < 0) col0 = 0;
     int col1 = (int)std::floor(maxXRequested * (double)sxf);
+
     // Never claim a window wider than the coverage mask can describe. A column
     // the mask cannot speak for must not be inside the region Python is told
     // was scanned, or "unknown" silently becomes "empty".
+    //
+    // THIS CLAMP JUST WENT SLACK, AND IT STAYS ANYWAY. Under the old 1400-ahead
+    // constant the window spanned ~19 of the 64 columns; under the measured
+    // 569-unit camera it spans ~7 at the measured secW of 100. So on Stereo
+    // Madness at zoom 1 this min() now never binds, and a clamp that never
+    // binds is exactly the shape of TODO N2 -- a constraint that goes slack
+    // unnoticed and takes a test's meaning with it. Kept deliberately, for
+    // reasons that are structural rather than defensive:
+    //
+    //   * secW is READ FROM THE GAME, not assumed. It is 0.01 -> 100 units on
+    //     both levels ever dumped, but a level with a finer section grid, or
+    //     a zoomed-OUT camera, needs more columns for the same world width.
+    //     64 * secW is the mask's reach and nothing else bounds it.
+    //   * Without it the advertised window would include columns the mask has
+    //     no entry for. env.py clips the section index and returns UNKNOWN
+    //     there, so it would not currently lie -- but that is a property of a
+    //     second file's defensive clip, and this file must not be relying on
+    //     it.
+    //
+    // What DID change is that the clamp binding is no longer routine. It now
+    // means the camera is wider than the mask can describe, i.e. the sensor is
+    // being silently narrowed below what the screen shows -- conservative
+    // under A (the agent sees LESS than a human, never more) but a real loss
+    // of fidelity, so it is reported instead of absorbed.
+    const int col1Requested = col1;
     col1 = std::min(col1, col0 + GDRL_COVERAGE_COLS - 1);
+    if (col1 < col1Requested) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            log::warn("[gdrl] ENV coverage clamp BOUND: window wanted columns "
+                      "{}..{} ({} of them) but the mask holds {}. The right "
+                      "edge is cut to {:.3f}; the agent sees LESS than the "
+                      "screen shows. secW={:.4f}, window={:.3f}..{:.3f}.",
+                      col0, col1Requested, col1Requested - col0 + 1,
+                      GDRL_COVERAGE_COLS, (double)(col1 + 1) * secW,
+                      secW, minX, maxXRequested);
+        }
+    }
 
     // Right edge of column col1 in world x, one section width past its left
     // edge. sxf is a float, so 1/0.01f is 100.0000022 and this edge sits a
@@ -687,13 +904,14 @@ void scanObjects(GJBaseGameLayer* layer, GdrlObservation* o, double px, double p
     //    ran on all of them -- the stored float is bit-identical with and
     //    without the back-off. Same result over 1.31e9 (sxf, col1) pairs with
     //    sxf spanning [0.001, 1), and with a window wide enough
-    //    (GDRL_ENV_WIN_AHEAD=20000, which clamps at :670) that colEdge rather
+    //    (GDRL_ENV_WIN_AHEAD=20000, which clamps at :874) that colEdge rather
     //    than maxXRequested is what wins the min() below, on all 2.37e9.
     // 2. The guarantee it claimed to provide is false, and the real one does not
     //    need it. Window and mask DO disagree, at the LEFT edge, on every
-    //    nonzero start column: windowMinX is px - g_winBehind (:709) while col0
-    //    is floor(minX * sxf) (:664), so the window starts partway INTO column
-    //    col0 -- by up to a full section. The reason that cannot lie is
+    //    nonzero start column: windowMinX is the camera's left edge (:928,
+    //    :828) while col0 is floor(minX * sxf) (:842), so the window starts
+    //    partway INTO column col0 -- by up to a full section. The reason that
+    //    cannot lie is
     //    structural: Python looks `state` up from the per-cell section index,
     //    not from the window, so knowledge is the INTERSECTION of the two and
     //    widening either alone can only remove cells, never add them. See the
@@ -766,10 +984,14 @@ void scanObjects(GJBaseGameLayer* layer, GdrlObservation* o, double px, double p
                 // standing on the player.
                 //
                 // It also appears once per column it has ever entered and those
-                // registrations are never removed, so at the default 400-unit
-                // behind-window it was emitted exactly five times per step
-                // (measured 5 at GDRL_ENV_WIN_BEHIND=400, 10 at 900 --
-                // phantom-synth-behind900.log). Dropping it by pointer removes
+                // registrations are never removed, so it was emitted once per
+                // behind-column: measured 5 per step at GDRL_ENV_WIN_BEHIND=400
+                // and 10 at 900 (phantom-synth-behind900.log). Both of those
+                // were taken when 400 was the DEFAULT behind-window; it is now
+                // an override and the camera's measured 209.5 behind would give
+                // ~3. The count scales with the window, the defect does not, and
+                // this filter is a pointer identity that does not care either
+                // way. Dropping it by pointer removes
                 // all of those at once and touches nothing else: in every
                 // sample of both runs, hits == ptrEqP1 + ptrEqP2, so no third
                 // object was ever involved.
@@ -1179,4 +1401,30 @@ $execute {
 //     inner-most dt rewrite is the one the engine sees), but if both
 //     GDRL_ENV_DELTA_TICKS and GDRL_DELTA_TICKS are set the effective dt is
 //     whichever hook is innermost, and that is not determined here.
+//
+// (7) NEW 2026-08-15, and it is now on the HOT PATH rather than in a probe.
+//     scanObjects calls gdrl::cameraWorldRect() every physics step, which calls
+//     CCNode::nodeToWorldTransform() on m_objectLayer's whole parent chain.
+//     That function RECOMPUTES and CACHES each ancestor matrix. viewport.cpp
+//     snapshots and restores every CCNode cache field around the call, so the
+//     chain is byte-identical afterwards BY CONSTRUCTION -- but "the field list
+//     is complete on this binary" is an argument about a header, not a
+//     measurement of the shipped object layout. TEST: one run with
+//     GDRL_VERIFY_XFORM=1, which byte-compares the whole CCNode subobject
+//     before the call against after the restore and logs every differing
+//     offset. Zero VERIFY_XFORM lines over an attempt is the evidence; anything
+//     else names the missing field directly. Until that run exists, the
+//     state-neutrality of the camera read is UNVERIFIED on the observation
+//     path, and (4)'s bit-identical maxX check is the outer guard that would
+//     catch it as a symptom.
+//
+// (8) NEW 2026-08-15. The window is now the camera rect, and object membership
+//     is a CENTRE test against it (m_positionX / m_positionY). At the old
+//     +-600 vertical that slack was irrelevant; at the measured +215/-105 an
+//     object whose centre is up to half its height outside the rect is dropped
+//     while part of it is on screen. UNVERIFIED how many objects per step that
+//     is -- it understates rather than overstates, which is the safe direction
+//     under Benchmark A, but it has never been counted. TEST: log, for one
+//     attempt, the count of objects rejected by the y/x filters whose
+//     getObjectRect() nevertheless intersects the window.
 // ---------------------------------------------------------------------------

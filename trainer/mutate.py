@@ -272,35 +272,35 @@ mut("C8-level-length-diagnostic-always-agrees", "factor",
 mut("D1-left-edge-snaps-to-the-column", "left-edge",
     "THE L5 DEFECT ITSELF: window derived from the column instead of the "
     "reverse. Advertised up to a full 100-unit section that was never scanned.",
-    [('            h["windowMinX"] = min_x                              # :710',
+    [('            h["windowMinX"] = min_x                              # :928',
       '            h["windowMinX"] = col0 * sec_w')])
 mut("D2-window-behind-sign-flip", "left-edge",
     "minX = px + g_winBehind: the window starts ahead of the player.",
-    [("            min_x = player_x - win_behind                        # :651",
-      "            min_x = player_x + win_behind                        # :651")])
+    [("            min_x = player_x - win_behind                        # :828",
+      "            min_x = player_x + win_behind                        # :828")])
 mut("D3-drop-the-col0-clamp", "left-edge",
-    "telemetry.cpp:665. Near the level start minX is negative and col0 would "
+    "telemetry.cpp:843. Near the level start minX is negative and col0 would "
     "index before the array.",
-    [("            col0 = max(0, col0)                                  # :665\n", "")])
+    [("            col0 = max(0, col0)                                  # :843\n", "")])
 mut("D4-col0-from-the-player-not-the-window", "left-edge",
     "Column derived from px rather than minX -- a four-column shift at the "
-    "mod's default 400 behind.",
-    [("            col0 = int(math.floor(min_x * sxf))                  # :664",
-      "            col0 = int(math.floor(player_x * sxf))               # :664")])
+    "fixture's 400 behind.",
+    [("            col0 = int(math.floor(min_x * sxf))                  # :842",
+      "            col0 = int(math.floor(player_x * sxf))               # :842")])
 mut("D5-drop-the-coverage-clamp-on-col1", "left-edge",
-    "telemetry.cpp:670. The window then claims columns the mask cannot speak "
+    "telemetry.cpp:874. The window then claims columns the mask cannot speak "
     "for, and unknown silently becomes empty.",
-    [("            col1 = min(col1, col0 + coverage_cols - 1)           # :670",
-      "            col1 = col0 + coverage_cols - 1                      # :670")])
+    [("            col1 = min(col1, col0 + coverage_cols - 1)           # :874",
+      "            col1 = col0 + coverage_cols - 1                      # :874")])
 mut("D6-right-edge-ignores-the-requested-window", "left-edge",
-    "telemetry.cpp:703. maxX must be the nearer of the requested edge and the "
+    "telemetry.cpp:921. maxX must be the nearer of the requested edge and the "
     "column edge.",
-    [("            max_x = min(max_x_requested, col_edge)               # :703",
-      "            max_x = col_edge                                     # :703")])
+    [("            max_x = min(max_x_requested, col_edge)               # :921",
+      "            max_x = col_edge                                     # :921")])
 mut("D7-col1-off-by-one", "left-edge",
     "One column too many claimed on the right.",
-    [("            col1 = int(math.floor(max_x_requested * sxf))        # :666",
-      "            col1 = int(math.floor(max_x_requested * sxf)) + 1    # :666")])
+    [("            col1 = int(math.floor(max_x_requested * sxf))        # :844",
+      "            col1 = int(math.floor(max_x_requested * sxf)) + 1    # :844")])
 # D8-delete-the-right-edge-backoff retired 2026-08-14. It existed only to
 # record that the nextafter back-off did nothing (an expected SURVIVED). The mod
 # deleted its copy in efc32e9 and publish() no longer transcribes it, so there is
@@ -335,13 +335,32 @@ mut("D14-scanned-cols-miscounted", "fixture",
     "it lies, the vacuity guards do too.",
     [("            self.scanned_cols = scanned", "            self.scanned_cols = coverage_cols")])
 mut("D15-refusal-frame-keeps-a-real-window", "fixture",
-    "The mod's bad-factor path claims nothing (telemetry.cpp:620-634). A "
+    "The mod's bad-factor path claims nothing (refuseScan, telemetry.cpp:"
+    "651-669). A "
     "fixture that left a real window there would make the refusal tests test "
     "the window instead of the refusal.",
     [("""            h["windowMinX"] = player_x
             h["windowMaxX"] = player_x""",
       """            h["windowMinX"] = player_x - 400.0
             h["windowMaxX"] = player_x + 1400.0""")])
+mut("D17-vertical-window-forced-symmetric-above", "fixture",
+    "The real window is +215 above the player and -105 below (measured "
+    "2026-08-15). Collapsing win_up back onto win_vert re-symmetrises it, "
+    "which is what every constant this repo used to ship did.",
+    [("            above = win_vert if win_up is None else win_up",
+      "            above = win_vert")])
+mut("D18-vertical-window-forced-symmetric-below", "fixture",
+    "Same, downward. Kept as a separate row because a decoder can lose one "
+    "half of the asymmetry without losing the other.",
+    [("            below = win_vert if win_down is None else win_down",
+      "            below = win_vert")])
+mut("D19-vertical-window-halves-swapped", "fixture",
+    "Up and down exchanged: the player sits HIGH on screen instead of low. "
+    "Same window height, so anything checking only the extent agrees.",
+    [("            min_y = player_y - below                             # :831\n"
+      "            max_y = player_y + above                             # :832",
+      "            min_y = player_y - above                             # :831\n"
+      "            max_y = player_y + below                             # :832")])
 mut("D16-refusal-frame-drops-objects-unavailable", "fixture",
     "Without the flag a count of 0 reads as 'looked and found none'.",
     [('            h["flags"] = int(h["flags"]) | int(GdrlHeaderFlag.OBJECTS_UNAVAILABLE)\n',

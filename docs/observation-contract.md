@@ -75,6 +75,23 @@ ignore what it was handed.* So each ruling also carries how it is actually held:
 mistakes the existence of this file for a guarantee. Closing that gap is listed
 at the end.
 
+**One ruling moved from DOC toward MOD on 2026-08-15: the scan window.** It was
+`px ± GDRL_ENV_WIN_BEHIND/_AHEAD/_VERT`, three constants picked before Benchmark
+A existed, and the mod now derives the window from the live camera rect every
+physics step (`telemetry.cpp:828-832`, `gdrl::cameraWorldRect`). Geometry
+outside the screen is no longer put on the wire, so it is unreachable rather
+than merely disapproved of — tier **MOD**.
+
+Two honest qualifications, because "MOD" overstates it otherwise:
+
+* `GDRL_ENV_WIN_*` still exist as **off-by-default overrides** for ablations and
+  the Benchmark B oracle. Setting one restores a constant window and the run is
+  no longer Benchmark A. The mod logs that in as many words, and the window it
+  used is on the wire in `windowMinX..windowMaxY`, but **nothing refuses such a
+  frame** — so "A-ness" itself is still DOC, held by a warning line.
+* The window is what is *geometrically on screen*, which is an **upper bound**
+  on what a human perceives. Fades, effects and draw order are not modelled.
+
 ---
 
 ## Header — `GdrlObsHeader` (`mod/src/gdrl_schema.hpp:478`)
@@ -88,10 +105,10 @@ at the end.
 | `playerX`, `playerY` | ALLOWED | POLICY | The player sees their own icon. Absolute world coordinates are a precise encoding of a perceived thing, and every other position is relative to them. |
 | `playerSpeed` | ALLOWED | POLICY | Perceived directly, and announced by a visible portal. |
 | `objectCount` | ALLOWED | POLICY | Count of objects **in the window**, i.e. a property of what was scanned, not of the level. Contrast `validity.objectCountTotal` below — same word, opposite ruling. |
-| `commandCount`, `pendingCount`, `speedSegCount` | ALLOWED | POLICY | Currently hard 0 with the UNAVAILABLE bit set (`telemetry.cpp:908-910`, zeroed at `:913-915`). See the table rulings. |
+| `commandCount`, `pendingCount`, `speedSegCount` | ALLOWED | POLICY | Currently hard 0 with the UNAVAILABLE bit set (`telemetry.cpp:1130-1132`, zeroed at `:1135-1137`). See the table rulings. |
 | `attempt` | ALLOWED | POLICY | The game displays "Attempt N" on screen in letters that big. Load-bearing for Objective D. |
 | `frame`, `stepIndex`, `dtIn`, `dtUsed` | ALLOWED | EXPERIMENTER | Harness bookkeeping and clock cross-checks. No reason for a policy to see them; no harm if it did. |
-| `windowMinX`, `windowMaxX`, `windowMinY`, `windowMaxY` | ALLOWED | POLICY | The **extent of the agent's own senses**. An agent that does not know where its knowledge stops cannot represent uncertainty, which is Objective E. Note carefully: the *field* is allowed unconditionally; the *values* are queue item 1's open question. Knowing where your senses end is legitimate whatever the answer. |
+| `windowMinX`, `windowMaxX`, `windowMinY`, `windowMaxY` | ALLOWED | POLICY | The **extent of the agent's own senses**. An agent that does not know where its knowledge stops cannot represent uncertainty, which is Objective E. Note carefully: the *field* is allowed unconditionally; the *values* were queue item 1's open question and are now the live camera rect, so these four fields vary per step and are no longer reconstructible from any constant. Knowing where your senses end is legitimate whatever the answer. |
 | `sectionXFactor`, `sectionYFactor` | ALLOWED | EXPERIMENTER | Engine indexing constants (`0.01` and `0` — measured). Emitted so the column arithmetic can be checked rather than assumed. Describes no geometry. |
 | `levelLength` | **ALLOWED** | POLICY | The hard case, and it resolves cleanly: the game draws a **progress bar**. A human reading the bar at position `p` knows `playerX / levelLength` directly, and combined with any sense of distance travelled that is informationally equivalent to `levelLength` itself. It tells you where the level ends — which is precisely what the bar tells you. |
 | `coverageStartCol` | ALLOWED | POLICY | Indexes `coverage[]` into world space. Meaningless without the array it labels. |
@@ -111,7 +128,7 @@ question by construction. The whole struct is **EXPERIMENTER**.
 | `status` | ALLOWED (experimenter) | Frame-refusal reason. |
 | `levelID`, `pinnedLevelID`, `levelPinned` | ALLOWED (experimenter) | A human sees the level's name on the screen, so even policy exposure would be defensible; there is no reason to take it. |
 | `blockInput`, `objectsTruncated` | ALLOWED (experimenter) | Harness configuration and capacity honesty. |
-| `objectCountTotal` | **FORBIDDEN for POLICY**, required for EXPERIMENTER | `m_objects->count()` for the **entire level**. A human has no channel to this whatsoever — not through the bar, not through the screen, not through anything. It is also load-bearing as a run gate: `< 10` means the level string never loaded and every number from the run is invalid (`telemetry.cpp:941`). Keep it, gate on it, never show it. |
+| `objectCountTotal` | **FORBIDDEN for POLICY**, required for EXPERIMENTER | `m_objects->count()` for the **entire level**. A human has no channel to this whatsoever — not through the bar, not through the screen, not through anything. It is also load-bearing as a run gate: `< 10` means the level string never loaded and every number from the run is invalid (`telemetry.cpp:1163`). Keep it, gate on it, never show it. |
 
 ## Player state — `GdrlPlayerState[2]` (`gdrl_schema.hpp:188`)
 
@@ -141,9 +158,14 @@ noted so it is not rediscovered as a surprise.
 ## Objects — `objects[256]` (`gdrl_schema.hpp:231`)
 
 Every entry is inside the scan window by construction, so the table's legitimacy
-rests entirely on **whether the window matches the screen** — queue item 1,
-unmeasured. Until that lands, every row below is NEEDS-MEASUREMENT *in
-aggregate*, whatever its individual verdict.
+rests entirely on **whether the window matches the screen**. That was queue item
+1 and it is now measured (569.0 × 320.0 world units, +215/−105 vertical, Stereo
+Madness at 1x and zoom 1.0) and implemented: the window is the camera rect, not
+three constants. The aggregate NEEDS-MEASUREMENT that used to hang over every
+row below is therefore **discharged for the configuration that was measured**,
+and only that one — see item 1c for the list of speeds, levels, zooms and aspect
+ratios still unmeasured, and note that no run has yet confirmed the camera-derived
+window on the live game.
 
 | Field | Verdict | Reason |
 |---|---|---|
@@ -159,7 +181,7 @@ aggregate*, whatever its individual verdict.
 
 **Currently unpopulated**, `COMMANDS_UNAVAILABLE` set, blocked on identifying
 which `GJEffectManager` container holds live `GroupCommandObject2`
-(`telemetry.cpp:901-904`).
+(`telemetry.cpp:1123-1126`).
 
 **Ruling: FORBIDDEN for POLICY as specified.** This changes what should be built,
 so it is worth being precise about why.
@@ -193,7 +215,7 @@ is what it *will* do, `duration` is how long it *will* take.
 The `PENDING_UNAVAILABLE` flag was previously "blocked on the trigger-objectID →
 kind mapping". As of this contract it is **permanent by policy, not blocked by
 engineering.** Nobody should complete that mapping expecting to populate this
-table for the agent. The comment at `telemetry.cpp:905-906` should say so.
+table for the agent. The comment at `telemetry.cpp:1127-1128` should say so.
 
 Legitimate under A: a trigger object that is **on screen** may appear in
 `objects[]` like any other object — a human sees the portal. What is forbidden
@@ -231,7 +253,7 @@ And one that does not change code but bounds a future claim:
 
 ## What this contract does not settle
 
-- **Whether the window matches the screen.** Every `objects[]` ruling is conditional on queue item 1, which is unmeasured. This document cannot make the geometry legitimate; only the measurement can.
+- **Whether the window matches the screen *in configurations nobody measured*.** Item 1 measured one: Stereo Madness, 1x, zoom 1.0, ~16:9. The mod's window is now derived rather than configured, which is what makes it correct at other zooms *by construction* — but "by construction" is an argument, and item 1c lists what has not been run. Item 1b is sharper still: under `kResolutionFixedHeight` the visible **width** follows the OS window's aspect ratio, so two runs at different aspects are not the same benchmark and nothing currently pins it.
 - **Enforcement.** Rulings 1–4 are tier **DOC** — written here, held by nothing. The mod still emits `objectCountTotal` and `groups[]`, and `env.py` still hands the whole record over. A policy-facing view that withholds the FORBIDDEN fields structurally (the way `KnownMask` already withholds a refused mask) is the obvious next step, and until it exists this file is an intention rather than a constraint.
 - **Whether `env.py`'s derived accessors leak.** `level_length_agrees_with_section_count()` and `column_span()` combine allowed fields; combinations of allowed fields are not automatically allowed, and no one has audited them for that.
 - **Music.** A human hears the beat and many GD levels are synchronised to it. The agent receives no audio at all. This is the one place the agent is *poorer* than the standard, and it is worth knowing before attributing a failure to the policy.
