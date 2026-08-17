@@ -1072,11 +1072,37 @@ spike and the other 166 must all still be reported.
 **569.0 world units on one launch, 493.0 on another — same binary, identical
 physics.** Two independent observers, tier (iv) each.
 
-Proposed mechanism, **UNVERIFIED**: GD's persisted window size escaping the
-sandbox through `cfprefsd`, which `scripts/run_sandbox.sh`'s own header caveat
-already warns ignores `CFFIXED_USER_HOME` — *"File I/O is redirected; the
-preferences system is not."* Ruled out: any `GDRL_*` switch (a probe-on run gave
-493; probe-off runs gave 569 **and** 493). It tracks the OS window only.
+**Diagnosed 2026-08-17 (tier iii).** Two hypotheses were falsified first, both
+worth recording because each was confidently held: it is **not** any `GDRL_*`
+switch (a probe-on run gave 493; probe-off runs gave 569 **and** 493), and it is
+**not** a `cfprefsd` preferences escape — the entire `com.robtop.geometrydashmac`
+domain is `{ NSAppSleepDisabled = 1; }`, one key, **no window-size key anywhere**.
+
+**The window size is a live function of whichever physical display is main at
+launch**, and the development machine has two with different aspect ratios:
+
+| display | resolution | aspect | → design width |
+|---|---|---|---|
+| Color LCD (built-in) | 2560×1664 | 1.5385 | **493** |
+| C27F390 (external) | 1920×1080 | 1.7778 | **569** |
+
+The logged `screen=` values confirm it exactly: 960×540 is **precisely half** the
+external panel, 735×478 precisely half a HiDPI scaled size of the built-in, and
+`ceil(screenW / (screenH / 320))` reproduces both design widths to the digit.
+
+**So the sensor width is docked-vs-undocked**, which is WindowServer/hardware
+state — structurally outside anything `HOME`/`CFFIXED_USER_HOME` can redirect,
+and not a sandbox leak at all. **Every width-sensitive number in this repo is
+therefore stratified by whether the external monitor was attached, and nobody was
+recording that.**
+
+This also constrains the fix: pinning cannot merely call
+`toggleFullScreen(false, …)` and trust the result — *that call is the
+display-dependent step*. It must set an absolute frame size. And a **second,
+unexplained resize** fires a few seconds after `[gdrl] forced windowed mode`
+(960×540→396×223; 735×478→342.5×222.5), always preserving the aspect; its code
+path is unidentified (**UNVERIFIED**) and it decides whether the pin needs
+reasserting or can be applied once.
 
 **Under Benchmark A the sensor definition *is* the benchmark**, so two runs at
 different widths are not the same benchmark and their attempts-to-completion

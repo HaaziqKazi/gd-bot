@@ -50,9 +50,12 @@ Status as of commit `fbc13ea` + the 2026-08-13 (L), 2026-08-14 (M/N),
 > **569 → 493** between launches of the same binary, and under Benchmark A that
 > means two runs are not the same benchmark.
 >
-> **Do not trust any run without checking provenance** — see #23. A run this
-> session had some switches arrive and others not, wandered onto *Bloodbath*, and
-> reported `input[clean]` throughout.
+> **Do not trust any run without checking provenance** — see #23. A run last
+> session lost **all** its `GDRL_*` switches (total, not partial — see the
+> 2026-08-17 correction), wandered onto *Bloodbath*, and produced a complete,
+> plausible, worthless data set. **Put every switch inline on the same command
+> line as `run_sandbox.sh`**; shell state does not persist between tool calls, and
+> only `GDRL_WINDOWED`/`GDRL_NO_APP_NAP` have inline fallbacks in the script.
 
 > **Read sections L and M first.** Between them they close I, J and K, harden
 > the observation decoder, and delete one loop that could never have done
@@ -1785,15 +1788,59 @@ at the origin early in every episode.*
 
 **The width is not stable: 569.0 world units on one launch, 493.0 on another,
 same binary, identical physics.** Two independent observers, tier (iv) each.
-Proposed mechanism, **UNVERIFIED**: GD's persisted window size escaping the
-sandbox via `cfprefsd`, which `scripts/run_sandbox.sh`'s own header caveat #2
-already warns ignores `CFFIXED_USER_HOME` — *"File I/O is redirected; the
-preferences system is not."*
+
+**DIAGNOSED 2026-08-17, tier (iii) — and the `cfprefsd` hypothesis is
+FALSIFIED.** It was the orchestrator's guess and it was wrong. The entire
+`com.robtop.geometrydashmac` preferences domain is:
+
+```
+{ NSAppSleepDisabled = 1; }
+```
+
+One key. **No window-size key exists** — not in the plist, not in a `ByHost`
+variant, not in Saved Application State. (That single key *is* real escaped
+state, so the `run_sandbox.sh` caveat is true in general — it is simply not the
+mechanism here. File-based state redirects correctly: the sandbox has its own
+11.7 KB `CCGameManager.dat` distinct from the real home's 10.4 MB one.)
+
+**The real cause: the window size is a live function of whichever physical
+display is main at launch, and this machine has two with different aspect
+ratios.**
+
+| display | resolution | aspect | → design width |
+|---|---|---|---|
+| Color LCD (built-in) | 2560×1664 | **1.5385** | **493** |
+| C27F390 (external) | 1920×1080 | **1.7778** | **569** |
+
+The logged `screen=` values confirm it exactly — 960×540 is **precisely half**
+the external panel, and 735×478 is precisely half a HiDPI scaled size of the
+built-in — and `ceil(screenW/(screenH/320))` reproduces both widths to the digit:
+
+| session | screen= (transient → settled) | aspect | design |
+|---|---|---|---|
+| Aug 15 | (960,540) → (396,223) | 1.778 | **569** |
+| Aug 16 | (735,478) → (342.5,222.5) | 1.538 | **493** |
+
+**So the drift is docked-vs-undocked**, and it is structurally outside anything
+`HOME`/`CFFIXED_USER_HOME` can redirect — it is WindowServer/hardware state, not
+a sandbox leak. **Consequence: every width-sensitive number in this repo is
+stratified by whether the external monitor was attached, and nobody was
+recording that.**
 
 **Under Benchmark A the sensor definition IS the benchmark**, so two runs at
 different widths are not the same benchmark and their attempts-to-completion
 numbers are not comparable. **This promotes item 1b from hygiene to a blocker on
 the acceptance run.**
+
+**Implications for the fix (#20):** pinning cannot just call
+`toggleFullScreen(false,…)` at `main.cpp:389` and trust the result — *that call
+is the display-dependent step*. It must set an absolute frame size. And there is
+a **second, unexplained resize** a few seconds after `[gdrl] forced windowed
+mode` (960×540→396×223; 735×478→342.5×222.5), always preserving the aspect,
+whose code path nobody has identified — **UNVERIFIED**, not load-bearing for the
+diagnosis, but it decides whether the pin must be *reasserted* or can be applied
+once. The assert-and-stamp half of 1b is now clearly the more valuable half: a
+laptop being undocked changes the benchmark with nobody touching the repo.
 
 ### Q4a. The phantom is GD's **anti-cheat spike** — a third injected object
 
@@ -1923,16 +1970,38 @@ goal the question is nearly moot.
 
 Both the tester and the debugger independently hit a run in which the `GDRL_*`
 vars never reached the game and something walked GD into *Bloodbath*. Each
-nearly misdiagnosed it as the defect they were hunting. Every health signal
-stayed quiet: `input[clean]`, `ui=0`, `uiTot=0` all looked fine while a human
-played a different level. The run produced a complete, plausible, worthless data
-set.
+nearly misdiagnosed it as the defect they were hunting. The run produced a
+complete, plausible, worthless data set.
 
-**This file's own "Methodology rules earned the hard way" already records the
-identical failure** — *"`input[clean]` meant clean-of-buttons and said nothing
-about which level was loaded — the game silently drifted to Back On Track and
-kept reporting clean."* The rule was written down and the guard was never built,
-so it happened again with a different level name. See #23.
+> **⚠️ CORRECTION 2026-08-17 — the paragraph that used to sit here was false, and
+> it was written by the orchestrator, not by any agent.** It claimed *"every
+> health signal stayed quiet: `input[clean]`, `ui=0`, `uiTot=0` all looked fine"*
+> and built an entire "partial propagation" theory on it. **The log says
+> `input[UNGUARDED]`, five for five.** Verified two independent ways:
+>
+> ```
+> 12:57:44 … ATTEMPT 1 lvl=10565740 maxX=687.566162109 … input[UNGUARDED blocked=0 leaked=0 ui=0 uiTot=0]
+> ```
+>
+> Across the **entire** 21-file archive, 392 of 392 `ATTEMPT` lines account for
+> cleanly: `input[clean]` pairs **only** with `lvl=1`/`lvl=21`; `lvl=10565740`
+> pairs **only** with `UNGUARDED`. No counterexample exists.
+>
+> The false claim came from conflating this incident with the *different*,
+> genuine Back On Track incident recorded in the methodology rules below — that
+> one really was `input[clean]` + wrong level, because `BLOCK_INPUT` was active
+> throughout and the level changed by a menu path. Same symptom shape, opposite
+> mechanism. **The symptom was propagated from a report into TODO.md and a commit
+> message without anyone grepping the log.** Exactly the failure mode this file
+> exists to prevent.
+
+**The related methodology rule below is about a *different* incident and remains
+true** — *"`input[clean]` meant clean-of-buttons and said nothing about which
+level was loaded — the game silently drifted to Back On Track and kept reporting
+clean."* That one predates the retained log window (earliest archived log is
+2026-08-13; no `lvl=2` ATTEMPT line exists in the corpus). The rule was written
+down and the guard was never built, so a *contamination* happened again — by a
+different mechanism. See #23.
 
 **Diagnosis (investigation only — no code was written).** `GDRL_PIN_LEVEL` has
 no logic defect. `g_pinLevel` (`main.cpp:121`, duplicated at `telemetry.cpp:254`)
@@ -1953,21 +2022,86 @@ level — distinguishable only by `lvl=`, which nobody greps. The comment at
 incident; the guard built in response only covers "wandered via menu mid-run",
 not "never had the var at all".
 
-**Unresolved contradiction, and it sharpens the root cause.** `inputVerdict()`
-returns `"clean"` only when `GDRL_BLOCK_INPUT` was observed as `1`. The
-contaminated run's line reads `input[clean …]`, **not `UNGUARDED`** — so
-`GDRL_BLOCK_INPUT` *did* reach that process. That makes the incident **partial
-propagation, not total**: some switches arrived and some did not, which is a
-different and more alarming root cause than "the env was lost". Settle this
-before building the guard; it changes where the fix belongs.
+**RESOLVED 2026-08-17: it was TOTAL loss, not partial. The "unresolved
+contradiction" recorded here was an artifact of the false symptom above.** Three
+switches are independently shown absent in that one run:
+
+- **`GDRL_BLOCK_INPUT`** — `input[UNGUARDED]` is emitted only when `!g_blockInput`
+  (`main.cpp:129`). Five lines, all UNGUARDED.
+- **`GDRL_AUTOPLAY`** — the `[gdrl] autoplay -> …` line is **absent**. It is
+  present in **13 of 13** other launches that day. This is a direct signal, not
+  an inference from the level drift.
+- **`GDRL_PIN_LEVEL`** — zero `WRONG LEVEL`, zero `onQuit suppressed`, zero
+  `pauseGame suppressed` lines. All three fire only when `g_pinLevel` is true
+  (`main.cpp:451-483`); their total absence on a wrong-level run is exactly what
+  "pin never armed" predicts.
+
+So the earlier diagnosis stands and is now *better* evidenced: **the off-state
+operating correctly on vars that silently never arrived is the whole failure.**
+Nothing selective is happening, and the guard's logic needs no repair.
+
+**The mechanism, and it is a trap for every agent that drives this repo.**
+`scripts/run_sandbox.sh` gives `GDRL_WINDOWED` and `GDRL_NO_APP_NAP` inline
+`${VAR:-default}` fallbacks **on the `env` invocation itself**, so they reach the
+child no matter what the calling shell had — and sure enough
+`App Nap suppression: ACTIVE` and `forced windowed mode` appear in the
+contaminated log exactly as everywhere else. **The other 37 `GDRL_*` names have
+no such fallback and pass purely by shell inheritance.** So if the invoking shell
+did not export them, *all of them vanish together, uniformly* — which is the
+observed pattern.
+
+**Why this will keep happening:** shell state does not persist between separate
+tool calls in this environment. An `export GDRL_PIN_LEVEL=1` issued in one call
+and a `./scripts/run_sandbox.sh` issued in the next produces exactly this
+contamination. **Always put the switches inline with the invocation on one
+command line** — as the "Operational notes" invocations do. UNVERIFIED as the
+cause of this specific launch (the original command line was not recovered), but
+it fully explains uniform loss and needs no per-variable behaviour.
+
+> **⚠️ A SEPARATE FAILURE WAS MISTAKEN FOR THIS ONE — 2026-08-16 21:26 onward.
+> Read this before using `autoplay=0` as a provenance signal.**
+>
+> Five consecutive launches showed `autoplay=0` and **zero** `ATTEMPT` lines
+> (~150 lines of mod-load only). The orchestrator diagnosed lost `GDRL_*`
+> switches — **wrong, and falsified within the hour by a main-thread launch with
+> every switch inline**, which propagated perfectly:
+>
+> ```
+> [gdrl] EXP instrumentation ON (GDRL_DELTA_TICKS=8 GDRL_FAST_RESET=1 GDRL_ADAPTIVE=1)
+> [gdrl] SEQCFG base=[325:8,712:8,1074:8,…]
+> ```
+>
+> …and then **hung anyway**, frozen at exactly 150 lines for 90 s of polling.
+>
+> **GD is hanging during startup**, stopping right after Geode's version check
+> and never reaching `MenuLayer::init` — which is *where the autoplay line is
+> emitted*. So `autoplay=0` here was a **consequence of the hang, not evidence of
+> lost variables**. The two runs before it (21:19, 21:24) were clean: 570 and 303
+> log lines, 37 attempts at `maxX=3959.183837891` and 13 at the null-input death.
+>
+> Ruled out by measurement: **Steam** (`connection_log.txt` shows `Logged On` at
+> 21:10:15 and Steam's logs still being written at 21:36), **lost switches**
+> (above), **a stale lock**, **a corrupt sandbox save** (untouched since 12:55),
+> and **a zombie GD process**. Display sleep / screen lock was checked and came
+> back **inconclusive**. **UNRESOLVED — needs someone to look at the physical
+> screen**, which no agent here can do.
+>
+> **Two lessons, and the second is the expensive one.** First: `autoplay=0` means
+> *"this run is void"*, never *"the switches were lost"* — those are different
+> diagnoses with different fixes. Second: **this is the third time in one session
+> that a symptom was read out of a report and turned into a cause without
+> checking the log**, and twice it was the orchestrator. The guard in (1) below
+> would have made all three self-evident.
 
 **Design settled, not written:** (1) stamp every `GDRL_*` switch the process
-actually observed — 39 distinct names are read across `mod/src/*.cpp` — into a
-startup log line, so "did the vars arrive" is answerable from the log with zero
-inference; (2) tag any attempt produced while pinned-and-wrong as a distinct
-`log::error` `ATTEMPT-REFUSED` line so a naive scan cannot mistake it for data.
-**Note (2) would not have caught this incident** — with `g_pinLevel` false the
-branch is never entered. **(1) is the one that closes it.**
+actually observed — 39 distinct names across `mod/src/*.cpp` — into a startup log
+line, so "did the vars arrive" is answerable from the log with zero inference;
+(2) tag any attempt produced while pinned-and-wrong as a distinct `log::error`
+`ATTEMPT-REFUSED` line so a naive scan cannot mistake it for data.
+**(2) would not have caught this incident** — with `g_pinLevel` false the branch
+is never entered. **(1) is the one that closes it**, and the one-line provenance
+grep in "Operational notes" would have caught it immediately: the missing
+`autoplay ->` line *is* the whole signal.
 
 ### What this session did NOT do
 
