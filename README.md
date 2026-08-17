@@ -981,6 +981,33 @@ the measured cost is ~14 s. The loopback table above is accurate and irrelevant 
 it measured Python, and **Python was never the constraint.** `frames=` is the
 honest throughput number, not round trips.
 
+> **↓ RESOLVED 2026-08-17. `GDRL_ENV_DELTA_TICKS` was measured and it works.**
+>
+> | | N=1 (control) | N=8 |
+> |---|---|---|
+> | maxX / deathTick | `3959.183837891` / 3048 | `3959.183837891` / 3048 |
+> | `frames=` | 3110 | **444** |
+> | `tickDeltas` | `[0:61 1:3048]` | `[0:62 8:381]` |
+> | wall clock / attempt | ~52 s | **~7 s** |
+>
+> **Bit-identical, ~7.4× faster.** Eleven attempts agree to the digit across
+> three independent configurations (EXP 5/5, ENV N=1 2/2, ENV N=8 4/4), all with
+> `attached=1 timeouts=0 protoErr=0`.
+>
+> **The point is not the speedup, it is that observability became free.** The EXP
+> path — no client, no observations — runs ~6.5 s per 3048-tick attempt. The ENV
+> path at N=8, with the full observation channel live, runs ~7 s. At N=1 it cost
+> **52 s**, eight times the entire budget. So the pathology was never the game;
+> it was answering the client on every single tick.
+>
+> Isolated deliberately: `GDRL_ENV_DELTA_TICKS` was the **only** dt rewriter
+> (`GDRL_DELTA_TICKS` and `GDRL_ADAPTIVE` off), so the compose ambiguity below
+> could not contaminate the result.
+>
+> **Untested and where the remaining win lives:** N=8 runs at 2× real time
+> (60 fps × 8 ticks = 480 ticks/s against 240). N=16 would be 4×, N=32 8× — if
+> determinism holds, which **nothing above 8 has tested.**
+
 **The knob was also the wrong knob**, and this file helped cause the confusion.
 There are two:
 

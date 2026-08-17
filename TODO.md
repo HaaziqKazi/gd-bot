@@ -1789,6 +1789,53 @@ This is a **pick-one** decision, not a stacking opportunity.
 no wire field, so an N-sweep **cannot be interleaved in one process** — it is one
 launch per N, and all of them must hit the same binary or the sweep is void.
 
+### 2026-08-17: `GDRL_ENV_DELTA_TICKS` MEASURED — it works, it is exact, and observability is now free
+
+**Tier (iv), main thread.** The measurement #24 was created for. Isolated
+cleanly: `GDRL_ENV=1` with `GDRL_ENV_DELTA_TICKS=N` as the **only** dt rewriter
+(`GDRL_DELTA_TICKS` and `GDRL_ADAPTIVE` deliberately OFF, so the
+`telemetry.cpp:1363` compose ambiguity cannot contaminate it), input driven by
+`GDRL_INJECT_SEQ`, and `trainer/passive_responder.py` attached so the ENV path is
+genuinely live.
+
+| | N=1 (control) | N=8 |
+|---|---|---|
+| attempts | 2 | 4 |
+| maxX / deathTick | `3959.183837891` / 3048 | `3959.183837891` / 3048 |
+| `frames=` | **3110** | **444** |
+| `tickDeltas` | `[0:61 1:3048]` | `[0:62 8:381]` |
+| wall clock / attempt | **~52 s** | **~7 s** |
+| admissibility | `attached=1 timeouts=0 protoErr=0` | `attached=1 timeouts=0 protoErr=0` |
+
+**The knob does exactly what it claims**: `tickDeltas[8:381]` is 381 frames of 8
+physics ticks = 3048, against N=1's 3048 frames of 1. **And the trajectory is
+bit-identical** — not close, identical, to the digit.
+
+**~7.4× faster at N=8, with zero divergence.** Eleven attempts now agree
+bit-for-bit across three independent configurations: EXP path 5/5, ENV N=1 2/2,
+ENV N=8 4/4.
+
+**The result that actually matters: observability is now free.** The EXP path
+(no client, no observations) runs ~6.5 s per 3048-tick attempt. The ENV path at
+N=8 — full observation channel, client answering every publish — runs ~7 s.
+**So the search can have its sensor at essentially no throughput cost.** At N=1
+it cost 52 s, i.e. 8× the whole budget, which is why this had to be measured
+before anyone designed around it.
+
+**Revised full-clear arithmetic, honest version.** A complete Stereo Madness run
+is ~20,585 ticks; at N=8 that is ~47 s, so an average attempt (dying partway) is
+~20–25 s. At 1,000–2,000 attempts that is **~6–13 hours** — an overnight job.
+**Not the ~2 h floated earlier**, which wrongly assumed 8× off the 14 s no-client
+baseline; the true gain against that baseline is ~2×, because it is N=1-with-a-
+client (52 s) that was pathological, not the game.
+
+**The obvious next move, UNMEASURED: go higher than 8.** At N=8 the game runs
+444 frames for 12.7 s of game time — 60 fps × 8 ticks = 480 ticks/s against
+real-time's 240, i.e. **2× real time**. N=16 would be 4× (~3.5 s/attempt) and
+N=32 8× (~1.75 s/attempt) *if* determinism holds. **Nothing above 8 has been
+tested, and the whole remaining throughput win lives there.** Sweep
+N ∈ {16, 32, 64} and find where it breaks — one launch per N, same binary.
+
 ### Q4 (amended). The camera sensor is right, but the width **drifts between launches**
 
 The original Q4 verdict ("the object scan is correct") should read: *correct for
