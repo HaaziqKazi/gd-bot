@@ -32,6 +32,15 @@ Status as of commit `fbc13ea` + the 2026-08-13 (L), 2026-08-14 (M/N),
 >    Rex has not yet made — but the sensor is probably already adequate (see Q5a),
 >    so this is likely policy work, not sensor work.
 >
+> **FIRST, BEFORE ANYTHING: `./scripts/dt_sweep.sh` exists and has never been
+> run.** It is the whole of step 2 below, already written. Run it, read the
+> output, record the largest bit-identical N. ~7 minutes.
+>
+> **If GD hangs at ~150 log lines and never reaches `MenuLayer`, restart Steam**
+> — quit it, relaunch, wait for `Logged On`, try again. That fixed it on
+> 2026-08-16, and Steam's log saying `Logged On` is **not** evidence Steam is
+> healthy; only a launch is.
+>
 > **Do this first, in one held GD slot (~10 min, invocations are written out
 > verbatim under "Operational notes"):**
 > 1. **Re-run Q2** against the current binary — it passed 9/9 but against an
@@ -2079,12 +2088,27 @@ it fully explains uniform loss and needs no per-variable behaviour.
 > lost variables**. The two runs before it (21:19, 21:24) were clean: 570 and 303
 > log lines, 37 attempts at `maxX=3959.183837891` and 13 at the null-input death.
 >
-> Ruled out by measurement: **Steam** (`connection_log.txt` shows `Logged On` at
-> 21:10:15 and Steam's logs still being written at 21:36), **lost switches**
-> (above), **a stale lock**, **a corrupt sandbox save** (untouched since 12:55),
-> and **a zombie GD process**. Display sleep / screen lock was checked and came
-> back **inconclusive**. **UNRESOLVED — needs someone to look at the physical
-> screen**, which no agent here can do.
+> **RESOLVED 21:41 — IT WAS STEAM, AND THE LOG LIED ABOUT IT.** Rex said
+> "restart Steam and try again". A graceful quit + relaunch fixed it completely:
+> the very next launch reached `MenuLayer`, emitted `autoplay -> 'Stereo
+> Madness'`, and played **5/5 attempts at `maxX=3959.183837891`**.
+>
+> **The reason this was missed is worth more than the fix.** Steam was ruled out
+> on the evidence of its own `connection_log.txt`, which read `Logged On` at
+> 21:10:15 with an unexpired JWT, and whose sibling logs were still being written
+> at 21:36. **All true, and all irrelevant** — Steam was logged in and still not
+> serving the API GD blocks on. This is exactly the signature
+> `scripts/run_sandbox.sh`'s header warns about: *"GD exits a few hundred ms in
+> with the same deceptive signature"*, where the Geode log looks perfectly
+> healthy right up to the point it stops.
+>
+> **RULE: `Logged On` in Steam's connection log is NOT evidence that Steam is
+> healthy for GD.** The only test is launching. When GD hangs at ~150 log lines,
+> **restart Steam first** — it costs 40 s and it is the highest-prior cause.
+>
+> Also ruled out along the way, and these were correct: lost switches (above), a
+> stale lock, a corrupt sandbox save (untouched since 12:55), a zombie GD
+> process. Display sleep was inconclusive and turned out to be irrelevant.
 >
 > **Two lessons, and the second is the expensive one.** First: `autoplay=0` means
 > *"this run is void"*, never *"the switches were lost"* — those are different
@@ -2131,6 +2155,44 @@ deterministic at ~8×, ~2 h.
 
 **So the dt sweep is not tuning. It is the difference between "run it overnight"
 and "not feasible in this project's current shape."**
+
+### 2026-08-17 addendum — the dt sweep is written but NOT run
+
+**`scripts/dt_sweep.sh` is the measurement driver for #24.** It exists, its
+syntax checks, and it has never been executed. Next session runs it and reads
+the output; no design work is needed first.
+
+What it encodes, all of it learned the hard way this session:
+- **One launch per N** — `g_envDeltaT` (`telemetry.cpp:196`) is a namespace-scope
+  `const` read once at load with no wire field, so N cannot vary within a
+  process. It also prints the binary hash at the start **and end**, because a
+  rebuild mid-sweep is indistinguishable from an N effect and voids everything.
+- **N = 1, 2, 4, 8, 16, 32, then 1 again** — the repeated control separates
+  between-process drift from a real divergence.
+- **Input comes from `GDRL_INJECT_SEQ`**, so the mod drives its own 12-jump
+  trajectory and no search driver is involved. `trainer/passive_responder.py`
+  attaches only so the ENV path is exercised and the mod does not time out and
+  free-run; an attempt with `timeouts>0` is not admissible evidence.
+- **It deliberately does not set `GDRL_DELTA_TICKS`/`GDRL_ADAPTIVE`** — that is
+  the EXP path's dt rewriter, and `telemetry.cpp:1363` warns the two do not
+  compose because the winner is a linker detail. It counts compose-warning lines
+  so a mistake is visible rather than silent.
+- **It checks `autoplay ->` after every launch and marks a run VOID** rather than
+  reporting numbers from it.
+
+**What it still cannot tell you:** whether `GDRL_ENV_DELTA_TICKS` is
+*deterministic*, and whether it is *faster*. Both remain **UNVERIFIED**, and
+together they decide whether a full Stereo Madness clear is ~2 h or 12–20 h.
+
+**Also established 2026-08-17, tier (iv), and previously never evidenced:**
+**the EXP path is deterministic.** Five consecutive attempts, all
+`maxX=3959.183837891 deathTick=3048 t=12.700000662 push=12 rel=12
+input[clean …]`, at ~6–7 s apart — matching the ~6.5 s/attempt figure and the
+2× advantage over the ENV path. That closes item 4 of #24's brief. It also
+partially re-establishes Q2 against the current binary `034fb3ac…` (the one
+carrying #22's anti-cheat filter), which reproduces the canonical trajectory
+exactly — though the *default-off* half of Q2, with no `GDRL_*` set at all, has
+still not been re-run.
 
 ### Operational notes — read before the next live run
 

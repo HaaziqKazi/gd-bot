@@ -1010,9 +1010,33 @@ cost ≈ `deathTick/240` s; ~80–120 jump decisions at 10–20 attempts each �
 The dt sweep is therefore not tuning — it is the difference between "run it
 overnight" and "not feasible in this project's current shape."
 
+**The EXP path is deterministic — established 2026-08-17, tier (iv), and never
+evidenced before.** Five consecutive attempts, every one
+`maxX=3959.183837891 deathTick=3048 t=12.700000662 push=12 rel=12
+input[clean …]`, ~6–7 s apart. So the 2× faster path is not trading correctness
+for speed, which is what made it worth taking seriously. `GDRL_ENV_DELTA_TICKS`
+itself remains **UNVERIFIED for both determinism and throughput**; the driver
+for that measurement is `scripts/dt_sweep.sh`, written and not yet run.
+
 Related and already recorded: the "~3.9 attempts/sec" figure elsewhere in this
 file came from a 391-tick attempt with **no env loop**. It does not carry to a
 3048-tick prefix.
+
+### A launch failure with a deceptive signature: restart Steam first
+
+GD can hang during startup, stopping at ~150 Geode log lines right after the
+version check and **never reaching `MenuLayer::init`** — which is where the
+`[gdrl] autoplay -> …` line is emitted. This matters for reading logs: in that
+state `autoplay=0` means *"this run is void"*, **not** *"the `GDRL_*` switches
+were lost"*. Those are different diagnoses with different fixes, and conflating
+them cost most of a session.
+
+**The fix is to restart Steam**, and the trap is that Steam's own evidence says
+it is fine: `connection_log.txt` read `Logged On` with an unexpired JWT and its
+sibling logs were still being written, while GD blocked anyway. `Logged On` is
+not evidence that Steam is healthy for GD — **only a successful launch is.**
+`scripts/run_sandbox.sh`'s header already warned that this failure wears a
+deceptive signature; it wears one for the hang too, not just the fast exit.
 
 ## Holding the jump button auto-repeats — measured, tier (iv)
 
