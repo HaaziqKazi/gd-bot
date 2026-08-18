@@ -209,7 +209,10 @@ def lay_out(struct: Struct, structs: dict[str, Struct]) -> None:
 # ---------------------------------------------------------------------------
 
 MAGIC = 0x4C524447          # 'GDRL' read little-endian -- README's GDRL_OBS_MAGIC
-WIRE_VERSION = 1
+WIRE_VERSION = 2             # bumped for GDRL_PRACTICE: GdrlActionKind gained
+                              # CHECKPOINT_SAVE/RESTORE/CLEAR, GdrlObsHeader gained
+                              # resumeTick/checkpointTick/hasCheckpoint/practiceMode,
+                              # GdrlValidity gained fullAttempts/practiceAttempts.
 
 # Fixed capacities. A variable-length record in the hot path means a parse
 # before you know how much to read; the point of this format is that a tick is
@@ -391,14 +394,28 @@ ENUMS: list[Enum] = [
     Enum(
         name="GdrlActionKind",
         underlying="u8",
-        members=(("NOOP", 0), ("PRESS", 1), ("RELEASE", 2), ("HOLD", 3)),
+        members=(
+            ("NOOP", 0), ("PRESS", 1), ("RELEASE", 2), ("HOLD", 3),
+            ("CHECKPOINT_SAVE", 4), ("CHECKPOINT_RESTORE", 5), ("CHECKPOINT_CLEAR", 6),
+        ),
         comment=(
             "HOLD is (start_tick, hold_ticks): one record the mod expands into a\n"
             "push at targetTick and a release at targetTick + holdTicks. It is here\n"
             "in wire version 1 on purpose -- Objective C needs an action duration,\n"
             "and adding the field later would reshape every trained action record.\n"
             "PRESS/RELEASE remain so a policy can also hold across an arbitrary\n"
-            "number of decisions without re-issuing."
+            "number of decisions without re-issuing.\n"
+            "\n"
+            "CHECKPOINT_SAVE/RESTORE/CLEAR (wire version 2, GDRL_PRACTICE) are\n"
+            "unlike the first four: they do not queue a button, they call GD's own\n"
+            "PlayLayer::markCheckpoint/loadLastCheckpoint/removeAllCheckpoints\n"
+            "immediately when the action block is consumed, and targetTick/\n"
+            "holdTicks/button/player are unused for them. They are refused\n"
+            "(a protocol error, same as an unknown kind) unless GDRL_PRACTICE=1 --\n"
+            "practice mode is an explicit, declared opt-in (TODO.md 'Open decisions\n"
+            "-> 0': rewinding without paying for the replay is Benchmark B by\n"
+            "definition), never something a stray action kind can smuggle in\n"
+            "against a default-off run."
         ),
     ),
 ]
@@ -634,6 +651,17 @@ STRUCTS: list[Struct] = [
             Field("blockInput", "u8", comment="GDRL_BLOCK_INPUT is on"),
             Field("objectsTruncated", "u8",
                   comment="a capacity was hit; some columns are TRUNCATED"),
+            Field("fullAttempts", "i64",
+                  comment="lifetime count of attempts that began at tick 0. "
+                          "Benchmark A's number. Never reset between attempts."),
+            Field("practiceAttempts", "i64",
+                  comment="lifetime count of attempts that began from a "
+                          "GDRL_PRACTICE checkpoint restore, tick > 0. Kept "
+                          "apart from fullAttempts on the wire itself so an A "
+                          "number and a practice-assisted number can never be "
+                          "averaged together by accident downstream. Zero on "
+                          "every run that never set GDRL_PRACTICE=1. Never "
+                          "reset between attempts."),
         ],
     ),
     Struct(
@@ -703,6 +731,35 @@ STRUCTS: list[Struct] = [
                   comment="EXT: GJGameState::m_isDualMode -- the real dual test"),
             Field("isPaused", "u8", comment="EXT: PlayLayer::m_isPaused"),
             Field("inResetDelay", "u8", comment="EXT: PlayLayer::m_inResetDelay"),
+            # --- GDRL_PRACTICE (wire version 2) -----------------------------
+            #
+            # Without these the driver cannot count honestly: a practice
+            # attempt and a from-tick-0 attempt look identical on the wire
+            # apart from the PRACTICE header flag, and neither tells the
+            # driver HOW MANY ticks of replay it actually paid for this
+            # attempt. resumeTick answers that; it is latched once, at the
+            # attempt boundary (GDRLTelemetryPlayLayer::resetLevel), and does
+            # NOT change mid-attempt even if a later CHECKPOINT_SAVE moves the
+            # live checkpoint -- checkpointTick/hasCheckpoint are the live
+            # values for that.
+            Field("resumeTick", "i32",
+                  comment="EXT: GDRL_PRACTICE. The tick this attempt began at. "
+                          "0 for a full (tick-0) attempt; the checkpoint's tick "
+                          "for a practice-resumed one. Latched at the attempt "
+                          "boundary, not live."),
+            Field("checkpointTick", "i32",
+                  comment="EXT: GDRL_PRACTICE. Tick of the checkpoint currently "
+                          "held (survives across attempts until overwritten or "
+                          "cleared), or -1 if none exists. Live, not latched."),
+            Field("hasCheckpoint", "u8",
+                  comment="EXT: GDRL_PRACTICE. 1 if a checkpoint exists right "
+                          "now and CHECKPOINT_RESTORE would have something to "
+                          "restore. Live, not latched."),
+            Field("practiceMode", "u8",
+                  comment="EXT: 1 if GDRL_PRACTICE=1 for this whole run, not "
+                          "just this attempt -- provenance a driver can read "
+                          "off the wire instead of having to have captured the "
+                          "STAMP log line."),
         ],
     ),
     Struct(

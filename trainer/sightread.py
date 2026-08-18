@@ -126,16 +126,25 @@ import heapq
 import itertools
 import json
 import math
+import os
 import statistics
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 import numpy as np
 
 import env as envmod
 import schema_generated as sg
-from env import Action, Channel, Observation, make_loopback_buffer, wait_for_shared
+from env import (
+    Action,
+    Channel,
+    HandshakeError,
+    Observation,
+    make_loopback_buffer,
+    wait_for_shared,
+)
 from schema_generated import (
     GDRL_MAX_ACTIONS,
     GDRL_TICK_HZ,
@@ -621,7 +630,8 @@ class AttemptLedger:
     has to defeat two counters, one of which this file does not control.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, on_close: Callable[[AttemptRecord], None] | None = None
+                ) -> None:
         self._records: list[AttemptRecord] = []
         self._first_game_attempt: int | None = None
         self._last_game_attempt: int | None = None
@@ -631,6 +641,14 @@ class AttemptLedger:
         #: but it is visible in header.attempt, so without tracking it the audit
         #: reports a phantom uncounted attempt on every run that stops on budget.
         self._unused_attempt: int | None = None
+        #: Called with every record the instant it closes, i.e. before the
+        #: caller that spent the attempt does anything else. TODO ("env.py
+        #: clients SIGSEGV when the game dies while they hold the mmap"): an
+        #: end-of-run dump is a dump that never happens if the process does not
+        #: reach the end, and this repo has already lost two full runs to that.
+        #: A callback here rather than a hardcoded file write is what lets the
+        #: loopback tests exercise this without touching a filesystem.
+        self._on_close = on_close
 
     # -- witnesses --------------------------------------------------------
     def observe_game_attempt(self, attempt: int) -> None:
@@ -701,6 +719,15 @@ class AttemptLedger:
         rec.wall_seconds = wall_seconds
         self.observe_game_attempt(game_attempt)
         self._open = None
+        # Ledger bookkeeping above is done first, so a raising callback (a full
+        # disk, a bad path) leaves the ledger itself consistent -- the open/close
+        # pairing that the audit depends on -- even though the persistence it
+        # was asked to do failed. The callback is intentionally NOT swallowed: a
+        # driver that silently failed to persist a result would be exactly the
+        # "confident answer nobody was entitled to" failure mode this repo keeps
+        # a rule about, just moved from the search to the I/O.
+        if self._on_close is not None:
+            self._on_close(rec)
 
     # -- the audit --------------------------------------------------------
     def audit(self) -> list[str]:
@@ -735,6 +762,30 @@ class AttemptLedger:
 
 class RunAborted(RuntimeError):
     """The run cannot continue: the environment stopped being evidence."""
+
+
+class GameGone(RunAborted):
+    """The game process is no longer there to answer.
+
+    A subclass of :class:`RunAborted`, not a sibling: ``Sightreader.run()``'s
+    existing ``except RunAborted`` already stops the search cleanly and reports
+    why, so this needed no new handling at that layer -- only a way for
+    :class:`Runner` to *tell the difference* between "the level-complete screen
+    is showing and stopped publishing" (an ordinary timeout, handled per-plan as
+    ``unrunnable``) and "the process is dead" (nothing further can be learned,
+    stop the whole run).
+
+    What this does NOT do, and cannot: catch an actual SIGSEGV/SIGBUS from
+    ``numpy`` touching a page the OS has pulled out from under the mapping.
+    That is a hardware trap, not a Python exception, and no ``try/except`` in
+    this file or any other pure-Python code can recover from it -- the process
+    dies before a handler could run safely. The mitigation for *that* failure
+    mode lives elsewhere: incremental, flushed JSONL writes (see
+    ``AttemptLedger(on_close=...)`` and ``main()``) mean a hard crash loses at
+    most the attempt in flight, not the run. This class only converts the
+    common, non-fatal case -- the game exited and polling now times out -- from
+    an uncaught crash into a clean, reported stop.
+    """
 
 
 @dataclass
@@ -797,7 +848,27 @@ class Runner:
 
     # -- protocol plumbing ------------------------------------------------
     def _poll(self) -> Observation:
-        obs = self.chan.poll(timeout=self.timeout)
+        # Cheap and proactive: `os.kill(pid, 0)` (behind mod_process_alive())
+        # costs one syscall and catches the common case -- the game already
+        # exited -- before spending a whole `timeout` finding out the slow way.
+        # It cannot close the race where the process dies mid-poll; the
+        # TimeoutError branch below is the fallback for that.
+        if not self.chan.mod_process_alive():
+            raise GameGone(
+                f"mod process (pid {self.chan.mod_pid}) is not running; "
+                "refusing to poll a segment nothing is writing to"
+            )
+        try:
+            obs = self.chan.poll(timeout=self.timeout)
+        except TimeoutError as exc:
+            # Distinguish "the process is dead" from "it is alive but not
+            # answering" (e.g. the level-complete screen, or a real stall).
+            # Only the former stops the whole run; see GameGone's docstring.
+            if not self.chan.mod_process_alive():
+                raise GameGone(
+                    f"the game process (pid {self.chan.mod_pid}) is gone: {exc}"
+                ) from exc
+            raise
         self.ledger.observe_game_attempt(obs.attempt)
         fatal = FrameGate.fatal_reasons(obs)
         if fatal:
@@ -1151,6 +1222,33 @@ class CandidateSource:
         self.rhythm = rhythm
         self.max_span_horizons = max_span_horizons
         self._tried: set[Interval] = set()
+        #: How many times ``widen()`` has been called. 0 means "never widened".
+        #: Feeds both the start-tick span (via ``max_span_horizons``, already a
+        #: multiplicative parameter) and the hold-length menu (via
+        #: ``_hold_mults``), because a stall that survives one widening should
+        #: get MORE room next time, not the same room again.
+        self.widen_level = 0
+        self._hold_mults: list[float] = [8, 4, 2, 1, 0.5, 0.125]
+        self._gen = self._generate()
+
+    def widen(self) -> None:
+        """Broaden the spread after repeated failure. Diversity, not depth.
+
+        Called on a node that is being forced back into contention by
+        escalating backtrack (:class:`Sightreader`). Doubling
+        ``max_span_horizons`` widens the start-tick sweep; adding a coarser and
+        a finer hold multiplier widens the hold-length menu. Both grow with
+        every call, so a site that stalls again after being widened once gets
+        widened further rather than being offered the same neighbourhood again.
+        Re-running ``_generate()`` re-yields already-tried intervals too, but
+        ``next()`` filters those through ``_tried`` at zero cost -- nothing here
+        spends an attempt by itself.
+        """
+        self.widen_level += 1
+        self.max_span_horizons *= 2.0
+        lo = self._hold_mults[-1] / 2.0
+        hi = self._hold_mults[0] * 2.0
+        self._hold_mults = [hi] + self._hold_mults + [lo]
         self._gen = self._generate()
 
     # -- what the senses said about the place it died ---------------------
@@ -1205,7 +1303,7 @@ class CandidateSource:
         cost four attempts per node and the tap-sized ones take over.
         """
         u = self.rhythm.unit
-        return [max(1, h) for h in (8 * u, 4 * u, 2 * u, u, u // 2, max(1, u // 8))]
+        return sorted({max(1, int(m * u)) for m in self._hold_mults}, reverse=True)
 
     def _start_passes(self) -> list[list[int]]:
         """Candidate start ticks, ordered by a prior about where jumps go.
@@ -1316,6 +1414,15 @@ class Node:
     attempts_spent: int = 0
     exhausted: bool = False
     children: list["Node"] = field(default_factory=list)
+    #: Set when this node's own outcome is a confirmed repeat of a detected
+    #: wall (see ``Sightreader._wall_tolerance``/``_at_wall``) or a press that
+    #: landed while airborne (``_press_was_airborne``). A blocked node is never
+    #: pushed to the heap: nothing past a wall's own arrival point can change
+    #: whether it was hit, so proposing MORE intervals after it is not a
+    #: different bet, it is the same bet again. Kept separate from
+    #: ``exhausted`` (which means "this node's generator ran dry") so a report
+    #: can tell "gave up" from "was pruned" apart.
+    blocked: bool = False
 
     def priority(self, penalty: float) -> float:
         """Higher is expanded first.
@@ -1349,6 +1456,9 @@ class SearchReport:
     stopped_because: str
     fatal: list[str]
     records: tuple[AttemptRecord, ...]
+    #: How many times escalating backtrack fired (see ``Sightreader._escalate``).
+    #: Zero means the run never needed it -- the frontier never stalled.
+    escalations: int = 0
 
     def text(self) -> str:
         lines = []
@@ -1378,6 +1488,7 @@ class SearchReport:
         lines.append(f"measured hop (ticks) : {self.rhythm.airtime_ticks} "
                      f"from {self.rhythm.jumps_seen} landings")
         lines.append(f"measured horizon     : {self.rhythm.horizon_ticks} ticks")
+        lines.append(f"wall escalations     : {self.escalations}")
         if self.unmeasured:
             lines.append("UNMEASURED, fallback in use: " + ", ".join(self.unmeasured))
         if self.fatal:
@@ -1422,6 +1533,7 @@ class SearchReport:
             "stopped_because": self.stopped_because,
             "fatal": self.fatal,
             "records": [r.as_dict() for r in self.records],
+            "escalations": self.escalations,
         }
 
 
@@ -1439,7 +1551,7 @@ class Sightreader:
     def __init__(self, runner: Runner, *, budget: int = 400,
                  target_x: float | None = None, patience: float = 8.0,
                  watch_lead_horizons: float = 1.25, verbose: bool = True,
-                 progress=print):
+                 progress=print, wall_patience: int = 3):
         self.runner = runner
         self.ledger = runner.ledger
         self.budget = budget
@@ -1451,6 +1563,12 @@ class Sightreader:
         self.memory = Memory()
         self.rhythm = Rhythm()
         self.best: Outcome | None = None
+        #: The tree node the current ``self.best`` outcome sits at, kept in
+        #: lockstep with it. Escalating backtrack walks up FROM here, because
+        #: every probe fired after a wall is confirmed shares this node's whole
+        #: plan as its prefix (measured: 236/236 in the live run that motivated
+        #: this).
+        self.best_node: Node | None = None
         #: The search tree's root, kept so the shape of the search (did it ever
         #: revisit a decision, or only push the frontier?) is inspectable rather
         #: than inferred from the attempt log.
@@ -1458,6 +1576,27 @@ class Sightreader:
         self._counter = itertools.count()
         self._heap: list[tuple[float, int, Node]] = []
         self.stopped_because = "budget exhausted"
+
+        #: After this many probes since the last escalation that still land on
+        #: the same detected wall (or land with the decisive press taken while
+        #: airborne), force a backtrack. Small and constant, not a level fact --
+        #: it is how much slack the search gives itself before concluding "more
+        #: of the same" isn't going to change the answer. Reused for both
+        #: signals so one knob governs both.
+        self.wall_patience = wall_patience
+        self._wall_strikes = 0
+        self._airborne_strikes = 0
+        #: How many ancestor-levels ``_escalate`` climbs on its NEXT trigger.
+        #: Starts at 1 (the immediate parent of ``best_node``, i.e. "try a
+        #: different last interval") and grows every time escalating to the
+        #: current depth is *also* followed by landing back on the same wall --
+        #: this is item 2's actual fix: interval N-1, then N-2, then N-3, not a
+        #: single fixed hop.
+        self._backtrack_depth = 1
+        #: How many times ``_escalate`` has actually fired. Reported, not acted
+        #: on further -- a run that escalated zero times never needed this file
+        #: at all, and one is a useful thing to be able to tell from a distance.
+        self.escalations = 0
 
     # -- bookkeeping ------------------------------------------------------
     def _penalty(self) -> float:
@@ -1487,6 +1626,91 @@ class Sightreader:
         lead = int(self.watch_lead_horizons * self.rhythm.horizon)
         return max(0, death_tick - lead)
 
+    # -- wall detection and escalating backtrack ---------------------------
+    def _wall_tolerance(self) -> float:
+        """How close two deaths' x must be to count as "the same place".
+
+        Derived from the measured hop, not a level constant: a twentieth of
+        one hop's travel is far tighter than any real gap between obstacles a
+        held input is meant to cross, and far looser than float noise on a
+        deterministic replay (README: bit-identical x on an identical prefix).
+        """
+        upt = self.rhythm.units_per_tick or Rhythm.DOCUMENTED_UPT_1X
+        return max(1e-6, 0.05 * self.rhythm.unit * upt)
+
+    def _at_wall(self, out: Outcome) -> bool:
+        """Is ``out`` a repeat of the death site :class:`Memory` has flagged?
+
+        ``Memory.death_wall`` only starts answering once >= 3 deaths have
+        clustered at the current best x, so this is silent for the first
+        couple of probes past a new frontier -- exactly the window in which a
+        death there might still be a fluke rather than a wall.
+        """
+        wall = self.memory.death_wall(self._wall_tolerance())
+        return wall is not None and abs(out.max_x - wall[0]) <= self._wall_tolerance()
+
+    def _press_was_airborne(self, out: Outcome, iv: Interval) -> bool | None:
+        """Was the player off the ground when ``iv``'s press was due?
+
+        A-legal: reads only ``player.is_on_ground``, an ALLOWED proprioceptive
+        field :class:`Rhythm.observe` already reads every attempt -- nothing
+        new is exposed to get this signal. If holding really does only
+        re-jump on landing (this module's stated, UNVERIFIED bet), a press
+        issued while airborne does nothing at all: the interval was scheduled,
+        counted, and had zero effect. That makes this a sharper and much
+        earlier signal that an interval was wasted than waiting for several
+        identical deaths to accumulate in ``Memory`` -- one occurrence already
+        says the press did nothing, where the death-site route needs three.
+
+        Returns ``None`` when the watch window did not cover the press tick,
+        which must never be read as "grounded": absence of evidence here is
+        not evidence of the ground, and misreading it that way would be
+        exactly the "measurement changed, not the simulation" mistake this
+        repo keeps a rule about.
+        """
+        for s in out.sights:
+            if s.tick == iv.start_tick:
+                return not s.player.is_on_ground
+        return None
+
+    def _escalate(self) -> None:
+        """Force an ancestor of ``best_node`` back into contention.
+
+        This is item 2's actual mechanism. Climbs ``self._backtrack_depth``
+        steps up the champion path from ``best_node`` (depth 1 is its parent,
+        i.e. "try a different last interval"; depth 2 is the grandparent,
+        i.e. "the last interval was never the problem, try a different one
+        before it"; and so on). Every node strictly between the reopened
+        ancestor and ``best_node`` -- including ``best_node`` itself -- is
+        blocked: everything in that span has only ever led back to the
+        current wall, so proposing yet another interval after it is the same
+        bet again, not a different one (item, "stop generating candidates
+        that lead into it unchanged"). The reopened ancestor is widened
+        (diversity: a broader start-tick sweep and hold-length menu) before
+        being pushed, and the depth grows by one for next time, so a site
+        that survives one escalation gets pushed back further on the next.
+        """
+        if self.best_node is None:
+            return
+        anc = self.best_node
+        for _ in range(self._backtrack_depth):
+            if anc.parent is None:
+                break
+            anc = anc.parent
+        cur = self.best_node
+        while cur is not anc and cur is not None:
+            cur.blocked = True
+            cur.exhausted = True
+            cur = cur.parent
+        anc.source.widen()
+        anc.blocked = False
+        anc.exhausted = False
+        self._push(anc)
+        self.escalations += 1
+        self._backtrack_depth += 1
+        self._wall_strikes = 0
+        self._airborne_strikes = 0
+
     def _say(self, msg: str) -> None:
         if self.verbose:
             self.progress(msg)
@@ -1510,9 +1734,16 @@ class Sightreader:
     # -- the loop ---------------------------------------------------------
     def run(self) -> SearchReport:
         t0 = time.perf_counter()
-        self.runner.prime()
 
         try:
+            # `prime()` used to sit outside this try. That meant a game that
+            # was already gone before the very first poll -- attach raced a
+            # crash, or GD never got past the loading screen -- raised
+            # GameGone/TimeoutError straight out of run(), past every handler
+            # below, and out of main() as an unhandled crash: no report, no
+            # "stopped_because", just a traceback. Moving it inside is the
+            # whole fix; RunAborted (GameGone's base) is already handled here.
+            self.runner.prime()
             # Attempt 1 is a calibration rollout with no input at all, observed
             # at stride 1 from the first tick. It buys the three numbers the
             # search is scaled by -- units per tick, hop length, sensor horizon --
@@ -1523,6 +1754,7 @@ class Sightreader:
                         source=CandidateSource(Plan(()), root_out, self.rhythm),
                         subtree_best_x=root_out.max_x)
             self.root = root
+            self.best_node = root
             self._push(root)
 
             while self._heap and self.ledger.count < self.budget:
@@ -1548,6 +1780,11 @@ class Sightreader:
                 out = self._evaluate(cand, "probe",
                                      self._watch_from(node.outcome.end_tick))
                 self._push(node)
+                became_best = self.best is out
+                if became_best:
+                    self._backtrack_depth = 1
+                    self._wall_strikes = 0
+                    self._airborne_strikes = 0
                 if out.ok:
                     child = Node(plan=cand, outcome=out, parent=node,
                                  depth=node.depth + 1,
@@ -1555,9 +1792,45 @@ class Sightreader:
                                  subtree_best_x=out.max_x)
                     node.children.append(child)
                     self._propagate(node, out.max_x)
-                    self._push(child)
+                    if became_best:
+                        self.best_node = child
+                        self._push(child)
+                    else:
+                        # Wall detection (item 1): a death that repeats an
+                        # already-flagged site, or a press that landed on a
+                        # cube already off the ground, cannot be fixed by
+                        # yet another interval appended after it -- block the
+                        # child instead of handing it a fresh CandidateSource
+                        # to explore forever. That is what let 236/236 probes
+                        # in the live run that motivated this share one
+                        # 5-interval prefix: every failed probe manufactured a
+                        # brand-new, zero-penalty child that outranked every
+                        # already-probed ancestor, so the search never ran out
+                        # of "fresh" territory to push one tick deeper into.
+                        airborne = self._press_was_airborne(out, iv)
+                        at_wall = self._at_wall(out)
+                        if airborne or at_wall:
+                            child.blocked = True
+                            child.exhausted = True
+                            if airborne:
+                                self._airborne_strikes += 1
+                            if at_wall:
+                                self._wall_strikes += 1
+                            if (self._airborne_strikes >= self.wall_patience
+                                    or self._wall_strikes >= self.wall_patience):
+                                self._escalate()
+                        else:
+                            self._push(child)
         except RunAborted as exc:
             self.stopped_because = f"aborted: {exc}"
+        except TimeoutError as exc:
+            # Reachable when the process is confirmed ALIVE but has stopped
+            # answering (GameGone above already handles the confirmed-dead
+            # case). A genuine hang is not evidence either, so this stops the
+            # run the same way rather than crashing main() with a traceback --
+            # but it is reported under its own name so a hang is never read as
+            # a clean "level completed"/"budget exhausted" stop.
+            self.stopped_because = f"aborted: game stopped responding: {exc}"
         except KeyboardInterrupt:
             self.stopped_because = "interrupted"
 
@@ -1599,6 +1872,7 @@ class Sightreader:
             stopped_because=self.stopped_because,
             fatal=list(self.runner.fatal),
             records=self.ledger.records,
+            escalations=self.escalations,
         )
 
 
@@ -1708,6 +1982,33 @@ def bench_loopback(strides=(1, 8, 64), objects=(0, 120), round_trips=2000,
 RECORD_MAX_X = 3959.183837891
 
 
+def jsonl_writer(path: str) -> Callable[[AttemptRecord], None]:
+    """Open ``path`` for append and return a callback that writes one attempt.
+
+    Every call writes one JSON line and flushes it to the OS immediately --
+    that is the durability property, not "gets written by the time the process
+    exits", because the whole reason this exists is that the process might not.
+    ``fsync`` is included: ``flush()`` alone only moves the bytes out of
+    Python's buffer into the OS page cache, which already survives this
+    process being killed or SIGSEGV-ing, but not a hard power loss; the fsync
+    is cheap at one line per real attempt (never more than a few per second)
+    and removes the need to reason about which failure modes it does and does
+    not cover.
+
+    The file is opened once, in append mode, and kept open for the life of the
+    run -- so restarting a crashed driver at the same path adds to the record
+    of that path rather than silently discarding what a previous process wrote.
+    """
+    fh = open(path, "a", buffering=1)   # line-buffered
+
+    def _write(rec: AttemptRecord) -> None:
+        fh.write(json.dumps(rec.as_dict()) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+    return _write
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="A-legal search driver for gd-rl.",
@@ -1721,6 +2022,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--patience", type=float, default=8.0,
                     help="ticks-equivalent a node forfeits per failed probe; "
                          "smaller backtracks sooner")
+    ap.add_argument("--wall-patience", type=int, default=3,
+                    help="consecutive probes that land back on the same "
+                         "death site, or land with the press taken while "
+                         "airborne, before escalating backtrack forces an "
+                         "earlier interval back into contention")
     ap.add_argument("--watch-horizons", type=float, default=1.25,
                     help="how many measured sensor horizons before the frontier "
                          "the observation stride drops to 1")
@@ -1729,7 +2035,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--timeout", type=float, default=20.0,
                     help="seconds to wait for one observation")
     ap.add_argument("--shm", default="gdrl.env", help="shared segment name")
-    ap.add_argument("--json", default=None, help="write the full report here")
+    ap.add_argument("--json", default=None, help="write the full report here, "
+                    "at the end of the run")
+    ap.add_argument("--jsonl", default=None,
+                    help="append each closed attempt here AS IT HAPPENS, "
+                         "flushed and fsynced immediately -- survives a crash "
+                         "mid-run. Defaults to '<json>.jsonl' when --json is "
+                         "given and this is not; pass explicitly to get "
+                         "incremental durability without an end-of-run file, "
+                         "or to name it yourself")
     ap.add_argument("--bench", action="store_true",
                     help="measure loopback round-trip cost and exit "
                          "(no game needed)")
@@ -1739,18 +2053,46 @@ def main(argv: list[str] | None = None) -> int:
         bench_loopback()
         return 0
 
-    buf = wait_for_shared(args.shm, timeout=30.0)
+    jsonl_path = args.jsonl or (f"{args.json}.jsonl" if args.json else None)
+    on_close = jsonl_writer(jsonl_path) if jsonl_path else None
+    if jsonl_path:
+        print(f"appending each closed attempt to {jsonl_path}")
+
+    # From here on, a dead/vanished game must not crash this process -- see
+    # GameGone. Sightreader.run() already converts GameGone/RunAborted/a bare
+    # poll TimeoutError into a clean stop with a populated report, so the only
+    # gap left here is BEFORE run() is reached: wait_for_shared timing out (the
+    # game never started) and chan.attach() racing a crash between the segment
+    # appearing and the handshake completing. Both are narrow windows, but per
+    # TODO's "cost two full runs" story, narrow is not the same as impossible.
+    try:
+        buf = wait_for_shared(args.shm, timeout=30.0)
+    except HandshakeError as exc:
+        print(f"never found a live game to attach to: {exc}", file=sys.stderr)
+        return 2
+
     chan = Channel(buf)
-    ledger = AttemptLedger()
+    ledger = AttemptLedger(on_close=on_close)
     runner = Runner(chan, ledger, max_stride=args.max_stride, timeout=args.timeout)
     search = Sightreader(runner, budget=args.budget,
                          target_x=None if args.target < 0 else args.target,
                          patience=args.patience,
-                         watch_lead_horizons=args.watch_horizons)
-    chan.attach()
+                         watch_lead_horizons=args.watch_horizons,
+                         wall_patience=args.wall_patience)
+    try:
+        chan.attach()
+    except HandshakeError as exc:
+        print(f"attach failed, no attempts were played: {exc}", file=sys.stderr)
+        buf.close()
+        return 2
+
     try:
         report = search.run()
     finally:
+        # Best-effort: if the segment really is gone, these are backstops (see
+        # Channel.detach's own docstring), not the primary defense. They are
+        # not expected to raise, but see the module-level note below GameGone:
+        # nothing here can promise that against a torn/unmapped segment.
         chan.detach()
         buf.close()
 
@@ -1759,6 +2101,9 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.json, "w") as fh:
             json.dump(report.as_dict(), fh, indent=2)
         print(f"\nfull ledger written to {args.json}")
+    if report.fatal:
+        print(f"\nFATAL, run stopped early: {'; '.join(report.fatal)}",
+              file=sys.stderr)
     return 0 if not report.audit and not report.fatal else 1
 
 

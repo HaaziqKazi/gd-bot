@@ -12,8 +12,8 @@ from enum import IntEnum
 import numpy as np
 
 GDRL_MAGIC = 0x4C524447
-GDRL_WIRE_VERSION = 1
-GDRL_SCHEMA_HASH = 0xBEE47E250E167BC7
+GDRL_WIRE_VERSION = 2
+GDRL_SCHEMA_HASH = 0x1932358CD5ED7E73
 GDRL_TICK_HZ = 240
 GDRL_MAX_OBJECTS = 256
 GDRL_MAX_GROUPS = 10
@@ -193,12 +193,26 @@ class GdrlActionKind(IntEnum):
     and adding the field later would reshape every trained action record.
     PRESS/RELEASE remain so a policy can also hold across an arbitrary
     number of decisions without re-issuing.
+
+    CHECKPOINT_SAVE/RESTORE/CLEAR (wire version 2, GDRL_PRACTICE) are
+    unlike the first four: they do not queue a button, they call GD's own
+    PlayLayer::markCheckpoint/loadLastCheckpoint/removeAllCheckpoints
+    immediately when the action block is consumed, and targetTick/
+    holdTicks/button/player are unused for them. They are refused
+    (a protocol error, same as an unknown kind) unless GDRL_PRACTICE=1 --
+    practice mode is an explicit, declared opt-in (TODO.md 'Open decisions
+    -> 0': rewinding without paying for the replay is Benchmark B by
+    definition), never something a stray action kind can smuggle in
+    against a default-off run.
     """
 
     NOOP = 0
     PRESS = 1
     RELEASE = 2
     HOLD = 3
+    CHECKPOINT_SAVE = 4
+    CHECKPOINT_RESTORE = 5
+    CHECKPOINT_CLEAR = 6
 
 
 # Padding is excluded from the dtypes below and replaced by explicit
@@ -332,9 +346,9 @@ GdrlSpeedSegment_DTYPE = np.dtype({
     'itemsize': 12,
 })
 
-# GdrlValidity: 56 bytes, align 8
+# GdrlValidity: 72 bytes, align 8
 GdrlValidity_DTYPE = np.dtype({
-    'names': ['blocked', 'leaked', 'uiEvents', 'timeouts', 'inputVerdict', 'status', 'levelID', 'pinnedLevelID', 'objectCountTotal', 'levelPinned', 'blockInput', 'objectsTruncated'],
+    'names': ['blocked', 'leaked', 'uiEvents', 'timeouts', 'inputVerdict', 'status', 'levelID', 'pinnedLevelID', 'objectCountTotal', 'levelPinned', 'blockInput', 'objectsTruncated', 'fullAttempts', 'practiceAttempts'],
     'formats': [
         '<i8',
         '<i8',
@@ -348,14 +362,16 @@ GdrlValidity_DTYPE = np.dtype({
         '<u1',
         '<u1',
         '<u1',
+        '<i8',
+        '<i8',
     ],
-    'offsets': [0, 8, 16, 24, 32, 36, 40, 44, 48, 52, 53, 54],
-    'itemsize': 56,
+    'offsets': [0, 8, 16, 24, 32, 36, 40, 44, 48, 52, 53, 54, 56, 64],
+    'itemsize': 72,
 })
 
-# GdrlObsHeader: 152 bytes, align 8
+# GdrlObsHeader: 168 bytes, align 8
 GdrlObsHeader_DTYPE = np.dtype({
-    'names': ['magic', 'version', 'flags', 'tick', 'attemptTime', 'dtPerStep', 'timeWarp', 'playerX', 'playerY', 'playerSpeed', 'objectCount', 'commandCount', 'pendingCount', 'speedSegCount', 'attempt', 'frame', 'stepIndex', 'dtIn', 'dtUsed', 'windowMinX', 'windowMaxX', 'windowMinY', 'windowMaxY', 'sectionXFactor', 'sectionYFactor', 'levelLength', 'coverageStartCol', 'sectionColumns', 'objectsDropped', 'commandsDropped', 'pendingDropped', 'isDualMode', 'isPaused', 'inResetDelay'],
+    'names': ['magic', 'version', 'flags', 'tick', 'attemptTime', 'dtPerStep', 'timeWarp', 'playerX', 'playerY', 'playerSpeed', 'objectCount', 'commandCount', 'pendingCount', 'speedSegCount', 'attempt', 'frame', 'stepIndex', 'dtIn', 'dtUsed', 'windowMinX', 'windowMaxX', 'windowMinY', 'windowMaxY', 'sectionXFactor', 'sectionYFactor', 'levelLength', 'coverageStartCol', 'sectionColumns', 'objectsDropped', 'commandsDropped', 'pendingDropped', 'isDualMode', 'isPaused', 'inResetDelay', 'resumeTick', 'checkpointTick', 'hasCheckpoint', 'practiceMode'],
     'formats': [
         '<u4',
         '<u2',
@@ -391,12 +407,16 @@ GdrlObsHeader_DTYPE = np.dtype({
         '<u1',
         '<u1',
         '<u1',
+        '<i4',
+        '<i4',
+        '<u1',
+        '<u1',
     ],
-    'offsets': [0, 4, 6, 8, 16, 24, 28, 32, 40, 48, 52, 56, 60, 64, 72, 80, 88, 96, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 142, 144, 146, 147, 148],
-    'itemsize': 152,
+    'offsets': [0, 4, 6, 8, 16, 24, 28, 32, 40, 48, 52, 56, 60, 64, 72, 80, 88, 96, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 142, 144, 146, 147, 148, 152, 156, 160, 161],
+    'itemsize': 168,
 })
 
-# GdrlObservation: 30280 bytes, align 8
+# GdrlObservation: 30312 bytes, align 8
 GdrlObservation_DTYPE = np.dtype({
     'names': ['seq', 'header', 'validity', 'players', 'coverage', 'objects', 'commands', 'pending', 'speedSegs'],
     'formats': [
@@ -410,8 +430,8 @@ GdrlObservation_DTYPE = np.dtype({
         (GdrlPendingTrigger_DTYPE, (64,)),
         (GdrlSpeedSegment_DTYPE, (16,)),
     ],
-    'offsets': [0, 8, 160, 216, 328, 392, 18824, 26504, 30088],
-    'itemsize': 30280,
+    'offsets': [0, 8, 176, 248, 360, 424, 18856, 26536, 30120],
+    'itemsize': 30312,
 })
 
 # GdrlAction: 16 bytes, align 8
@@ -479,7 +499,7 @@ GdrlControl_DTYPE = np.dtype({
     'itemsize': 136,
 })
 
-# GdrlShared: 30568 bytes, align 8
+# GdrlShared: 30600 bytes, align 8
 GdrlShared_DTYPE = np.dtype({
     'names': ['control', 'obs', 'action'],
     'formats': [
@@ -487,8 +507,8 @@ GdrlShared_DTYPE = np.dtype({
         GdrlObservation_DTYPE,
         GdrlActionBlock_DTYPE,
     ],
-    'offsets': [0, 136, 30416],
-    'itemsize': 30568,
+    'offsets': [0, 136, 30448],
+    'itemsize': 30600,
 })
 
 STRUCT_SIZES = {
@@ -497,13 +517,13 @@ STRUCT_SIZES = {
     'GdrlGroupCommand': 120,
     'GdrlPendingTrigger': 56,
     'GdrlSpeedSegment': 12,
-    'GdrlValidity': 56,
-    'GdrlObsHeader': 152,
-    'GdrlObservation': 30280,
+    'GdrlValidity': 72,
+    'GdrlObsHeader': 168,
+    'GdrlObservation': 30312,
     'GdrlAction': 16,
     'GdrlActionBlock': 152,
     'GdrlControl': 136,
-    'GdrlShared': 30568,
+    'GdrlShared': 30600,
 }
 
 # Offsets of the three top-level regions inside the mapping, so env.py
@@ -511,4 +531,4 @@ STRUCT_SIZES = {
 # rather than trusting either side alone.
 OFFSET_CONTROL = 0
 OFFSET_OBS = 136
-OFFSET_ACTION = 30416
+OFFSET_ACTION = 30448

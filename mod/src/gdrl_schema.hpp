@@ -19,8 +19,8 @@
 
 #define GDRL_MAGIC 0x4C524447u
 #define GDRL_OBS_MAGIC GDRL_MAGIC   // the README spec's name for it
-#define GDRL_WIRE_VERSION 1u
-#define GDRL_SCHEMA_HASH 0xBEE47E250E167BC7ull
+#define GDRL_WIRE_VERSION 2u
+#define GDRL_SCHEMA_HASH 0x1932358CD5ED7E73ull
 #define GDRL_TICK_HZ 240
 #define GDRL_MAX_OBJECTS 256
 #define GDRL_MAX_GROUPS 10
@@ -169,11 +169,25 @@ enum class GdrlObjectKind : uint8_t {
 // and adding the field later would reshape every trained action record.
 // PRESS/RELEASE remain so a policy can also hold across an arbitrary
 // number of decisions without re-issuing.
+//
+// CHECKPOINT_SAVE/RESTORE/CLEAR (wire version 2, GDRL_PRACTICE) are
+// unlike the first four: they do not queue a button, they call GD's own
+// PlayLayer::markCheckpoint/loadLastCheckpoint/removeAllCheckpoints
+// immediately when the action block is consumed, and targetTick/
+// holdTicks/button/player are unused for them. They are refused
+// (a protocol error, same as an unknown kind) unless GDRL_PRACTICE=1 --
+// practice mode is an explicit, declared opt-in (TODO.md 'Open decisions
+// -> 0': rewinding without paying for the replay is Benchmark B by
+// definition), never something a stray action kind can smuggle in
+// against a default-off run.
 enum class GdrlActionKind : uint8_t {
     NOOP = 0,
     PRESS = 1,
     RELEASE = 2,
     HOLD = 3,
+    CHECKPOINT_SAVE = 4,
+    CHECKPOINT_RESTORE = 5,
+    CHECKPOINT_CLEAR = 6,
 };
 
 // One PlayerObject, raw. Every field is read live off the object rather
@@ -441,8 +455,10 @@ struct GdrlValidity {
     uint8_t blockInput;                           // GDRL_BLOCK_INPUT is on
     uint8_t objectsTruncated;                     // a capacity was hit; some columns are TRUNCATED
     uint8_t _pad0;                                // alignment padding, never read
+    int64_t fullAttempts;                         // lifetime count of attempts that began at tick 0. Benchmark A's number. Never reset between attempts.
+    int64_t practiceAttempts;                     // lifetime count of attempts that began from a GDRL_PRACTICE checkpoint restore, tick > 0. Kept apart from fullAttempts on the wire itself so an A number and a practice-assisted number can never be averaged together by accident downstream. Zero on every run that never set GDRL_PRACTICE=1. Never reset between attempts.
 };
-static_assert(sizeof(GdrlValidity) == 56, "GdrlValidity size drifted from trainer/schema.py");
+static_assert(sizeof(GdrlValidity) == 72, "GdrlValidity size drifted from trainer/schema.py");
 static_assert(alignof(GdrlValidity) == 8, "GdrlValidity alignment drifted from trainer/schema.py");
 static_assert(std::is_standard_layout_v<GdrlValidity>, "GdrlValidity must be POD to cross the wire");
 static_assert(std::is_trivially_copyable_v<GdrlValidity>, "GdrlValidity must be POD to cross the wire");
@@ -458,6 +474,8 @@ static_assert(offsetof(GdrlValidity, objectCountTotal) == 48, "GdrlValidity.obje
 static_assert(offsetof(GdrlValidity, levelPinned) == 52, "GdrlValidity.levelPinned offset drifted");
 static_assert(offsetof(GdrlValidity, blockInput) == 53, "GdrlValidity.blockInput offset drifted");
 static_assert(offsetof(GdrlValidity, objectsTruncated) == 54, "GdrlValidity.objectsTruncated offset drifted");
+static_assert(offsetof(GdrlValidity, fullAttempts) == 56, "GdrlValidity.fullAttempts offset drifted");
+static_assert(offsetof(GdrlValidity, practiceAttempts) == 64, "GdrlValidity.practiceAttempts offset drifted");
 
 // README spec, lines 566-580, adopted field for field and then extended
 // below the marked line. Nothing above that line was renamed, retyped or
@@ -513,8 +531,13 @@ struct GdrlObsHeader {
     uint8_t isPaused;                             // EXT: PlayLayer::m_isPaused
     uint8_t inResetDelay;                         // EXT: PlayLayer::m_inResetDelay
     uint8_t _pad2[3];                             // alignment padding, never read
+    int32_t resumeTick;                           // EXT: GDRL_PRACTICE. The tick this attempt began at. 0 for a full (tick-0) attempt; the checkpoint's tick for a practice-resumed one. Latched at the attempt boundary, not live.
+    int32_t checkpointTick;                       // EXT: GDRL_PRACTICE. Tick of the checkpoint currently held (survives across attempts until overwritten or cleared), or -1 if none exists. Live, not latched.
+    uint8_t hasCheckpoint;                        // EXT: GDRL_PRACTICE. 1 if a checkpoint exists right now and CHECKPOINT_RESTORE would have something to restore. Live, not latched.
+    uint8_t practiceMode;                         // EXT: 1 if GDRL_PRACTICE=1 for this whole run, not just this attempt -- provenance a driver can read off the wire instead of having to have captured the STAMP log line.
+    uint8_t _pad3[6];                             // alignment padding, never read
 };
-static_assert(sizeof(GdrlObsHeader) == 152, "GdrlObsHeader size drifted from trainer/schema.py");
+static_assert(sizeof(GdrlObsHeader) == 168, "GdrlObsHeader size drifted from trainer/schema.py");
 static_assert(alignof(GdrlObsHeader) == 8, "GdrlObsHeader alignment drifted from trainer/schema.py");
 static_assert(std::is_standard_layout_v<GdrlObsHeader>, "GdrlObsHeader must be POD to cross the wire");
 static_assert(std::is_trivially_copyable_v<GdrlObsHeader>, "GdrlObsHeader must be POD to cross the wire");
@@ -552,6 +575,10 @@ static_assert(offsetof(GdrlObsHeader, pendingDropped) == 144, "GdrlObsHeader.pen
 static_assert(offsetof(GdrlObsHeader, isDualMode) == 146, "GdrlObsHeader.isDualMode offset drifted");
 static_assert(offsetof(GdrlObsHeader, isPaused) == 147, "GdrlObsHeader.isPaused offset drifted");
 static_assert(offsetof(GdrlObsHeader, inResetDelay) == 148, "GdrlObsHeader.inResetDelay offset drifted");
+static_assert(offsetof(GdrlObsHeader, resumeTick) == 152, "GdrlObsHeader.resumeTick offset drifted");
+static_assert(offsetof(GdrlObsHeader, checkpointTick) == 156, "GdrlObsHeader.checkpointTick offset drifted");
+static_assert(offsetof(GdrlObsHeader, hasCheckpoint) == 160, "GdrlObsHeader.hasCheckpoint offset drifted");
+static_assert(offsetof(GdrlObsHeader, practiceMode) == 161, "GdrlObsHeader.practiceMode offset drifted");
 
 // One physics-step observation: header, validity, both players, the
 // coverage mask, and the four fixed-capacity tables.
@@ -574,19 +601,19 @@ struct GdrlObservation {
     GdrlPendingTrigger pending[64];
     GdrlSpeedSegment speedSegs[16];
 };
-static_assert(sizeof(GdrlObservation) == 30280, "GdrlObservation size drifted from trainer/schema.py");
+static_assert(sizeof(GdrlObservation) == 30312, "GdrlObservation size drifted from trainer/schema.py");
 static_assert(alignof(GdrlObservation) == 8, "GdrlObservation alignment drifted from trainer/schema.py");
 static_assert(std::is_standard_layout_v<GdrlObservation>, "GdrlObservation must be POD to cross the wire");
 static_assert(std::is_trivially_copyable_v<GdrlObservation>, "GdrlObservation must be POD to cross the wire");
 static_assert(offsetof(GdrlObservation, seq) == 0, "GdrlObservation.seq offset drifted");
 static_assert(offsetof(GdrlObservation, header) == 8, "GdrlObservation.header offset drifted");
-static_assert(offsetof(GdrlObservation, validity) == 160, "GdrlObservation.validity offset drifted");
-static_assert(offsetof(GdrlObservation, players) == 216, "GdrlObservation.players offset drifted");
-static_assert(offsetof(GdrlObservation, coverage) == 328, "GdrlObservation.coverage offset drifted");
-static_assert(offsetof(GdrlObservation, objects) == 392, "GdrlObservation.objects offset drifted");
-static_assert(offsetof(GdrlObservation, commands) == 18824, "GdrlObservation.commands offset drifted");
-static_assert(offsetof(GdrlObservation, pending) == 26504, "GdrlObservation.pending offset drifted");
-static_assert(offsetof(GdrlObservation, speedSegs) == 30088, "GdrlObservation.speedSegs offset drifted");
+static_assert(offsetof(GdrlObservation, validity) == 176, "GdrlObservation.validity offset drifted");
+static_assert(offsetof(GdrlObservation, players) == 248, "GdrlObservation.players offset drifted");
+static_assert(offsetof(GdrlObservation, coverage) == 360, "GdrlObservation.coverage offset drifted");
+static_assert(offsetof(GdrlObservation, objects) == 424, "GdrlObservation.objects offset drifted");
+static_assert(offsetof(GdrlObservation, commands) == 18856, "GdrlObservation.commands offset drifted");
+static_assert(offsetof(GdrlObservation, pending) == 26536, "GdrlObservation.pending offset drifted");
+static_assert(offsetof(GdrlObservation, speedSegs) == 30120, "GdrlObservation.speedSegs offset drifted");
 
 // One scheduled input. Placed by PHYSICS TICK, never by render frame:
 // the render:physics ratio is not constant (316-440 render frames
@@ -716,13 +743,13 @@ struct GdrlShared {
     GdrlObservation obs;
     GdrlActionBlock action;
 };
-static_assert(sizeof(GdrlShared) == 30568, "GdrlShared size drifted from trainer/schema.py");
+static_assert(sizeof(GdrlShared) == 30600, "GdrlShared size drifted from trainer/schema.py");
 static_assert(alignof(GdrlShared) == 8, "GdrlShared alignment drifted from trainer/schema.py");
 static_assert(std::is_standard_layout_v<GdrlShared>, "GdrlShared must be POD to cross the wire");
 static_assert(std::is_trivially_copyable_v<GdrlShared>, "GdrlShared must be POD to cross the wire");
 static_assert(offsetof(GdrlShared, control) == 0, "GdrlShared.control offset drifted");
 static_assert(offsetof(GdrlShared, obs) == 136, "GdrlShared.obs offset drifted");
-static_assert(offsetof(GdrlShared, action) == 30416, "GdrlShared.action offset drifted");
+static_assert(offsetof(GdrlShared, action) == 30448, "GdrlShared.action offset drifted");
 
 // The four fields an older Python must still be able to read out of a
 // newer mapping in order to report the right mismatch rather than a

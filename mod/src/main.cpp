@@ -371,6 +371,61 @@ class $modify(GDRLMenuLayer, MenuLayer) {
             log::info("[gdrl] ISOLATION stars      = {}",
                       GameStatsManager::sharedState()->getStat("6"));
 
+            // Provenance stamp -- TODO #23. A run last session silently lost
+            // EVERY GDRL_* switch (see TODO's 2026-08-16 RESUME box and the
+            // 2026-08-17 correction), wandered onto a different level, and
+            // produced a complete, plausible, worthless data set. Grepping
+            // "[gdrl] STAMP" now answers "what did this process actually
+            // resolve" without inference. This is the earliest point at which
+            // the CCEGLView is guaranteed to exist (MenuLayer has already
+            // init'd), so it is also where the screen-derived sensor width
+            // (TODO "Q4 (amended)": 569 vs 493, a live function of which
+            // display was main at launch) can be logged, not merely those two
+            // known values re-asserted.
+            //
+            // main.cpp's own switches are logged here from the same consts
+            // the hooks above branch on (g_verbose/g_blockInput/g_pinLevel);
+            // the rest are re-read via the same envOn()/getenv() the
+            // corresponding code calls at point of use, which is not a second
+            // interpretation of the switch (no caching to drift from) and so
+            // cannot disagree with it. telemetry.cpp, experiments.cpp,
+            // probes.cpp and viewport.cpp each stamp their own switches from
+            // their own resolved consts, unconditionally, elsewhere in the log.
+            if (auto* view = CCDirector::sharedDirector()->getOpenGLView()) {
+                const CCSize win    = CCDirector::sharedDirector()->getWinSize();
+                const CCSize screen = view->m_obScreenSize;
+                const CCSize design = view->m_obDesignResolutionSize;
+                // cocos's own formula under kResolutionFixedHeight (policy=3),
+                // reproduced here as a cross-check against design.width, the
+                // field the live sensor (m_cameraWidth, viewport.cpp) actually
+                // derives from. Both should agree to the unit; if they do not,
+                // the sensor is not using the design-resolution path this
+                // formula assumes and that assumption needs re-checking.
+                const double computedDesignWidth = screen.height > 0.f
+                    ? std::ceil(screen.width / (screen.height / 320.0))
+                    : -1.0;
+                log::info("[gdrl] STAMP screen win=({:.2f},{:.2f}) "
+                          "screen=({:.2f},{:.2f}) design=({:.2f},{:.2f}) "
+                          "computedDesignWidth={:.2f} policy={}",
+                          win.width, win.height, screen.width, screen.height,
+                          design.width, design.height, computedDesignWidth,
+                          (int)view->m_eResolutionPolicy);
+            } else {
+                log::warn("[gdrl] STAMP screen -- no CCEGLView; screen size "
+                          "and sensor design width are unknown at this point");
+            }
+            log::info("[gdrl] STAMP main GDRL_VERBOSE={} GDRL_BLOCK_INPUT={} "
+                      "GDRL_PIN_LEVEL={} GDRL_NO_APP_NAP={} GDRL_WINDOWED={} "
+                      "GDRL_AUTOPLAY={} GDRL_SYNTH={} GDRL_SYNTH_COMPRESS={} "
+                      "GDRL_DUMP_LEVEL={}",
+                      (int)g_verbose, (int)g_blockInput, (int)g_pinLevel,
+                      (int)envOn("GDRL_NO_APP_NAP"), (int)envOn("GDRL_WINDOWED"),
+                      (int)envOn("GDRL_AUTOPLAY"), (int)envOn("GDRL_SYNTH"),
+                      std::getenv("GDRL_SYNTH_COMPRESS")
+                          ? std::getenv("GDRL_SYNTH_COMPRESS") : "(unset)",
+                      std::getenv("GDRL_DUMP_LEVEL")
+                          ? std::getenv("GDRL_DUMP_LEVEL") : "(unset)");
+
             // Force windowed, once, at startup.
             //
             // GD starts fullscreen, which puts it on its own Space. Switching

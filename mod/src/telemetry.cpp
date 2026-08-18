@@ -131,6 +131,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -163,6 +164,18 @@ long g_gdrlEnvSteps    = 0;
 long g_gdrlEnvTimeouts = 0;
 long g_gdrlEnvProtoErr = 0;
 
+// GDRL_PRACTICE. Lifetime, process-wide -- deliberately NOT reset by
+// resetLevel() the way g_gdrlEnvTimeouts/g_gdrlEnvProtoErr above are, because
+// the whole point is a running total a report can quote directly. TODO.md
+// "Open decisions -> 0" is explicit that practice mode is a rewind and
+// rewinding without paying for the replay is Benchmark B by definition, so an
+// A attempt count and a practice-assisted one must never be summed into one
+// number by accident -- keeping them as two counters, on the wire itself
+// (GdrlValidity.fullAttempts/.practiceAttempts), is what makes that structural
+// rather than a convention someone downstream has to remember.
+long g_gdrlFullAttempts     = 0;
+long g_gdrlPracticeAttempts = 0;
+
 }  // namespace gdrl
 
 namespace {
@@ -194,6 +207,145 @@ const bool  g_envOn       = envFlag("GDRL_ENV");
 const char* g_shmSuffix   = envStr("GDRL_ENV_NAME", "gdrl.env");
 const int   g_waitBudget  = envInt("GDRL_ENV_WAIT_US", 250000);   // 250 ms
 const int   g_envDeltaT   = envInt("GDRL_ENV_DELTA_TICKS", 0);    // 0 = passthrough
+
+// Give the ENV path experiments.cpp's adaptive-dt treatment: instead of every
+// frame consuming a fixed g_envDeltaT ticks (which CAN place a scheduled input
+// up to g_envDeltaT-1 ticks late -- both firing rules are THRESHOLDS, not
+// equalities, see fireDueInputs below), shrink the frame that is about to
+// cross a scheduled input's target tick so it lands exactly on the boundary
+// fireDueInputs needs. See nextEventTickEnv() below and its use at the useDt
+// computation. The cap comes from GDRL_ENV_DELTA_TICKS itself (0 means no cap
+// is defined, so this switch is inert -- warned about at $execute below)
+// rather than from a second knob, so the two switches compose instead of
+// fighting.
+//
+// CORRECTION 2026-08-17 (orchestrator, live measurement, after this switch was
+// built): the failure mode above is real at a FIXED stride, but it is NOT
+// currently live in trainer/sightread.py. That driver's action protocol
+// already carries an `advanceSteps` field and the driver already sets it to
+// `min(scheduled target ticks) - curTick` every step -- i.e. Python is already
+// doing per-step adaptive striding on its own, one level up from this switch.
+// Measured live: dt in {1,8,32,64} through that driver gave bit-identical
+// results attempt-for-attempt, with "fired LATE" count 0 and protoErr=0
+// throughout. So for TODAY'S client this switch fixes nothing that is
+// currently broken -- it is insurance for a client that streams a fixed
+// GDRL_ENV_DELTA_TICKS without computing its own per-step advanceSteps (the
+// C++-side mechanism a Python bug or a simpler client could still need), not
+// a repair to an active defect in the shipped driver. Default off either way.
+const bool  g_envAdaptive = envFlag("GDRL_ENV_ADAPTIVE");
+
+// ---------------------------------------------------------------------------
+// GDRL_PRACTICE -- checkpoint save/restore, driven over the wire.
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS, measured live: a search run against Stereo Madness (254
+// attempts, 527s) found 237 of those 254 attempts died at the exact same
+// place -- x=3071.545, end_tick=2368 -- with all progress made in the first
+// 15 attempts. Every one of the other 239 replayed the level from tick 0,
+// ~2.1s of real time, just to reach the same wall and die again. That is the
+// throughput problem this switch answers: let the driver resume near the
+// obstacle instead of paying for the whole prefix every time.
+//
+// THIS IS BENCHMARK B BY THE PROJECT'S OWN DEFINITION, NOT A PERFORMANCE
+// KNOB. TODO.md "Open decisions -> 0" states outright: Benchmark A is "true
+// sightreading", one of whose three defining properties is "replay is paid
+// for -- there is no rewind", and the same entry says plainly that rewinding
+// WITHOUT paying for the replay is Benchmark B by definition. A checkpoint
+// restore is exactly that rewind -- the attempt did not happen from tick 0,
+// so counting it as an A attempt would misrepresent the number a report is
+// built on. The user asked for this anyway (practice mode is how a human
+// grinds a hard level too), so it is built -- but DECLARED, not smuggled:
+//
+//   1. Default OFF, like every other GDRL_* switch. With GDRL_PRACTICE unset,
+//      none of this file's added code paths execute and behaviour is
+//      byte-identical to before this switch existed.
+//   2. Practice and full attempts are counted SEPARATELY on the wire itself
+//      (GdrlValidity.fullAttempts / .practiceAttempts, both lifetime
+//      counters -- see their declaration above) so an A number and a
+//      practice-assisted number can never be averaged into one figure by a
+//      decoder that is not looking for the difference.
+//   3. Every observation produced by a practice-resumed attempt carries the
+//      PRACTICE header flag (already reserved in wire version 1, unused
+//      until now) and header.resumeTick, so the driver -- or anyone auditing
+//      a run after the fact -- can tell which attempts were which without
+//      re-deriving it from a log line.
+//   4. This process's own log carries GDRL_PRACTICE's resolved value in the
+//      STAMP block below, unconditionally, the same way every other switch
+//      in this file is stamped -- so no run's provenance is ambiguous about
+//      whether checkpoints were in play.
+//   5. Nothing here removes or weakens anything that enforces Benchmark A
+//      when the switch is off. This is an additional, opt-in mode living
+//      alongside the sightreading path, not a replacement for it.
+//
+// THE BINDING, verified beyond the .bro entry: PlayLayer declares
+// createCheckpoint(), loadFromCheckpoint(CheckpointObject*), getLastCheckpoint(),
+// loadLastCheckpoint(), markCheckpoint(), storeCheckpoint(),
+// removeAllCheckpoints() (virtual) and togglePracticeMode(bool), all with live
+// m1 (arm64) and imac (x86_64) addresses in bindings/2.2081/GeometryDash.bro --
+// so both architectures this mod ships for are covered. Per this repo's own
+// rule ("an address is not a call site"), these were bl/b-counted against the
+// installed arm64 slice (`Geometry Dash.app`, lipo -thin arm64, otool -tV; the
+// app was never LAUNCHED, only read as a file) rather than trusted from the
+// header alone:
+//
+//   createCheckpoint          m1 0xa86d0    bl=3 b=0   -- called
+//   loadFromCheckpoint(CkpO*) m1 0xaa038    bl=3 b=0   -- called
+//   getLastCheckpoint         m1 0xa9854    bl=3 b=0   -- called
+//   loadLastCheckpoint        m1 0xa9fe0    bl=0 b=0   -- NOT a virtual, and
+//                                                          NOT inlined per the
+//                                                          .bro (imac/ios both
+//                                                          have real addresses)
+//                                                          -- yet nothing in
+//                                                          the shipped binary
+//                                                          branches to it. Not
+//                                                          used below; see the
+//                                                          CHECKPOINT_RESTORE
+//                                                          handler for what is
+//                                                          used instead.
+//   markCheckpoint            m1 0xa8374    bl=3 b=1   -- called
+//   storeCheckpoint           m1 0xa9e48    bl=2 b=0   -- called
+//   togglePracticeMode        m1 0xaad2c    bl=4 b=0   -- called
+//   removeAllCheckpoints      m1 0xaa7e8    bl=0 b=0   -- VIRTUAL (overrides
+//                                                          GJBaseGameLayer's),
+//                                                          so per this repo's
+//                                                          rule 3 ("virtuals
+//                                                          are evidenced by
+//                                                          neither") this
+//                                                          count says nothing
+//                                                          either way.
+//
+// A FURTHER RESULT, not asked for but found while checking the above: the
+// disassembly of PlayLayer::resetLevel() itself (m1 0xaaf88) shows it calling
+// loadFromCheckpoint TWICE, at file addresses 0x1000ab49c and 0x1000ab550. The
+// first site (0x1000ab47c..0x1000ab49c) is a null-checked
+// getLastCheckpoint()-shaped sequence: load a pointer field, `cbz` to a
+// "no checkpoint" path if it is null, else fetch the array's last entry and
+// call loadFromCheckpoint(CheckpointObject*) on it -- i.e. vanilla resetLevel()
+// ALREADY restores from the last checkpoint when one exists. This is why the
+// resetLevel() hook below does NOT call loadFromCheckpoint itself: the vanilla
+// call above almost certainly already did, and duplicating it risks a
+// double-apply of whatever side effects that function has (none enumerated,
+// none ruled out). What this disassembly pass did NOT establish: whether that
+// null-checked pointer is m_checkpointArray/m_currentCheckpoint specifically
+// (plausible from field position, not independently confirmed against
+// Geode's own offset codegen) or whether m_isPracticeMode gates this
+// specific call site directly versus only indirectly, by being the only path
+// that ever populates the array (which is what CHECKPOINT_SAVE below is
+// gated on regardless). Tier (d) disassembly evidence for "the call exists
+// and is reachable"; tier (h) for "this is definitely THE practice-mode
+// checkpoint path and not something else". The game was run ZERO times for
+// any of this -- see the tester's job below.
+//
+// WHAT IS STILL UNVERIFIED, LOUDLY: restore determinism past this file's own
+// force-set of m_attemptTime (see the resetLevel() hook and the
+// CHECKPOINT_RESTORE handler) is NOT established. TODO.md 2.1 flags
+// m_attemptTime, m_extraDelta, the RNG seeds, m_queuedButtons and the section
+// grid as suspected gaps in what CheckpointObject actually snapshots; only
+// the first of those five is corrected here. A driver must not assume
+// bit-exact replay past a restore until TODO.md 2.1's own acceptance test is
+// run live: restore the same checkpoint N times with the same subsequent
+// inputs and require bit-identical outcomes.
+const bool  g_gdrlPractice = envFlag("GDRL_PRACTICE");
 
 // ---------------------------------------------------------------------------
 // Observation window OVERRIDES. Unset -- the default -- means the window is
@@ -297,6 +449,20 @@ bool  g_wasAttached      = false; // edge-detects Python attaching mid-attempt
 float g_dtIn   = 0.f;
 float g_dtUsed = 0.f;
 
+// GDRL_PRACTICE state. Mod-owned bookkeeping, not a read of GD's own
+// m_checkpointArray/m_currentCheckpoint -- within an ENV run the only paths
+// that touch those are CHECKPOINT_SAVE/CHECKPOINT_CLEAR below (this mirror
+// cannot drift from them) and PlayLayer::resetLevel()'s own internal restore
+// (which does not add or remove checkpoints, only consumes the last one), so
+// the mirror stays accurate as long as nothing outside this file's control --
+// e.g. the level editor's own test-mode checkpoint -- also touches the array
+// in the same PlayLayer instance. That case is not guarded against.
+bool   g_gdrlHasCheckpoint         = false; // a checkpoint currently exists (live)
+long   g_gdrlCheckpointTick        = -1;    // tick of that checkpoint, -1 if none (live)
+double g_gdrlCheckpointAttemptTime = 0.0;   // PlayLayer::m_attemptTime at save time
+bool   g_gdrlAttemptIsPractice     = false; // latched at the attempt boundary: did THIS attempt begin from a restore
+long   g_gdrlResumeTick            = 0;     // latched at the attempt boundary: the tick it began at (0 for a full attempt)
+
 // Scheduled inputs, keyed by physics tick. Fixed capacity: a variable-length
 // container here would allocate on the game thread inside the step loop.
 struct Scheduled {
@@ -320,6 +486,27 @@ bool schedule(long tick, int button, bool push, bool player2) {
         return true;
     }
     return false;
+}
+
+// The ENV analogue of experiments.cpp's nextEventTick(): the next tick at
+// which the OUTER per-frame update() call must stop growing its dt so that a
+// scheduled input lands exactly on time.
+//
+// This is NOT simply min(s.tick). fireDueInputs's firing rule is
+// `curTick + 1 >= s.tick` (documented at its definition below): a button
+// queued while curTick == s.tick - 1 takes effect ON s.tick. So the tick at
+// which the frame boundary must land -- the value nextEventTick() in
+// experiments.cpp would call "the next event" -- is s.tick - 1, not s.tick.
+// Landing a frame boundary later than that (i.e. letting curTick run past
+// s.tick - 1 within one oversized frame) is exactly the "fires late" failure
+// mode this switch exists to remove.
+long nextEventTickEnv() {
+    long best = LONG_MAX;
+    for (auto& s : g_sched) {
+        if (!s.live) continue;
+        best = std::min(best, s.tick - 1);
+    }
+    return best;
 }
 
 // ---------------------------------------------------------------------------
@@ -473,8 +660,20 @@ bool awaitAction(uint64_t seq) {
     }
 }
 
+// Count and log a protocol error whose message is not the generic "schedule
+// full" one below -- used by the GDRL_PRACTICE checkpoint actions, which are
+// refused for reasons (mode off, no checkpoint held) that have nothing to do
+// with the scheduler.
+void protoErr(const char* msg) {
+    gdrl::g_gdrlEnvProtoErr++;
+    if (g_shm) __atomic_fetch_add(&g_shm->control.protocolErrors, 1ull, __ATOMIC_RELAXED);
+    log::error("{}", msg);
+}
+
 // Apply an answered action block. Returns the requested observation stride.
-int consumeActions(long curTick) {
+// `pl` is passed through only for the GDRL_PRACTICE checkpoint actions below;
+// every existing action kind is unaffected by it.
+int consumeActions(PlayLayer* pl, long curTick) {
     const auto& a = g_shm->action;
 
     if (a.seq != g_obsSeq) {
@@ -516,6 +715,91 @@ int consumeActions(long curTick) {
                 const long hold = std::max<long>(1, act.holdTicks);
                 ok = schedule(act.targetTick, act.button, true, p2)
                   && schedule(act.targetTick + hold, act.button, false, p2);
+                break;
+            }
+            // GDRL_PRACTICE. Unlike the four kinds above these do not queue a
+            // button for a future tick -- they call GD's own checkpoint API
+            // immediately, right here, on the game thread inside
+            // prepareMoveActions (the same context queueButton() is already
+            // called from, above). targetTick/holdTicks/button/player are
+            // unused for all three. Each is refused as a protocol error
+            // (exactly like an unknown kind) unless GDRL_PRACTICE=1 -- see
+            // that switch's definition for why this must be an explicit,
+            // declared opt-in rather than something a stray action kind can
+            // trigger against a default-off run.
+            case GdrlActionKind::CHECKPOINT_SAVE: {
+                if (!g_gdrlPractice) {
+                    protoErr("[gdrl] ENV CHECKPOINT_SAVE requested but "
+                             "GDRL_PRACTICE is not set -- refused");
+                    break;
+                }
+                if (!pl) {
+                    log::error("[gdrl] ENV CHECKPOINT_SAVE with no PlayLayer "
+                               "-- ignored");
+                    break;
+                }
+                // markCheckpoint() is confirmed CALLED in the shipped arm64
+                // slice (bl=3, b=1 against m1 0xa8374); loadLastCheckpoint(),
+                // used nowhere in this file, showed bl=0 b=0 -- see the
+                // switch definition above for the full evidence and why that
+                // one is avoided.
+                pl->markCheckpoint();
+                g_gdrlHasCheckpoint = true;
+                g_gdrlCheckpointAttemptTime = pl->m_attemptTime;
+                g_gdrlCheckpointTick = curTick;
+                log::info("[gdrl] ENV PRACTICE checkpoint saved at tick {}",
+                          curTick);
+                break;
+            }
+            case GdrlActionKind::CHECKPOINT_RESTORE: {
+                if (!g_gdrlPractice) {
+                    protoErr("[gdrl] ENV CHECKPOINT_RESTORE requested but "
+                             "GDRL_PRACTICE is not set -- refused");
+                    break;
+                }
+                if (!pl || !g_gdrlHasCheckpoint) {
+                    protoErr("[gdrl] ENV CHECKPOINT_RESTORE with no "
+                             "checkpoint held -- refused. Check "
+                             "header.hasCheckpoint before asking.");
+                    break;
+                }
+                // Explicit, on-demand restore -- independent of dying. Uses
+                // getLastCheckpoint() + loadFromCheckpoint(CheckpointObject*)
+                // rather than the loadLastCheckpoint() convenience wrapper,
+                // because that pair is what PlayLayer::resetLevel() ITSELF
+                // was disassembled calling (m1 0xab47c..0xab49c) and both
+                // are independently confirmed live (bl=3 each); the wrapper
+                // showed zero call sites anywhere in the binary.
+                if (auto* cp = pl->getLastCheckpoint()) {
+                    pl->loadFromCheckpoint(cp);
+                    // See the resetLevel() hook for why m_attemptTime is
+                    // force-set rather than trusted to loadFromCheckpoint:
+                    // TODO.md 2.1 flags it as a suspected gap in what
+                    // CheckpointObject snapshots.
+                    pl->m_attemptTime = g_gdrlCheckpointAttemptTime;
+                    log::info("[gdrl] ENV PRACTICE restored to tick {} on "
+                              "demand (mid-attempt, not via death)",
+                              g_gdrlCheckpointTick);
+                } else {
+                    protoErr("[gdrl] ENV CHECKPOINT_RESTORE: "
+                             "getLastCheckpoint() returned null despite "
+                             "hasCheckpoint=1 -- bookkeeping was stale, "
+                             "clearing it");
+                    g_gdrlHasCheckpoint = false;
+                }
+                break;
+            }
+            case GdrlActionKind::CHECKPOINT_CLEAR: {
+                if (!g_gdrlPractice) {
+                    protoErr("[gdrl] ENV CHECKPOINT_CLEAR requested but "
+                             "GDRL_PRACTICE is not set -- refused");
+                    break;
+                }
+                if (pl) pl->removeAllCheckpoints();
+                g_gdrlHasCheckpoint = false;
+                g_gdrlCheckpointTick = -1;
+                g_gdrlCheckpointAttemptTime = 0.0;
+                log::info("[gdrl] ENV PRACTICE checkpoints cleared");
                 break;
             }
             default:
@@ -1137,9 +1421,29 @@ void fillObservation(GJBaseGameLayer* layer, PlayLayer* pl, float dtPerStep) {
     h.isPaused    = (pl && pl->m_isPaused) ? 1 : 0;
     h.inResetDelay = (pl && pl->m_inResetDelay) ? 1 : 0;
 
+    // GDRL_PRACTICE. resumeTick is LATCHED at the attempt boundary
+    // (GDRLTelemetryPlayLayer::resetLevel, below) and does not move within
+    // the attempt; checkpointTick/hasCheckpoint are LIVE and can change
+    // mid-attempt if this step's action block placed or cleared a
+    // checkpoint. practiceMode is the whole-run switch, not the per-attempt
+    // kind -- it can be 1 while resumeTick is still 0 (practice mode on, but
+    // this particular attempt happened to start at tick 0 because no
+    // checkpoint existed yet).
+    h.resumeTick     = (int32_t)g_gdrlResumeTick;
+    h.checkpointTick = (int32_t)g_gdrlCheckpointTick;
+    h.hasCheckpoint  = g_gdrlHasCheckpoint ? 1 : 0;
+    h.practiceMode   = g_gdrlPractice ? 1 : 0;
+
     uint16_t flags = (uint16_t)GdrlHeaderFlag::GAMEPLAY_STEP;
     if (g_blockInput && g_gdrlLeaked == 0) flags |= (uint16_t)GdrlHeaderFlag::INPUT_CLEAN;
     if (h.isDualMode) flags |= (uint16_t)GdrlHeaderFlag::DUAL;
+    // Set for every observation of an attempt that began from a checkpoint
+    // restore, not merely when GDRL_PRACTICE is on -- see the resetLevel()
+    // hook for how g_gdrlAttemptIsPractice is decided. This is the field
+    // TODO.md's "Open decisions -> 0" requires: a driver or a report can
+    // filter on this bit alone and never accidentally average a
+    // practice-assisted attempt into a Benchmark A number.
+    if (g_gdrlAttemptIsPractice) flags |= (uint16_t)GdrlHeaderFlag::PRACTICE;
     // The three tables this wire version does not populate. count==0 with the
     // bit SET means "not looked at", which is a different claim from "looked
     // and found none" -- and the difference is exactly what stops the projector
@@ -1176,6 +1480,10 @@ void fillObservation(GJBaseGameLayer* layer, PlayLayer* pl, float dtPerStep) {
     v.inputVerdict  = !g_blockInput   ? (uint32_t)GdrlInputVerdict::UNGUARDED
                     : (g_gdrlLeaked > 0) ? (uint32_t)GdrlInputVerdict::INVALID
                                          : (uint32_t)GdrlInputVerdict::CLEAN;
+    // GDRL_PRACTICE. Lifetime counters (see their declaration in the gdrl
+    // namespace above), zero on every run that never set GDRL_PRACTICE=1.
+    v.fullAttempts     = gdrl::g_gdrlFullAttempts;
+    v.practiceAttempts = gdrl::g_gdrlPracticeAttempts;
 
     const int objTotal = layer->m_objects ? (int)layer->m_objects->count() : 0;
     v.objectCountTotal = objTotal;
@@ -1211,7 +1519,7 @@ void stepProtocol(GJBaseGameLayer* layer, PlayLayer* pl, float dtPerStep, long c
     __atomic_fetch_add(&g_shm->control.stepsServed, 1ull, __ATOMIC_RELAXED);
 
     if (awaitAction(g_obsSeq)) {
-        g_stepsUntilPublish = consumeActions(curTick);
+        g_stepsUntilPublish = consumeActions(pl, curTick);
     } else {
         // No answer. The game runs on with whatever was already scheduled --
         // which is the honest fallback, because inventing a release here would
@@ -1242,12 +1550,57 @@ class $modify(GDRLTelemetryBaseGameLayer, GJBaseGameLayer) {
         g_dtIn = dt;
         // Feeding update a dt of exactly N/240 controls how much simulated time
         // each rendered frame consumes, and the outcome is invariant under it
-        // (91 attempts, three regimes, all bit-identical). Unlike
-        // experiments.cpp's GDRL_ADAPTIVE this does NOT need to shrink around
-        // event ticks, because actions are now placed per physics step rather
-        // than per frame.
+        // (91 attempts, three regimes, all bit-identical). THAT measurement was
+        // about physics only. The claim that used to sit here -- "this does NOT
+        // need to shrink around event ticks, because actions are now placed per
+        // physics step rather than per frame" -- was wrong and is corrected as
+        // of this comment: fireDueInputs's firing rule (see its definition
+        // below) is a threshold (`curTick + 1 >= s.tick`), not an equality, so
+        // at a fixed N a scheduled input can fire up to N-1 ticks late whenever
+        // curTick jumps past its target inside one oversized frame. Measured
+        // 2026-08-17: bit-identical physics up to at least N=64 with nothing
+        // scheduled, but only 1 of 12 scheduled jumps still land at N=32 and
+        // NONE at N=64 -- AT A FIXED GDRL_ENV_DELTA_TICKS STRIDE, i.e. a client
+        // that schedules inputs without also shrinking its own step size around
+        // them. GDRL_ENV_ADAPTIVE gives this path the same treatment
+        // experiments.cpp's GDRL_ADAPTIVE already has (README "Adaptive dt"):
+        // shrink the frame around a scheduled input's target tick so every
+        // frame still consumes a whole number of 1/240 steps and no frame ever
+        // steps OVER a tick a schedule entry needs. See nextEventTickEnv().
+        //
+        // NOT needed by trainer/sightread.py as it stands: that driver already
+        // sets its own `advanceSteps` to land exactly on its next action tick
+        // every step, and measured live (orchestrator, 2026-08-17) that already
+        // gives bit-identical results at dt in {1,8,32,64} with zero "fired
+        // LATE" and zero protoErr. This switch is insurance for a client that
+        // does NOT do that -- e.g. a fixed-stride client, or a bug in a future
+        // one -- not a repair to an active defect in the current driver.
+        long curTick = -1;
+        if (g_envAdaptive && g_envDeltaT > 0) {
+            if (auto* pl = PlayLayer::get()) {
+                curTick = std::lround(pl->m_attemptTime * (double)GDRL_TICK_HZ);
+            }
+        }
+
+        int ticksThisFrame = g_envDeltaT;
+        if (g_envAdaptive && g_envDeltaT > 0 && curTick >= 0) {
+            const long ev = nextEventTickEnv();
+            if (ev != LONG_MAX) {
+                const long gap = ev - curTick;
+                ticksThisFrame = gap <= 0 ? 1
+                                          : (int)std::min<long>(gap, g_envDeltaT);
+            }
+        }
+
+        // Passthrough (g_envDeltaT == 0) is untouched by any of the above:
+        // ticksThisFrame is never consulted and useDt is exactly the real
+        // frame dt, same as before this switch existed. This is what keeps
+        // GDRL_ENV_ADAPTIVE default-off byte-identical: with it unset,
+        // g_envAdaptive is false, curTick stays -1, ticksThisFrame stays
+        // g_envDeltaT unconditionally, and useDt reduces to the pre-existing
+        // expression bit for bit.
         const float useDt = g_envDeltaT > 0
-            ? (float)((double)g_envDeltaT / (double)GDRL_TICK_HZ)
+            ? (float)((double)ticksThisFrame / (double)GDRL_TICK_HZ)
             : dt;
         g_dtUsed = useDt;
 
@@ -1317,6 +1670,33 @@ class $modify(GDRLTelemetryEffectManager, GJEffectManager) {
 };
 
 class $modify(GDRLTelemetryPlayLayer, PlayLayer) {
+    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+
+        // GDRL_PRACTICE: per-level reset. A checkpoint from a previous
+        // PlayLayer instance must never leak into this one -- this is the
+        // mod's OWN mirror (see its declaration above), reset explicitly
+        // rather than trusted to already agree with a fresh GD instance.
+        g_gdrlHasCheckpoint         = false;
+        g_gdrlCheckpointTick        = -1;
+        g_gdrlCheckpointAttemptTime = 0.0;
+        g_gdrlAttemptIsPractice     = false;
+        g_gdrlResumeTick            = 0;
+
+        if (g_gdrlPractice) {
+            // Toggled on for the WHOLE level session, not per attempt. Two
+            // independent reasons, both in the switch's own comment above:
+            // it is what the disassembled resetLevel() call graph appears to
+            // gate checkpoint creation on, and it is GD's documented way of
+            // keeping a level run from writing real progress/stars, which
+            // matters here because this run may attempt the level thousands
+            // of times. togglePracticeMode is confirmed CALLED elsewhere in
+            // the shipped binary (bl=4 against m1 0xaad2c).
+            this->togglePracticeMode(true);
+        }
+        return true;
+    }
+
     void resetLevel() {
         if (g_envOn && g_stepIndex > 0) {
             // The per-attempt verdict, in the shape every other line in this
@@ -1335,6 +1715,53 @@ class $modify(GDRLTelemetryPlayLayer, PlayLayer) {
 
         PlayLayer::resetLevel();
 
+        // GDRL_PRACTICE attempt-kind bookkeeping -- decided HERE, once, right
+        // after the reset that begins the next attempt, and then latched
+        // (g_gdrlAttemptIsPractice / g_gdrlResumeTick) for every observation
+        // that attempt produces. See the switch's own comment for why this
+        // must be counted and reported separately rather than folded into
+        // the ordinary attempt count.
+        //
+        // The mod does NOT call loadFromCheckpoint itself here. Disassembly
+        // of the shipped arm64 slice shows PlayLayer::resetLevel() (the call
+        // just above) ALREADY does: at m1 0xab47c..0xab49c it loads a
+        // pointer field, null-checks it (cbz -> "no checkpoint" path),
+        // else fetches the array's last entry and calls
+        // loadFromCheckpoint(CheckpointObject*) on it -- the exact
+        // getLastCheckpoint()+loadFromCheckpoint() shape used explicitly in
+        // CHECKPOINT_RESTORE above. Duplicating that call here would risk a
+        // double-apply of whatever side effects it has, none of which are
+        // enumerated or ruled out. So the mod PREDICTS what the call above
+        // just did rather than re-issuing it: practice mode is on and a
+        // checkpoint was held at the moment of this reset, so the null
+        // check almost certainly took the restore branch. This prediction
+        // is tier (d) disassembly evidence for "the call exists and is
+        // reachable", not tier (i) "the game was observed doing it" -- the
+        // tester should verify player x/tick immediately after this line
+        // against what CHECKPOINT_SAVE recorded, live.
+        const bool resumedFromCheckpoint =
+            g_envOn && g_gdrlPractice && g_gdrlHasCheckpoint;
+        g_gdrlAttemptIsPractice = resumedFromCheckpoint;
+        g_gdrlResumeTick = resumedFromCheckpoint ? g_gdrlCheckpointTick : 0;
+        if (resumedFromCheckpoint) {
+            // TODO.md 2.1: m_attemptTime is NOT a member of CheckpointObject
+            // -- a suspected gap in GD's own snapshot. Rather than trust
+            // whatever the vanilla loadFromCheckpoint() call above left it
+            // at, the mod is authoritative over this ONE field: force it
+            // back to the value captured at CHECKPOINT_SAVE time, which is
+            // also what header.tick/resumeTick report for every step of
+            // this attempt. m_extraDelta, the RNG seeds, m_queuedButtons and
+            // the section grid are OTHER suspected gaps from the same TODO
+            // entry and are NOT corrected here -- restore determinism
+            // beyond this one field is UNVERIFIED. See TODO.md 2.1's own
+            // acceptance test (restore the same checkpoint N times, require
+            // bit-identical outcomes) before trusting a search over this.
+            this->m_attemptTime = g_gdrlCheckpointAttemptTime;
+            gdrl::g_gdrlPracticeAttempts++;
+        } else {
+            gdrl::g_gdrlFullAttempts++;
+        }
+
         // Reset AFTER delegating and unconditionally, so this hook's state does
         // not depend on whether it runs before or after main.cpp's or
         // experiments.cpp's resetLevel hook -- that order is a linker detail.
@@ -1350,6 +1777,40 @@ class $modify(GDRLTelemetryPlayLayer, PlayLayer) {
     }
 };
 
+// Provenance stamp -- TODO #23. Unconditional and printed on EVERY launch,
+// on or off, because the failure this exists to catch is a switch silently
+// never reaching the process: a conditional "if (g_envOn) log(...)" cannot
+// distinguish "resolved off" from "never read at all", and that ambiguity is
+// exactly what let a run wander onto Bloodbath while looking clean. Every
+// value below is the actual const this file's hooks branch on, read here, not
+// a second getenv call that could drift from it.
+$execute {
+    log::info("[gdrl] STAMP telemetry GDRL_ENV={} GDRL_ENV_NAME={} "
+              "GDRL_ENV_WAIT_US={} GDRL_ENV_DELTA_TICKS={} GDRL_ENV_ADAPTIVE={} "
+              "GDRL_ENV_WIN_BEHIND={}{} GDRL_ENV_WIN_AHEAD={}{} "
+              "GDRL_ENV_WIN_VERT={}{} GDRL_BLOCK_INPUT={} GDRL_PIN_LEVEL={} "
+              "GDRL_PRACTICE={}",
+              (int)g_envOn, g_shmSuffix, g_waitBudget, g_envDeltaT,
+              (int)g_envAdaptive,
+              g_winBehind, g_winBehindSet ? "(set)" : "(unset, camera-derived)",
+              g_winAhead,  g_winAheadSet  ? "(set)" : "(unset, camera-derived)",
+              g_winVert,   g_winVertSet   ? "(set)" : "(unset, camera-derived)",
+              (int)g_blockInput, (int)g_pinLevel,
+              (int)g_gdrlPractice);
+    // GDRL_PRACTICE is a Benchmark-A-breaking opt-in (see the switch's own
+    // comment) -- stamped again, on its own line, so grepping "[gdrl] STAMP"
+    // for provenance cannot miss it inside a long comma list, and so a run
+    // with it on is unmistakable in the log independent of whether anyone
+    // reads the line above closely.
+    if (g_gdrlPractice) {
+        log::warn("[gdrl] STAMP telemetry GDRL_PRACTICE=1 -- THIS RUN IS NOT "
+                  "BENCHMARK A. Checkpoint-resumed attempts will be counted "
+                  "separately (GdrlValidity.practiceAttempts) and flagged "
+                  "(PRACTICE header bit, header.resumeTick) on the wire, but "
+                  "any report drawn from this run must say so.");
+    }
+}
+
 $execute {
     if (!g_envOn) return;
     if (!openSegment()) {
@@ -1362,10 +1823,19 @@ $execute {
     }
     if (g_envDeltaT > 0 && envInt("GDRL_DELTA_TICKS", 0) > 0) {
         log::warn("[gdrl] ENV both GDRL_ENV_DELTA_TICKS={} and GDRL_DELTA_TICKS={} "
-                  "are set. Two update hooks both rewrite dt and the order between "
-                  "translation units is a linker detail, so which one wins is "
-                  "UNVERIFIED. Set only one.",
-                  g_envDeltaT, envInt("GDRL_DELTA_TICKS", 0));
+                  "are set (GDRL_ENV_ADAPTIVE={}, GDRL_ADAPTIVE={}). Two update "
+                  "hooks both rewrite dt and the order between translation "
+                  "units is a linker detail, so which one wins -- adaptive or "
+                  "not -- is UNVERIFIED. Set only one of GDRL_ENV_DELTA_TICKS / "
+                  "GDRL_DELTA_TICKS.",
+                  g_envDeltaT, envInt("GDRL_DELTA_TICKS", 0),
+                  (int)g_envAdaptive, envInt("GDRL_ADAPTIVE", 0));
+    }
+    if (g_envAdaptive && g_envDeltaT <= 0) {
+        log::warn("[gdrl] ENV GDRL_ENV_ADAPTIVE=1 is set but GDRL_ENV_DELTA_TICKS "
+                  "is 0 -- there is no cap to shrink from, so adaptive sizing has "
+                  "nothing to do and this switch has NO EFFECT. Set "
+                  "GDRL_ENV_DELTA_TICKS>0 to use it.");
     }
 }
 
@@ -1390,14 +1860,26 @@ $execute {
 //     will still advance in lockstep -- which is why BOTH are emitted. A
 //     constant offset is correctable; a varying one invalidates placement.
 //
-// (3) Placement is tick-exact through this path. experiments.cpp established
-//     the ground truth by queuing from update(): at dt=1/240, injection tick
-//     324 gives maxX=542.668640137 and 325 gives maxX=958.117858887, a hard
-//     boundary with no smearing. TEST: schedule PRESS at targetTick=324 with
-//     hold 8 and separately at 325, via this path, at GDRL_ENV_DELTA_TICKS=32.
-//     The boundary must land in exactly the same place. If it lands at 323/324
-//     or 325/326 the +1 in fireDueInputs is off by one -- which is a one-line
-//     fix, but only once it is measured rather than reasoned about.
+// (3) Placement is tick-exact through this path AT GDRL_ENV_DELTA_TICKS=1.
+//     experiments.cpp established the ground truth by queuing from update():
+//     at dt=1/240, injection tick 324 gives maxX=542.668640137 and 325 gives
+//     maxX=958.117858887, a hard boundary with no smearing. TEST: schedule
+//     PRESS at targetTick=324 with hold 8 and separately at 325, via this
+//     path, at GDRL_ENV_DELTA_TICKS=1. The boundary must land in exactly the
+//     same place. If it lands at 323/324 or 325/326 the +1 in fireDueInputs is
+//     off by one -- which is a one-line fix, but only once it is measured
+//     rather than reasoned about.
+//
+//     AT N>1 WITHOUT GDRL_ENV_ADAPTIVE this is now KNOWN to fail, not merely
+//     UNVERIFIED: measured 2026-08-17, tier (iv), a 12-jump sequence landed 1
+//     of 12 jumps at GDRL_ENV_DELTA_TICKS=32 and 0 of 12 at =64, while the
+//     underlying physics stayed bit-identical up to at least N=64 with nothing
+//     scheduled. That measurement is what GDRL_ENV_ADAPTIVE (see g_envAdaptive
+//     and nextEventTickEnv() above) exists to fix, by the same mechanism
+//     experiments.cpp's GDRL_ADAPTIVE already uses. Whether it actually fixes
+//     placement at N=32/64 -- as opposed to merely being modelled on a
+//     mechanism that fixed the EXP path -- is item (9) below and is
+//     UNVERIFIED until it is run.
 //
 // (4) Enabling the environment does not perturb the simulation. The object scan
 //     calls the virtual getObjectRect() on every object in the window every
@@ -1452,4 +1934,38 @@ $execute {
 //     under Benchmark A, but it has never been counted. TEST: log, for one
 //     attempt, the count of objects rejected by the y/x filters whose
 //     getObjectRect() nevertheless intersects the window.
+//
+// (9) NEW, this session. GDRL_ENV_ADAPTIVE=1 makes placement tick-exact at
+//     N>1, not merely closer. Never run against the live game -- everything
+//     about it here is the same kind of static analysis (3) warns against,
+//     modelled on experiments.cpp's GDRL_ADAPTIVE (README "Adaptive dt",
+//     validated tier iv there) but NOT itself measured against GD. The two
+//     paths differ in one respect that matters: EXP injects once per OUTER
+//     update() call, before delegating, so adaptive-dt correctness there only
+//     ever depended on the outer frame boundary landing on the right tick.
+//     ENV's fireDueInputs runs inside prepareMoveActions, whose call cadence
+//     relative to the outer frame is EXACTLY item (1)/(2)'s open question --
+//     if it fires once per physics substep (curTick advancing by 1 every
+//     call, independent of the outer dt), this switch is provably a no-op
+//     that costs nothing; if it fires once per outer update() call (curTick
+//     jumping by the whole frame's tick count in one step, which the 2026-08-17
+//     lateness measurement is most easily explained by), this switch is the
+//     fix and the frame-boundary reasoning in the useDt comment above applies
+//     directly. Both cases are argued to be handled correctly by capping the
+//     OUTER frame's dt (see the comment above nextEventTickEnv()), but "argued
+//     to be handled" is not "measured to be handled". TEST: repeat the
+//     twelve-jump sequence from the 2026-08-17 measurement at
+//     GDRL_ENV_DELTA_TICKS=32 and =64 with GDRL_ENV_ADAPTIVE=1 and confirm
+//     12/12 jumps land, maxX and deathTick bit-identical to the N=1 (or N=8/16)
+//     baseline.
+//
+//     CORRECTION 2026-08-17 (orchestrator, live): this switch is not on the
+//     critical path. trainer/sightread.py's `advanceSteps` already lands the
+//     frame boundary on its next action tick every step, independent of this
+//     switch, and measured bit-identical at dt in {1,8,32,64} with 0 "fired
+//     LATE" and 0 protoErr. The above TEST is still the right one to falsify
+//     THIS switch specifically -- e.g. for a client that streams a fixed
+//     stride rather than computing advanceSteps -- it is just no longer the
+//     thing standing between the project and tick-exact ENV placement, because
+//     the thing actually shipping already solved that problem one layer up.
 // ---------------------------------------------------------------------------

@@ -1174,6 +1174,94 @@ triggers are not rendered, so a human sightreading cannot see them either, and
 they describe the level's *future* rather than its present. Largely moot for the
 current goal — Stereo Madness dumps `0 move triggers`.
 
+## The agent plays: first autonomous run, 2026-08-17
+
+`trainer/sightread.py` was run against real Geometry Dash for the first time.
+Before this, every result in this file came from a human hand-picking tick
+numbers and feeding them to `GDRL_INJECT_SEQ`.
+
+Two runs, binary `034fb3ac`, `autoplay -> 'Stereo Madness'` confirmed on both:
+
+| run | budget | dt | attempts | wall | best x |
+|---|---|---|---|---|---|
+| smoke | 12 | 8 | 12 | 36.9 s | `2431.463867188` |
+| acceptance | 600 | 64 | 254 | 526.9 s | `3071.545410156` |
+
+The acceptance criterion — autonomously reach the human record
+`3959.183837891` — is **not met**. 3071.5 is 77.6 % of it.
+
+**The driver measures its own constants, and they agree with this file:**
+
+| quantity | driver measured | previously recorded |
+|---|---|---|
+| units per tick @1x | `1.298340` | `1.298250437` (diff 8.9e-5) |
+| hop (ticks between auto-repeat jumps) | **103**, from 265 landings | ~104 assumed |
+| sensor horizon | 276 ticks | 277 |
+
+The hop number matters more than it looks. The interval action space is a bet
+that holding jump auto-repeats, and `sightread.py`'s own docstring called the
+supporting test circular — the toy level was *written* to auto-repeat. **265 real
+landings in the live game is the non-circular measurement**, and it agrees.
+
+## `GDRL_ENV_DELTA_TICKS`: no ceiling for a client that strides adaptively
+
+Physics is bit-identical at every dt tested. Null input (no `GDRL_INJECT_SEQ`)
+at N in {1, 8, 16, 32, 64} gives `maxX=507.615234375`, `finalTick=391` at **every
+N**; frames fall 447 -> 110 -> 87 -> 73 -> 39. A 64-tick dt integrates the same
+as a 1-tick dt.
+
+What varies is only **when a queued button is pressed**, and only for clients
+that do not stride to their own action ticks. Both firing rules are thresholds,
+not equalities — `experiments.cpp:381` (`curTick >= push`) and
+`telemetry.cpp:547` `fireDueInputs` — so an input fires up to N-1 ticks late.
+
+- **`GDRL_INJECT_SEQ` path — degrades at N>=32.** It fires whenever the clock
+  next passes the target. At N=32 exactly one of the canonical twelve jumps
+  lands, giving `958.117858887 / 738`, which is this file's own recorded
+  single-jump-at-325 trajectory. At N=64 none land, giving `507.615234375 / 391`,
+  the null-input trajectory. N=16 survives only because outcome plateaus are ~7
+  ticks wide (see the tick 325-331 table) — **luck about one sequence, not a
+  property of the stride.**
+- **The ENV path driven by `sightread.py` — exact at every dt tested.** The
+  driver sets `stride = max(1, min(targets) - cur)` (`sightread.py:1001`), so the
+  frame boundary lands on the action tick by construction, and the mod honours a
+  partial final frame. Running the same search at dt = 1, 8, 32, 64 gives
+  **bit-identical results attempt-for-attempt**, with `fired LATE` count 0 and
+  `env[timeouts=0 protoErr=0]` throughout.
+
+Wall clock for one 1825-tick attempt: **31.47 s / 4.87 s / 2.27 s / 1.85 s** at
+dt = 1 / 8 / 32 / 64. **17x, no divergence.** dt=64 is the operating point.
+
+**At low dt the driver's timeout must be raised**: `max_stride=2048` at dt=1 is
+~34 s of wall clock against a default 20 s per-observation timeout, which is the
+only reason two dt=1 attempts failed. At dt=64 the same stride is ~0.5 s.
+
+## The search's binding failure: it does not back out of a wall
+
+From the acceptance run's ledger:
+
+| death x | attempts |
+|---|---|
+| **3071.545** | **237** |
+| everything else | 1-2 each |
+
+**237 of 254 attempts died at exactly `x=3071.545`, `end_tick=2368`**, and the
+best result was reached at attempt #15 — attempts #16-#254 improved nothing.
+
+The obstacle, read from the game's own dumped level string, is **one ordinary
+spike (`id 8`) at x=3075, runtime y=135**, on an unbroken run of blocks from
+x=2955 to x=3195. The simplest obstacle in the game.
+
+The cause is not the spike. Using the driver's own measured constants: death at
+x=3071.545 is tick ~2365; the best plan's last interval `(2170,110)` auto-repeats
+into a jump starting ~2273 that lands ~2376. **The cube is airborne and
+descending when it reaches the spike**, so every near-frontier press the search
+tried — 2317, 2330, 2343, all hold 12 — was issued off the ground and did
+nothing. No candidate near the frontier can fix it at any tick or hold length;
+only revising an interval ~195 ticks earlier changes the landing phase.
+
+**Throughput is solved and the sensor is adequate. The search is what fails.**
+
 ## A search driver exists: `trainer/sightread.py`
 
 Built 2026-08-15. Before it, nothing in this repo chose an action — the best

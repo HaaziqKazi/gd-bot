@@ -1283,6 +1283,20 @@ class $modify(GDRLCensusBaseGameLayer, GJBaseGameLayer) {
     }
 };
 
+// Provenance stamp -- TODO #23, unconditional (see telemetry.cpp's copy of
+// this comment). Same consts the probes above branch on, gathered into one
+// line here because this is the first point in the file after all of them
+// are declared.
+$execute {
+    log::info("[gdrl] STAMP probes GDRL_PROBE_CMDVEC={} GDRL_PROBE_MOVE={} "
+              "GDRL_FORCE_VEHICLE_set={} GDRL_FORCE_VEHICLE={} "
+              "GDRL_FORCE_VEHICLE_TICK={} GDRL_PROBE_PHANTOM={} "
+              "GDRL_CENSUS={} GDRL_CENSUS_SWEEP={}",
+              (int)g_probeCmdVec, (int)g_probeMove, (int)g_probeForceVehicle,
+              g_forceVehicle, g_forceVehicleTick, (int)g_probePhantom,
+              (int)g_census, g_censusSweepTo);
+}
+
 $execute {
     if (g_censusSweepTo > 0 && envOn("GDRL_PIN_LEVEL")) {
         log::error("[gdrl] CENSUS_SWEEP={} and GDRL_PIN_LEVEL are both set. The "

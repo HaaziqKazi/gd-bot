@@ -27,6 +27,8 @@ Run: cd trainer && python3 -m pytest test_sightread.py -q
 from __future__ import annotations
 
 import inspect
+import json
+import subprocess
 import sys
 import threading
 import time
@@ -505,3 +507,332 @@ def test_the_bench_reports_both_sides_of_the_gil_artifact():
         "measuring it or this machine schedules differently -- either way the "
         "number in the module docstring should not be trusted until it is "
         "re-derived.")
+
+
+# ---------------------------------------------------------------------------
+# Surviving a live run: the wire cap, incremental persistence, a dead game
+#
+# These four things are named in TODO's "Things that cost runs" as having
+# already cost real GD sessions. Everything below is tier (i) -- regression
+# against the puppet or a bare AttemptLedger -- per this file's own posture
+# statement at the top. None of it is evidence about Geometry Dash; all of it
+# is evidence about whether this driver has a path that avoids repeating a
+# mistake already paid for once.
+# ---------------------------------------------------------------------------
+
+def _hazard_chain_level(n: int, spacing: float = 100.0,
+                        first_x: float = 150.0) -> toy.ToyLevel:
+    """``n`` hazards, each independently clearable by one short hop."""
+    xs = [first_x + spacing * i for i in range(n)]
+    return toy.ToyLevel(hazards=tuple(toy.Hazard(x=x) for x in xs),
+                        length=xs[-1] + spacing)
+
+
+def _clearing_plan(level: toy.ToyLevel, hold_ticks: int = 4,
+                   lead: float = 40.0) -> sr.Plan:
+    """One short hop per hazard, timed the same way as the cluster test above."""
+    upt = toy.TOY_UNITS_PER_TICK
+    return sr.Plan(tuple(sr.Interval(int((h.x - lead) / upt), hold_ticks)
+                         for h in level.hazards))
+
+
+def test_a_plan_past_the_wire_cap_still_clears_every_hazard():
+    """GDRL_MAX_ACTIONS=8 (schema_generated.py, checked against env.py's
+    Channel.respond below): a plan needing 9 intervals must place all 9 across
+    two responses, or the player dies at the hazard only the 9th interval
+    clears.
+
+    This is deliberately NOT an exception-only test. A regression that caps
+    the outgoing batch at 8 and silently drops the tail (rather than looping to
+    send the rest on the next response) would raise nothing -- Channel.respond
+    never sees more than 8 either way -- and would still fail this test on
+    ``reached_end_of_level``, because the 9th hazard is unclearable without the
+    9th interval. An exception-only test would have missed exactly that bug.
+    """
+    assert sr.GDRL_MAX_ACTIONS == 8, (
+        "the cap this file was told about does not match schema_generated.py; "
+        "the rest of this test's premise (9 > cap) may no longer hold")
+    level = _hazard_chain_level(9)
+    buf = make_loopback_buffer()
+    game = toy.ToyGame(buf, level=level)
+    chan = Channel(buf)
+    chan.attach()
+    game.start(max_seconds=60.0)
+    try:
+        runner = sr.Runner(chan, sr.AttemptLedger(), timeout=10.0)
+        runner.prime()
+        plan = _clearing_plan(level)
+        assert len(plan.intervals) == 9
+        out = runner.rollout(plan, watch_from_tick=0)
+    finally:
+        game.stop()
+        chan.detach()
+        buf.close()
+    assert out.unrunnable is None, out.unrunnable
+    assert out.reached_end_of_level, (
+        f"died before the level ended (max_x={out.max_x}); the 9th interval, "
+        "past the 8-action wire cap, was most likely never scheduled")
+    assert game.late_events == 0, "an input was scheduled for a tick already gone"
+
+
+def test_a_plan_past_the_wire_cap_never_sends_more_than_the_cap_per_response():
+    """The structural half of the claim above, verified AT THE WIRE.
+
+    Spies on ``Channel.respond`` (the exact function TODO says raises above 8)
+    to confirm both halves at once: no call ever exceeds the cap, AND the 9
+    intervals are not quietly trimmed to 8 while making that true -- they sum
+    to 9 across the calls that carried any.
+    """
+    level = _hazard_chain_level(9)
+    buf = make_loopback_buffer()
+    game = toy.ToyGame(buf, level=level)
+    chan = Channel(buf)
+    chan.attach()
+    game.start(max_seconds=60.0)
+
+    calls: list[int] = []
+    real_respond = chan.respond
+
+    def spy(actions=None, *, advance_steps=1, detach=False):
+        calls.append(len(actions or []))
+        return real_respond(actions, advance_steps=advance_steps, detach=detach)
+
+    chan.respond = spy
+    try:
+        runner = sr.Runner(chan, sr.AttemptLedger(), timeout=10.0)
+        runner.prime()
+        runner.rollout(_clearing_plan(level), watch_from_tick=0)
+    finally:
+        game.stop()
+        chan.detach()
+        buf.close()
+
+    assert calls, "the spy never saw a call; the test is not exercising anything"
+    assert all(n <= sr.GDRL_MAX_ACTIONS for n in calls), calls
+    assert sum(calls) == 9, (
+        f"calls carried {sum(calls)} actions total, not 9 -- some intervals "
+        f"were dropped rather than deferred to a later response: {calls}")
+
+
+def test_attempt_ledger_on_close_fires_synchronously_with_the_closed_record():
+    """The hook incremental persistence is built on, tested with no game at all.
+
+    Nothing here touches a file or a channel -- just that ``close()`` invokes
+    ``on_close`` exactly once, with the same record object, fully populated,
+    before ``close()`` returns. If this is true, wiring a file writer onto it
+    (below) is the only thing left to trust.
+    """
+    seen: list[sr.AttemptRecord] = []
+    led = sr.AttemptLedger(on_close=seen.append)
+    rec = led.open("probe", sr.Plan(()), game_attempt=5)
+    assert seen == [], "on_close fired before the attempt even closed"
+    led.close(rec, game_attempt=5, max_x=12.5, end_tick=99, note="ok",
+             wall_seconds=0.01)
+    assert len(seen) == 1
+    assert seen[0] is rec
+    assert seen[0].max_x == 12.5 and seen[0].end_tick == 99
+    assert seen[0].game_attempt_at_close == 5
+
+
+def test_jsonl_writer_persists_every_attempt_even_though_nothing_closed_it(
+        tmp_path):
+    """Durability, not just correctness.
+
+    TODO: "env.py clients SIGSEGV when the game dies while they hold the mmap
+    ... Any driver must write results incrementally, per attempt. An
+    end-of-run dump is a dump that never happens. Cost two full runs." The file
+    handle ``jsonl_writer`` opens is deliberately never closed by this test --
+    that is the point. If the data were only visible after a clean close, a
+    process that dies (or is killed) mid-run would still lose it, and this
+    would not be a fix for what TODO describes.
+    """
+    path = tmp_path / "attempts.jsonl"
+    buf = make_loopback_buffer()
+    game = toy.ToyGame(buf)
+    chan = Channel(buf)
+    chan.attach()
+    game.start(max_seconds=60.0)
+    try:
+        ledger = sr.AttemptLedger(on_close=sr.jsonl_writer(str(path)))
+        runner = sr.Runner(chan, ledger, timeout=10.0)
+        search = sr.Sightreader(runner, budget=15, target_x=None, verbose=False)
+        report = search.run()
+    finally:
+        game.stop()
+        chan.detach()
+        buf.close()
+
+    # A completely separate read of the path -- not the writer's own `fh`.
+    lines = path.read_text().splitlines()
+    assert len(lines) == report.attempts == ledger.count
+    decoded = [json.loads(line) for line in lines]
+    assert [d["index"] for d in decoded] == list(range(len(decoded)))
+    # Cross-check one record against the ledger's in-memory copy: same
+    # attempt, reached two independent ways (the object vs. its JSONL line).
+    assert decoded[-1] == ledger.records[-1].as_dict()
+
+
+def test_game_gone_is_a_run_aborted_so_existing_abort_handling_still_works():
+    """Structural: GameGone must not need Sightreader.run() to learn a new
+    except clause. It is a RunAborted subclass so the existing
+    ``except RunAborted`` -- which already reports and stops cleanly -- covers
+    it for free. A refactor that broke the subclass relationship would still
+    pass every other test here and silently reopen the crash this closes."""
+    assert issubclass(sr.GameGone, sr.RunAborted)
+
+
+def test_a_confirmed_dead_process_is_detected_before_the_full_timeout():
+    """A process confirmed gone must not cost a full poll timeout to notice.
+
+    Regression for the SIGSEGV story: the fix is to stop touching the mapping
+    once the writer is known to be gone, not to wait out a timeout hoping it
+    reappears. ``modPid`` is pointed at a subprocess that has already exited --
+    a real, previously-valid, now-guaranteed-dead pid, not a magic number --
+    so ``mod_process_alive()`` is exercised for real rather than stubbed.
+    """
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+
+    buf = make_loopback_buffer()
+    game = toy.ToyGame(buf)
+    chan = Channel(buf)
+    chan.attach()
+    game.start(max_seconds=30.0)
+    try:
+        ledger = sr.AttemptLedger()
+        runner = sr.Runner(chan, ledger, timeout=5.0)
+        runner.prime()                       # normal contact, game genuinely alive
+        game.stop()                          # the writer thread stops answering
+        game.game.control["modPid"] = dead.pid   # ...and now looks dead too
+
+        t0 = time.perf_counter()
+        with pytest.raises(sr.GameGone):
+            runner.rollout(sr.Plan((sr.Interval(40, 4),)), watch_from_tick=0)
+        elapsed = time.perf_counter() - t0
+    finally:
+        chan.detach()
+        buf.close()
+
+    assert elapsed < runner.timeout, (
+        f"took {elapsed:.2f}s against a {runner.timeout}s timeout -- this "
+        "means the dead process was found reactively (after the full wait) "
+        "rather than proactively, which is still correct but not the "
+        "improvement this test is for")
+    # The sync record _await_fresh_attempt opened before discovering the
+    # process was gone must still be closed, not left dangling -- an open
+    # record would poison the ledger's audit on the very next call.
+    assert ledger.audit() == []
+
+
+def test_the_full_search_survives_the_process_dying_mid_search_not_just_at_sync():
+    """End to end, and a DIFFERENT code path than the test above.
+
+    The previous test kills the process before the very first rollout, so
+    ``GameGone`` is raised from inside ``_await_fresh_attempt`` (no per-plan
+    ``except TimeoutError`` there -- see that method's docstring). This one
+    lets the calibration rollout complete normally and kills the process only
+    once the search is already inside its main probe loop, so ``GameGone`` is
+    raised from ``rollout()``'s MAIN BATCH loop instead -- the one that DOES
+    have an ``except TimeoutError`` clause, which must NOT swallow it (GameGone
+    is a RunAborted, not a TimeoutError). If a future edit changed that except
+    clause to catch bare ``Exception`` or ``RunAborted`` instead of exactly
+    ``TimeoutError``, this is the test that would catch it: the search would
+    then mislabel a dead game as an ordinary "unrunnable" plan and keep
+    probing a game that no longer exists, at length seq(0) every time.
+    """
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+
+    buf = make_loopback_buffer()
+    game = toy.ToyGame(buf)
+    chan = Channel(buf)
+    chan.attach()
+    game.start(max_seconds=30.0)
+    try:
+        ledger = sr.AttemptLedger()
+        runner = sr.Runner(chan, ledger, timeout=3.0)
+        search = sr.Sightreader(runner, budget=50, target_x=None, verbose=False)
+
+        real_rollout = runner.rollout
+        killed = {"done": False}
+
+        def rollout_then_die(*args, **kwargs):
+            out = real_rollout(*args, **kwargs)
+            # Kill the game only once, right after the FIRST rollout (the
+            # calibration probe) returns successfully -- so the NEXT rollout
+            # call discovers death from inside its own main batch loop, not
+            # before it starts.
+            if not killed["done"]:
+                killed["done"] = True
+                game.stop()
+                game.game.control["modPid"] = dead.pid
+            return out
+
+        runner.rollout = rollout_then_die
+        report = search.run()
+    finally:
+        chan.detach()
+        buf.close()
+
+    assert report.attempts >= 2, (
+        "the death must be discovered from the SECOND rollout, not the first "
+        f"-- got only {report.attempts} attempt(s), so this did not exercise "
+        "the code path it claims to")
+    assert "aborted" in report.stopped_because, report.text()
+    assert ledger.audit() == []
+
+
+def test_an_alive_but_unresponsive_game_stops_the_search_cleanly_not_a_crash():
+    """A hang is not the same claim as a crash, and must not be confused with
+    one -- but neither may take main() down with it.
+
+    ``mod_process_alive()`` is stubbed to keep answering True (the process
+    genuinely did not die) while ``poll`` is made to stop answering after the
+    very first (real) contact, standing in for a real hang. ``Sightreader.run()``
+    must still return a normal ``SearchReport`` -- not raise -- with
+    ``stopped_because`` naming what happened rather than reporting a
+    misleadingly clean "budget exhausted" or "search space exhausted".
+
+    The hang is placed right after ``prime()`` -- inside the "run out the
+    in-flight attempt" sync phase every first rollout of a session does (see
+    ``_await_fresh_attempt``) -- deliberately, because THAT call site has no
+    per-plan ``except TimeoutError`` of its own (only the main batch loop in
+    ``rollout()`` does, which turns an ordinary timeout there into a per-plan
+    "unrunnable" and keeps searching -- also correct, and also covered, by
+    ``test_a_plan_past_the_wire_cap_...`` and the driver's own design; it is
+    not a crash either). This test is for the OTHER call site: the one that
+    used to propagate a bare exception straight out of ``Sightreader.run()``.
+    """
+    buf = make_loopback_buffer()
+    game = toy.ToyGame(buf)
+    chan = Channel(buf)
+    chan.attach()
+    game.start(max_seconds=30.0)
+    try:
+        ledger = sr.AttemptLedger()
+        runner = sr.Runner(chan, ledger, timeout=1.0)
+        search = sr.Sightreader(runner, budget=10, target_x=None, verbose=False)
+
+        real_poll = chan.poll
+        calls = {"n": 0}
+
+        def hang_after_a_few(timeout=5.0):
+            calls["n"] += 1
+            if calls["n"] <= 1:
+                return real_poll(timeout=timeout)
+            raise TimeoutError("stub: the game stopped answering")
+
+        chan.poll = hang_after_a_few
+        chan.mod_process_alive = lambda: True
+
+        report = search.run()
+    finally:
+        game.stop()
+        chan.detach()
+        buf.close()
+
+    assert "game stopped responding" in report.stopped_because, report.text()
+    assert report.stopped_because.startswith("aborted")
+    assert report.attempts >= 1
+    assert ledger.audit() == [], (
+        "the abort must not leave a dangling open record behind")

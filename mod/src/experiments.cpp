@@ -553,6 +553,22 @@ class $modify(GDRLExpPlayLayer, PlayLayer) {
     }
 };
 
+// Provenance stamp -- TODO #23, unconditional (see telemetry.cpp's copy of
+// this comment for why "off" must be logged, not just "on"). These are the
+// same consts EXPBaseGameLayer::update branches on, read here rather than
+// re-fetched from getenv.
+$execute {
+    log::info("[gdrl] STAMP experiments GDRL_EXP={} GDRL_DELTA_TICKS={} "
+              "GDRL_FAST_RESET={} GDRL_ADAPTIVE={} GDRL_INJECT_TICK={} "
+              "GDRL_INJECT_HOLD={} GDRL_INJECT_SPAN={} GDRL_INJECT_SEQ_ITEMS={} "
+              "GDRL_SWEEP_START={} GDRL_SWEEP_SPAN={} GDRL_SWEEP_STEP={} "
+              "GDRL_SWEEP_HOLD={} GDRL_PERTURB_IDX={} GDRL_PERTURB_DELTAS_N={}",
+              (int)g_expOn, g_deltaTicks, (int)g_fastReset, (int)g_adaptive,
+              g_injectTick, g_injectHold, g_injectSpan, (int)g_seqBase.size(),
+              g_sweepStart, g_sweepSpan, g_sweepStep, g_sweepHold, g_perturbIdx,
+              (int)g_perturbDeltas.size());
+}
+
 $execute {
     if (g_expOn) {
         log::info("[gdrl] EXP instrumentation ON (GDRL_DELTA_TICKS={} "

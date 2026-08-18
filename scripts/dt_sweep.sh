@@ -67,7 +67,11 @@ run_one() {
   echo
 }
 
-for spec in "1:control-first" "2:" "4:" "8:" "16:" "32:" "1:control-last"; do
+# SPEC overrides the sweep list, e.g. SPEC="8:control-first 16: 32: 64: 8:control-last".
+# The default is the full ladder from 1. Always keep a repeated control at both
+# ends: it separates between-process drift from a real divergence.
+SPEC=${SPEC:-"1:control-first 2: 4: 8: 16: 32: 1:control-last"}
+for spec in $SPEC; do
   run_one "${spec%%:*}" "${spec#*:}"
 done
 echo "binary at end: $(shasum -a 256 mod/build/gdrl.probe.geode | cut -c1-16)"

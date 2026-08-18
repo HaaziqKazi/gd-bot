@@ -876,6 +876,14 @@ class $modify(GDRLViewportBaseLayer, GJBaseGameLayer) {
     }
 };
 
+// Provenance stamp -- TODO #23, unconditional (see telemetry.cpp's copy of
+// this comment).
+$execute {
+    log::info("[gdrl] STAMP viewport GDRL_PROBE_VIEWPORT={} "
+              "GDRL_PROBE_VIEWPORT_PERIOD={} GDRL_VERIFY_XFORM={}",
+              g_mode, g_period, (int)g_verifyXform);
+}
+
 $execute {
     if (g_mode > 0) {
         log::info("[gdrl] PROBE_VIEWPORT on -- mode={} ({}), period={} frames. "
