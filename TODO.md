@@ -84,6 +84,13 @@ Status as of commit `478cd16` + the 2026-08-13 (L), 2026-08-14 (M/N),
 > completion path already exists in the driver. Only candidate *generation* is
 > cube-specific. Sequenced after the wall fix.
 >
+> **Preserved evidence** (`backups/2026-08-17/`, gitignored but durable — the
+> originals were in `/tmp` and are one reboot from gone):
+> `sightread_live_20260817-230706.jsonl` is the 254-attempt acceptance ledger
+> and is **the baseline the wall fix must beat**;
+> `sightread_live_20260817-225850.jsonl` is the 12-attempt smoke run;
+> `dtsweep_hi.txt` is the N=8/16/32/64 sweep output.
+>
 > **Provenance:** always `grep "gdrl\] autoplay ->"` the log. And the mod now has
 > a `[gdrl] STAMP` block (uncommitted-at-wrap work, unbuilt) that logs every
 > resolved `GDRL_*` switch plus the screen size and derived sensor width —
