@@ -137,6 +137,7 @@ import numpy as np
 
 import env as envmod
 import schema_generated as sg
+from conditioning import Vehicle, derive_vehicle
 from env import (
     Action,
     Channel,
@@ -1318,7 +1319,14 @@ class CandidateSource:
         """
         u = self.rhythm.unit
         lo = self._earliest_start()
-        hi = max(lo, self.death_tick)
+        # A press scheduled AT the tick the incumbent already died on cannot
+        # affect anything before that death -- the run is over by then. Capped
+        # at death_tick - 1, not death_tick, so ``t <= hi`` can never propose a
+        # no-op. Measured live (orchestrator, 2026-08-18): 49/237 post-frontier
+        # probes in the un-guarded generator had start_tick >= the incumbent's
+        # own death tick, pure waste that this closes off structurally rather
+        # than leaving to chance.
+        hi = max(lo, self.death_tick - 1)
         span = int(self.max_span_horizons * self.rhythm.horizon)
         lo = max(lo, hi - span)
         centre = max(lo, min(hi, self.death_tick - u // 2))
@@ -1358,7 +1366,12 @@ class CandidateSource:
         # because none of its inputs happened before the death, and the priority
         # kept picking that node because its subtree best was the frontier. It
         # looked like a search and was a loop.
-        if self._earliest_start() > self.death_tick:
+        # A start at or after death_tick can never affect the outcome (see
+        # _start_passes' hi cap for the same rule applied to the sweep below),
+        # so "no room to append anything before the death" is now ">=" rather
+        # than "greater than" -- lo == death_tick is exactly the case where the
+        # only tick left is the one nothing can be scheduled AT.
+        if self._earliest_start() >= self.death_tick:
             return
 
         # 0. The cheapest probe of the hold hypothesis: hold from as early as the
@@ -1366,7 +1379,7 @@ class CandidateSource:
         #    stretches really are cleared by simply holding, this finds them for
         #    one attempt instead of a sweep.
         lo = self._earliest_start()
-        if lo <= self.death_tick:
+        if lo < self.death_tick:
             yield Interval(lo, max(1, self.death_tick - lo + 4 * self.rhythm.unit))
 
         # 1. The one candidate the SENSOR shapes: a hold as long as the hazard
@@ -1378,7 +1391,7 @@ class CandidateSource:
             u = self.rhythm.unit
             for lead in (u // 2, u, u // 4):
                 start = self.death_tick - lead
-                if start >= lo:
+                if lo <= start < self.death_tick:
                     yield Interval(start, span + u)
 
         # 2. The sweep: coarse pass first, and every hold shape at each start
@@ -1401,6 +1414,205 @@ class CandidateSource:
         return None
 
 
+class ShipCandidateSource:
+    """Proposals for one node when the player was last seen in a SHIP.
+
+    Ship is continuous control: thrust accelerates the player upward while the
+    button is held, and gravity pulls it down while released (README, "in a
+    ship, holding is continuous thrust rather than a re-triggered jump" --
+    also TODO Q5/Q5a). :class:`CandidateSource` has nothing sensible to
+    propose there -- its whole menu is scaled by ``Rhythm.airtime_ticks``, a
+    ground-contact hop *period*, and a ship in flight does not produce the
+    ground->air->ground cycle that measurement is built from (``Rhythm``
+    keeps it ``None`` and falls back to ``FALLBACK_AIRTIME_TICKS``, a cube
+    number, if nothing here stopped that).
+
+    This class never reads ``rhythm.unit``/``rhythm.airtime_ticks`` for
+    exactly that reason. Its start-tick and hold-length menus are scaled by
+    ``rhythm.horizon`` instead -- a real, vehicle-agnostic measurement (the
+    sensor's own reach, README item 1) -- and use the SAME coarse-to-fine
+    sweep shape as :class:`CandidateSource` because that structure (wide
+    passes first, refining on later ones) is a property of piecewise-constant
+    outcomes in tick space, not of hopping specifically.
+
+    UNVERIFIED, IN FULL. Nobody has run this against a live ship section --
+    Stereo Madness's ship portals (x=7995, 22935, 24045, TODO Q5) have never
+    been reached by this driver, and no ship-equivalent of the hop-period
+    constant has ever been measured to replace the one this class refuses to
+    borrow. The only established fact this design leans on is that the
+    ``Interval(start_tick, hold_ticks)`` action space itself is
+    vehicle-agnostic (README) -- what start ticks and hold lengths are worth
+    TRYING for a ship is a guess, stated as one, not a measurement.
+
+    Deliberately NOT ported from :class:`CandidateSource`:
+
+    * ``obstacle_span_ticks`` -- the sensor-shaped candidate that spans a
+      hazard cluster. Its gap threshold is ``rhythm.unit * units_per_tick``,
+      a cube hop distance; there is no measured ship-equivalent gap to
+      substitute, and fabricating one would be exactly the "confident guess"
+      this repo's rules forbid. Omitted rather than faked.
+    * the airborne-press / wall-detection use of ``player.is_on_ground`` in
+      :class:`Sightreader` -- TODO Q5a flags that a ship can rest against
+      floor OR ceiling with ``m_isOnGround`` as a single bit, so that signal
+      may not mean the same thing here. Left alone (out of this task's
+      scope); a ship run will fall back to :class:`Memory`'s slower,
+      several-deaths-at-the-same-x wall detection instead, which does not
+      depend on ``is_on_ground`` at all.
+    """
+
+    def __init__(self, plan: Plan, outcome: "Outcome", rhythm: Rhythm, *,
+                 max_span_horizons: float = 2.0):
+        self.plan = plan
+        self.outcome = outcome
+        self.death_tick = outcome.end_tick
+        self.first_tick = outcome.first_tick
+        self.rhythm = rhythm
+        self.max_span_horizons = max_span_horizons
+        self._tried: set[Interval] = set()
+        self.widen_level = 0
+        # Hold lengths as fractions of the sensor HORIZON, not of a hop period
+        # -- there is nothing hop-shaped to fraction here. Spans a brief tap
+        # to a hold nearly as long as the horizon itself: a ship's vertical
+        # correction could need anything from a nudge to sustained thrust
+        # across a whole screen of ceiling/floor geometry, and nothing
+        # measured yet says which.
+        self._hold_fracs: list[float] = [1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125]
+        self._gen = self._generate()
+
+    def widen(self) -> None:
+        """Broaden the spread after repeated failure. Mirrors CandidateSource."""
+        self.widen_level += 1
+        self.max_span_horizons *= 2.0
+        lo = self._hold_fracs[-1] / 2.0
+        hi = self._hold_fracs[0] * 2.0
+        self._hold_fracs = [hi] + self._hold_fracs + [lo]
+        self._gen = self._generate()
+
+    # -- the space --------------------------------------------------------
+    def _earliest_start(self) -> int:
+        last = self.plan.last
+        floor_tick = self.first_tick + 2
+        if last is not None:
+            floor_tick = max(floor_tick, last.end_tick + 1)
+        return floor_tick
+
+    def _holds(self) -> list[int]:
+        h = max(1, self.rhythm.horizon)
+        return sorted({max(1, int(f * h)) for f in self._hold_fracs}, reverse=True)
+
+    def _start_passes(self) -> list[list[int]]:
+        """Candidate start ticks, coarse pass first. No hop-relative bias:
+
+        unlike :class:`CandidateSource` (centred half a hop before the death
+        tick, on the theory a jump must begin before the obstacle it clears),
+        there is no equivalent lead-in law for thrust, so the sweep centres on
+        the death tick itself and widens outward in ``horizon``-scaled steps.
+        """
+        lo = self._earliest_start()
+        # Same no-op guard as CandidateSource._start_passes: a thrust interval
+        # beginning AT the tick the incumbent already died on cannot change
+        # anything that happens before that death. Capped at death_tick - 1 so
+        # ``t <= hi`` can never propose one. This class shipped with the
+        # un-guarded ``max(lo, self.death_tick)`` its cube counterpart was
+        # fixed out of; nothing had exercised it, because no ship section has
+        # ever been reached live.
+        hi = max(lo, self.death_tick - 1)
+        span = int(self.max_span_horizons * self.rhythm.horizon)
+        lo = max(lo, hi - span)
+        centre = max(lo, min(hi, self.death_tick - 1))
+
+        passes: list[list[int]] = []
+        seen: set[int] = set()
+        step = max(1, self.rhythm.horizon // 4)
+        while True:
+            this_pass: list[int] = []
+            offsets = [0]
+            k = step
+            while centre - k >= lo or centre + k <= hi:
+                offsets.extend((-k, k))
+                k += step
+            for off in offsets:
+                t = centre + off
+                if lo <= t <= hi and t not in seen:
+                    seen.add(t)
+                    this_pass.append(t)
+            if this_pass:
+                passes.append(this_pass)
+            if step == 1:
+                break
+            step = max(1, step // 2)
+        return passes
+
+    def _generate(self):
+        # Same backtrack-not-loop guard as CandidateSource: no room to append
+        # anything after the committed tail means this node is exhausted, not
+        # a dead end to grind on.
+        if self._earliest_start() > self.death_tick:
+            return
+
+        # 0. Cheapest probe of the "hold is sustained thrust" hypothesis:
+        #    thrust from as early as the plan allows to well past where the
+        #    last attempt ended.
+        lo = self._earliest_start()
+        if lo <= self.death_tick:
+            yield Interval(lo, max(1, self.death_tick - lo + self.rhythm.horizon))
+
+        # 1. The sweep: coarse pass first, every hold at each start before
+        #    moving to the next start -- same ordering rationale as
+        #    CandidateSource (start tick matters far more than hold length).
+        for starts in self._start_passes():
+            for start in starts:
+                for hold in self._holds():
+                    yield Interval(start, hold)
+
+    def next(self) -> Interval | None:
+        for iv in self._gen:
+            if iv in self._tried:
+                continue
+            self._tried.add(iv)
+            return iv
+        return None
+
+
+def _last_known_vehicle(outcome: "Outcome") -> Vehicle:
+    """The vehicle active at the end of ``outcome``'s tail, if known.
+
+    Read off the LAST :class:`Sight` in the tail the driver was given -- the
+    vehicle in force at (or just before) the point where any candidate
+    appended after this outcome will begin. ``Vehicle.CUBE`` when no sight is
+    available (an unrunnable outcome, or a rollout whose stride never dropped
+    to 1), which reproduces this file's only behaviour before vehicle
+    awareness existed: propose cube-shaped candidates. Proprioception only
+    (``player.vehicle_flags``, ALLOWED) -- no forbidden field is touched.
+    """
+    if not outcome.sights:
+        return Vehicle.CUBE
+    return derive_vehicle(outcome.sights[-1].player.vehicle_flags)
+
+
+def select_candidate_source(plan: Plan, outcome: "Outcome", rhythm: Rhythm, *,
+                             max_span_horizons: float = 2.0
+                             ) -> "CandidateSource | ShipCandidateSource":
+    """Choose the cube or the ship generator for a node, from what was seen.
+
+    The only switch: :class:`ShipCandidateSource` when the last observed
+    vehicle was SHIP, :class:`CandidateSource` (unchanged) otherwise --
+    including every other vehicle (ball, UFO, wave, robot, spider, swing).
+    Nothing has been measured about any of those either; cube's generator is
+    the pre-existing default and this function does not widen its scope
+    beyond what was asked for (TODO Q5: ship only). Picking the wrong one
+    costs nothing but wasted probes -- both generators still only produce
+    legal ``Interval``s, so a misclassified vehicle degrades the search, it
+    does not corrupt it.
+    """
+    vehicle = _last_known_vehicle(outcome)
+    if vehicle == Vehicle.SHIP:
+        return ShipCandidateSource(plan, outcome, rhythm,
+                                   max_span_horizons=max_span_horizons)
+    return CandidateSource(plan, outcome, rhythm,
+                           max_span_horizons=max_span_horizons)
+
+
 @dataclass
 class Node:
     """A committed plan, and the search's opinion of it."""
@@ -1409,7 +1621,7 @@ class Node:
     outcome: Outcome
     parent: "Node | None"
     depth: int
-    source: CandidateSource
+    source: "CandidateSource | ShipCandidateSource"
     subtree_best_x: float
     attempts_spent: int = 0
     exhausted: bool = False
@@ -1577,12 +1789,20 @@ class Sightreader:
         self._heap: list[tuple[float, int, Node]] = []
         self.stopped_because = "budget exhausted"
 
-        #: After this many probes since the last escalation that still land on
+        #: Base number of probes since the last escalation that still land on
         #: the same detected wall (or land with the decisive press taken while
-        #: airborne), force a backtrack. Small and constant, not a level fact --
-        #: it is how much slack the search gives itself before concluding "more
-        #: of the same" isn't going to change the answer. Reused for both
-        #: signals so one knob governs both.
+        #: airborne) before forcing a backtrack. NOT the threshold actually
+        #: used once the search has already escalated once for this wall --
+        #: see ``_escalate_patience``, which scales this by
+        #: ``_backtrack_depth``. Live evidence (orchestrator, 2026-08-18) is
+        #: why: holding this flat at every depth reached the plan's root in a
+        #: handful of probes (median divergence tick 340, minimum 3, on a
+        #: 5-interval committed plan where the actual fix needed only one
+        #: interval revised) -- ``_escalate`` was blocking each reopened
+        #: ancestor's own not-yet-exhausted local search before it had a real
+        #: chance, not because the wall needed root-deep revision but because
+        #: three failed probes is too little evidence that a WIDENED sweep
+        #: (dozens to hundreds of candidates) has nothing left to offer.
         self.wall_patience = wall_patience
         self._wall_strikes = 0
         self._airborne_strikes = 0
@@ -1627,6 +1847,30 @@ class Sightreader:
         return max(0, death_tick - lead)
 
     # -- wall detection and escalating backtrack ---------------------------
+    def _escalate_patience(self) -> int:
+        """Probes the CURRENT level gets before ``_escalate`` is allowed to
+        climb past it, gradual so cheap (shallow) revisions are exhausted
+        before expensive (deep) ones are even offered.
+
+        ``self.wall_patience * 2 ** self._backtrack_depth``: at
+        ``_backtrack_depth == 1`` (the very first escalation this wall has
+        seen -- still deciding whether to revise ``best_node``'s own last
+        interval at all) that is already ``2 * wall_patience``, not
+        ``wall_patience`` itself. Reason: the level being judged is not a
+        single fixed candidate, it is a whole widened sweep (``widen()``
+        roughly doubles both the start-tick span and the hold menu each time
+        it fires) -- ``wall_patience`` failures is nowhere near enough
+        evidence that a sweep with dozens of untried candidates left has
+        nothing in it, and treating it as if it were is exactly what turned
+        depth-1 escalations into de-facto jumps to the plan root (see
+        ``wall_patience``'s docstring for the live numbers). Doubling per
+        depth means the total cost of exhausting depths ``1..d`` before
+        finally reaching depth ``d+1`` is bounded (a geometric series), so
+        root is still reachable given a persistent wall -- ``_escalate``
+        keeps unbounded depth as a capability -- it is just no longer free.
+        """
+        return int(self.wall_patience * (2 ** self._backtrack_depth))
+
     def _wall_tolerance(self) -> float:
         """How close two deaths' x must be to count as "the same place".
 
@@ -1751,7 +1995,8 @@ class Sightreader:
             # else. Nothing is assumed that this could measure.
             root_out = self._evaluate(Plan(()), "calibrate", watch_from=0)
             root = Node(plan=Plan(()), outcome=root_out, parent=None, depth=0,
-                        source=CandidateSource(Plan(()), root_out, self.rhythm),
+                        source=select_candidate_source(Plan(()), root_out,
+                                                       self.rhythm),
                         subtree_best_x=root_out.max_x)
             self.root = root
             self.best_node = root
@@ -1788,7 +2033,8 @@ class Sightreader:
                 if out.ok:
                     child = Node(plan=cand, outcome=out, parent=node,
                                  depth=node.depth + 1,
-                                 source=CandidateSource(cand, out, self.rhythm),
+                                 source=select_candidate_source(cand, out,
+                                                                self.rhythm),
                                  subtree_best_x=out.max_x)
                     node.children.append(child)
                     self._propagate(node, out.max_x)
@@ -1816,8 +2062,9 @@ class Sightreader:
                                 self._airborne_strikes += 1
                             if at_wall:
                                 self._wall_strikes += 1
-                            if (self._airborne_strikes >= self.wall_patience
-                                    or self._wall_strikes >= self.wall_patience):
+                            patience = self._escalate_patience()
+                            if (self._airborne_strikes >= patience
+                                    or self._wall_strikes >= patience):
                                 self._escalate()
                         else:
                             self._push(child)
@@ -2023,10 +2270,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="ticks-equivalent a node forfeits per failed probe; "
                          "smaller backtracks sooner")
     ap.add_argument("--wall-patience", type=int, default=3,
-                    help="consecutive probes that land back on the same "
-                         "death site, or land with the press taken while "
-                         "airborne, before escalating backtrack forces an "
-                         "earlier interval back into contention")
+                    help="BASE count of consecutive probes that land back on "
+                         "the same death site, or land with the press taken "
+                         "while airborne, before escalating backtrack forces "
+                         "an earlier interval back into contention -- the "
+                         "actual threshold used doubles at every escalation "
+                         "depth (Sightreader._escalate_patience), so this is "
+                         "the cost of the FIRST backtrack, not of every one")
     ap.add_argument("--watch-horizons", type=float, default=1.25,
                     help="how many measured sensor horizons before the frontier "
                          "the observation stride drops to 1")

@@ -212,8 +212,9 @@ def test_the_search_machinery_contains_no_level_constant():
     record itself is allowed to exist as a stopping *target* in the CLI and
     nowhere else. This checks the parts that choose actions.
     """
-    for cls in (sr.CandidateSource, sr.Sightreader, sr.Rhythm, sr.Plan,
-                sr.Interval, sr.Runner):
+    for cls in (sr.CandidateSource, sr.ShipCandidateSource, sr.Sightreader,
+                sr.Rhythm, sr.Plan, sr.Interval, sr.Runner,
+                sr.select_candidate_source):
         src = inspect.getsource(cls)
         assert "3959" not in src, f"{cls.__name__} references the record x"
         for known_jump_tick in ("325", "712", "1074", "2878", "3048"):
@@ -483,6 +484,667 @@ def test_the_search_can_finish_the_toy_level(played):
     assert report.reached_end_of_level, (
         f"did not finish in {report.attempts} attempts:\n{report.text()}")
     assert report.audit == []
+
+
+# ---------------------------------------------------------------------------
+# Escalating backtrack: gradual depth, the no-op guard, and the wall-detection
+# methods (_wall_tolerance, _at_wall, _press_was_airborne, _escalate,
+# CandidateSource.widen)
+#
+# TIER (i), REGRESSION/MECHANISM ONLY -- and more deliberately so than
+# anywhere else in this file. Most of what follows drives Sightreader against
+# a FakeRunner whose "physics" is a hand-written lookup table, not
+# sightread_toy's cube. That is by design, not a shortcut: the property under
+# test is a property of the SEARCH (does escalation reach the tick position a
+# fix needs; does depth grow gradually; does the candidate generator ever
+# schedule a press after its own incumbent already died) -- not of any
+# physics, real or toy. A FakeRunner makes "the wall" and "the fix" exact,
+# chosen numbers instead of something coaxed out of a jump arc, which is what
+# lets these tests assert on the search's OWN bookkeeping (backtrack depth,
+# which nodes got blocked) rather than only on whether x went up. None of
+# this is evidence about Geometry Dash, or even about sightread_toy's puppet.
+#
+# The live numbers these tests are shaped by (orchestrator, 2026-08-18,
+# real-game runs against the committed wall-detection code before this file's
+# gradual-patience change): deepest backtrack before death 87 ticks (needed
+# ~198), 49/236 post-frontier probes had a start tick at or after the
+# incumbent's own death tick (pure waste), and -- after `_escalate` was
+# confirmed to fire correctly -- median divergence tick dropped from 2292 to
+# 340 and minimum divergence to 3, i.e. flat per-depth patience made
+# `_escalate` overshoot almost to the plan's root on nearly every wall,
+# discarding an ancestor's own not-yet-exhausted widened search before it had
+# a fair chance and never finding a fix either way (best_x unchanged, 3071.5
+# vs 3069.8).
+# ---------------------------------------------------------------------------
+
+def _mk_sight(tick: int, *, is_on_ground: bool, player_x: float = 0.0) -> sr.Sight:
+    """A fabricated Sight with only the fields these tests read set
+    meaningfully -- there is no wire record here, so nothing is decoded."""
+    return sr.Sight(
+        tick=tick, attempt_time=tick / 240.0, attempt=1, flags=0,
+        time_warp=1.0, dt_per_step=1.0,
+        player_x=player_x, player_y=105.0, player_speed=1.0,
+        window_min_x=0.0, window_max_x=200.0, window_min_y=0.0, window_max_y=200.0,
+        level_length=2000.0, section_columns=1, coverage_start_col=0,
+        object_count=0, objects_dropped=0, is_dual_mode=False,
+        player=sr.PlayerSense(
+            x=player_x, y=105.0, y_velocity=0.0, gravity=1.0, rotation=0.0,
+            vehicle_size=1.0, player_speed=1.0, vehicle_flags=0,
+            is_upside_down=False, is_sideways=False, is_on_ground=is_on_ground,
+            is_dashing=False, present=True,
+        ),
+        player2_present=False,
+        coverage=np.zeros(1, dtype=bool),
+        _objects=np.zeros(0, dtype=[("x", "f4")]),
+        unavailable=(),
+    )
+
+
+def _mk_outcome(plan: sr.Plan, *, max_x: float, end_tick: int, first_tick: int = 2,
+                sights=(), reached_end: bool = False,
+                attempt_index: int = 0) -> sr.Outcome:
+    return sr.Outcome(
+        attempt_index=attempt_index, game_attempt=1, plan=plan,
+        max_x=max_x, max_x_tick=end_tick, max_x_stride=1, end_tick=end_tick,
+        first_tick=first_tick, sights=tuple(sights),
+        reached_end_of_level=reached_end, unrunnable=None, wall_seconds=0.0,
+    )
+
+
+class _FakeRunner:
+    """A ``Runner`` whose physics is a lookup, not a simulation.
+
+    ``outcome_fn(plan)`` returns the kwargs for ``_mk_outcome`` (everything
+    but ``plan``/``attempt_index``) for that exact plan -- the ground truth a
+    test is built around, instead of something a jump arc happens to produce.
+    Real ``AttemptLedger`` bookkeeping is preserved (open/close on every
+    call) so ``Sightreader``'s budget loop, ledger count, and audit behave
+    exactly as they do against the real ``Runner``.
+    """
+
+    def __init__(self, outcome_fn):
+        self.ledger = sr.AttemptLedger()
+        self._outcome_fn = outcome_fn
+        self._attempt = 0
+        self.fatal: list = []
+
+    def prime(self) -> None:
+        pass
+
+    def rollout(self, plan: sr.Plan, *, purpose: str = "probe",
+                watch_from_tick: int = 0) -> sr.Outcome:
+        self._attempt += 1
+        rec = self.ledger.open(purpose, plan, self._attempt)
+        kwargs = self._outcome_fn(plan)
+        self.ledger.close(rec, game_attempt=self._attempt, max_x=kwargs["max_x"],
+                          end_tick=kwargs["end_tick"], note="", wall_seconds=0.0)
+        return _mk_outcome(plan, attempt_index=rec.index, **kwargs)
+
+
+def test_gradual_escalation_reaches_a_fix_flat_patience_permanently_loses():
+    """The failing case this whole section exists to close.
+
+    Manufactured plan: the ONLY working continuation is a specific second
+    interval, ``I2_GOOD`` -- confirmed below to be the 6th distinct candidate
+    ``CandidateSource`` offers for that slot. Every other second interval, and
+    the first interval alone, die at an IDENTICAL (x, tick) "wall" with the
+    press airborne at the moment it was due -- the diagnosed real shape: a
+    committed interval leaves the puppet unable to react locally (every local
+    press after it is issued mid-air and does nothing), and only revising
+    THAT interval, not appending past it, can change the outcome.
+
+    This is unsolvable by ``_at_wall``/``_press_was_airborne`` blocking alone
+    (both already correctly mark every bad I2 attempt as wasted -- that part
+    of this module already worked) -- it needs `_escalate` to revise the
+    FIRST interval's own node, and that node's own widened candidate menu has
+    to be given enough tries to actually reach candidate #5. With
+    ``wall_patience`` alone used at every depth (this module's shape before
+    this change), the first interval's node is abandoned -- and permanently
+    blocked -- after exactly 3 failures, one short of the fix, and the rest
+    of the budget is spent on a doomed alternative first interval instead
+    (this is asserted first, below, as the failing case). With patience
+    scaled by ``_backtrack_depth`` (this change), the same node gets enough
+    tries and the plan is found with zero escalations.
+    """
+    I1 = sr.Interval(4, 246)
+    I2_GOOD = sr.Interval(370, 30)
+
+    def physics(plan: sr.Plan) -> dict:
+        ivs = plan.intervals
+        if not ivs or ivs[0] != I1:
+            # Any other choice for the first interval never gets anywhere --
+            # this scenario has exactly one lever, I2, and it is not this one.
+            return dict(max_x=10.0, end_tick=10, first_tick=2)
+        if len(ivs) == 1:
+            return dict(max_x=500.0, end_tick=400, first_tick=2)
+        if ivs[1] == I2_GOOD:
+            return dict(max_x=1000.0, end_tick=770, first_tick=2, reached_end=True)
+        # Every other second interval: the identical wall, press airborne.
+        sight = _mk_sight(ivs[1].start_tick, is_on_ground=False)
+        return dict(max_x=500.0, end_tick=400, first_tick=2, sights=(sight,))
+
+    # Precondition check on the fixture itself, not a claim about the fix:
+    # confirm I2_GOOD really is candidate #5 (0-indexed) for this exact
+    # (plan, outcome, rhythm), i.e. that this test is actually exercising
+    # "not enough patience" and not some other accident of the generator.
+    rhythm_check = sr.Rhythm()
+    node1_outcome = _mk_outcome(sr.Plan((I1,)), max_x=500.0, end_tick=400)
+    probe_src = sr.CandidateSource(sr.Plan((I1,)), node1_outcome, rhythm_check)
+    first_six = [probe_src.next() for _ in range(6)]
+    assert first_six[5] == I2_GOOD, (
+        f"fixture drifted -- CandidateSource's first six candidates for this "
+        f"node are now {first_six}, and I2_GOOD is not the 6th")
+    assert I2_GOOD not in first_six[:5], "fixture drifted: the fix is reachable early"
+
+    # -- FLAT patience (this module's shape before this change): fails. -----
+    flat_runner = _FakeRunner(physics)
+    flat_search = sr.Sightreader(flat_runner, budget=60, target_x=None,
+                                 verbose=False, wall_patience=3)
+    flat_search._escalate_patience = lambda: flat_search.wall_patience
+    flat_report = flat_search.run()
+    assert not flat_report.reached_end_of_level, (
+        "fixture drifted: flat patience now finds the fix too -- this test "
+        "no longer demonstrates the regression it is named for")
+    assert flat_report.best_x == 500.0, (
+        f"expected flat patience to get permanently stuck at the wall "
+        f"(500.0); got best_x={flat_report.best_x}. "
+        f"{flat_report.text()}")
+
+    # -- Depth-scaled patience (this change): succeeds. ----------------------
+    scaled_runner = _FakeRunner(physics)
+    scaled_search = sr.Sightreader(scaled_runner, budget=60, target_x=None,
+                                   verbose=False, wall_patience=3)
+    scaled_report = scaled_search.run()
+    assert scaled_report.reached_end_of_level, (
+        f"depth-scaled patience did not find the fix either:\n"
+        f"{scaled_report.text()}")
+    assert scaled_report.best_plan.intervals == (I1, I2_GOOD)
+    assert scaled_report.audit == []
+
+
+def test_candidate_source_never_schedules_a_press_at_or_after_the_incumbents_death():
+    """The no-op guard (orchestrator, 2026-08-18: 49/236 real post-frontier
+    probes had ``start_tick >= death_tick`` before this was closed off).
+
+    A press scheduled at or after the tick the incumbent already died on
+    cannot affect anything before that death -- the run is already over. This
+    checks every candidate ``CandidateSource`` can produce, before AND after
+    ``widen()`` (which regenerates the sweep with a wider span and could, in
+    principle, reintroduce the edge if the cap were not re-applied every
+    regeneration).
+    """
+    rhythm = sr.Rhythm()
+    outcome = _mk_outcome(sr.Plan(()), max_x=500.0, end_tick=400, first_tick=2)
+    src = sr.CandidateSource(sr.Plan(()), outcome, rhythm)
+
+    seen = []
+    for _ in range(400):
+        iv = src.next()
+        if iv is None:
+            break
+        seen.append(iv)
+    assert len(seen) > 50, "fixture drifted: too few candidates to be a real check"
+    offenders = [iv for iv in seen if iv.start_tick >= outcome.end_tick]
+    assert offenders == [], (
+        f"{len(offenders)} candidate(s) scheduled at or after the incumbent's "
+        f"own death tick ({outcome.end_tick}): {offenders[:5]}")
+
+    src.widen()
+    src.widen()
+    more = []
+    for _ in range(400):
+        iv = src.next()
+        if iv is None:
+            break
+        more.append(iv)
+    offenders_after_widen = [iv for iv in more if iv.start_tick >= outcome.end_tick]
+    assert offenders_after_widen == [], (
+        f"widen() reintroduced a no-op candidate: {offenders_after_widen[:5]}")
+
+
+def test_a_node_with_no_room_before_death_yields_nothing_even_when_flush():
+    """Boundary of the guard above: ``earliest_start == death_tick`` (not just
+    ``>``) must also yield nothing -- the only tick left is the one nothing
+    can be scheduled AT.  Regression for the ``>`` -> ``>=`` edit in
+    ``_generate``'s backtrack-not-loop guard.
+    """
+    rhythm = sr.Rhythm()
+    plan = sr.Plan((sr.Interval(10, 40),))     # ends at tick 50
+    outcome = _mk_outcome(plan, max_x=100.0, end_tick=51, first_tick=2)  # earliest_start = 51
+    src = sr.CandidateSource(plan, outcome, rhythm)
+    assert src.next() is None
+
+
+def test_escalate_patience_grows_with_backtrack_depth():
+    """``_escalate_patience`` -- the mechanism behind gradual escalation.
+
+    Must strictly increase with ``_backtrack_depth`` (deeper, more expensive
+    revisions require more accumulated evidence before being tried), and must
+    equal ``wall_patience`` itself at NO depth -- flat patience at every depth
+    is exactly the regression the test above reproduces.
+    """
+    runner = _FakeRunner(lambda plan: dict(max_x=0.0, end_tick=10))
+    search = sr.Sightreader(runner, budget=10, target_x=None, verbose=False,
+                            wall_patience=3)
+    seen = []
+    for depth in range(1, 6):
+        search._backtrack_depth = depth
+        seen.append(search._escalate_patience())
+    assert seen == sorted(seen) and len(set(seen)) == len(seen), (
+        f"_escalate_patience is not strictly increasing with depth: {seen}")
+    assert all(p > search.wall_patience for p in seen), (
+        f"_escalate_patience should exceed the flat wall_patience at every "
+        f"depth >= 1 (that flatness is the bug this change closes): {seen} "
+        f"vs wall_patience={search.wall_patience}")
+
+
+def test_escalate_climbs_blocks_and_widens_exactly_the_claimed_nodes():
+    """``_escalate`` directly, against a hand-built 4-node chain
+    root -> n1 -> n2 -> n3, bypassing any physics.
+
+    Climbing 2 levels from ``best_node=n3`` must reach ``n1``; every node
+    strictly between (``n3`` and ``n2``, inclusive of ``n3``) must end up
+    blocked and exhausted; ``n1`` (the reopened ancestor) must end up
+    unblocked, widened once, and back in the heap; and the bookkeeping
+    (``escalations``, ``_backtrack_depth``, the strike counters) must reflect
+    exactly one escalation.
+    """
+    rhythm = sr.Rhythm()
+    runner = _FakeRunner(lambda plan: dict(max_x=0.0, end_tick=10))
+    search = sr.Sightreader(runner, budget=10, target_x=None, verbose=False)
+
+    def mk(parent, plan, x):
+        outcome = _mk_outcome(plan, max_x=x, end_tick=10)
+        node = sr.Node(plan=plan, outcome=outcome, parent=parent,
+                       depth=(parent.depth + 1 if parent else 0),
+                       source=sr.CandidateSource(plan, outcome, rhythm),
+                       subtree_best_x=x)
+        if parent is not None:
+            parent.children.append(node)
+        return node
+
+    root = mk(None, sr.Plan(()), 0.0)
+    n1 = mk(root, sr.Plan((sr.Interval(4, 10),)), 100.0)
+    n2 = mk(n1, sr.Plan((sr.Interval(4, 10), sr.Interval(20, 10))), 100.0)
+    n3 = mk(n2, sr.Plan((sr.Interval(4, 10), sr.Interval(20, 10), sr.Interval(40, 10))),
+            100.0)
+
+    search.root = root
+    search.best_node = n3
+    search.best = n3.outcome
+    search._backtrack_depth = 2
+    search._wall_strikes = 5
+    search._airborne_strikes = 0
+    widen_calls_before = n1.source.widen_level
+
+    search._escalate()
+
+    assert n3.blocked and n3.exhausted
+    assert n2.blocked and n2.exhausted
+    assert not n1.blocked and not n1.exhausted, (
+        "the reopened ancestor must not itself be left blocked")
+    assert root.blocked is False and root.exhausted is False, (
+        "escalate must not touch anything above the reopened ancestor"
+    )
+    assert n1.source.widen_level == widen_calls_before + 1
+    assert search.escalations == 1
+    assert search._backtrack_depth == 3, "depth must grow by exactly one per call"
+    assert search._wall_strikes == 0 and search._airborne_strikes == 0
+    assert any(node is n1 for _, _, node in search._heap), (
+        "the reopened ancestor must be back in the heap")
+
+
+def test_escalate_caps_at_the_root_rather_than_erroring():
+    """Requesting a backtrack deeper than the tree is tall must land on the
+    root, not crash or silently do nothing -- "unbounded depth as a
+    capability" (orchestrator) still has to terminate somewhere real.
+    """
+    rhythm = sr.Rhythm()
+    runner = _FakeRunner(lambda plan: dict(max_x=0.0, end_tick=10))
+    search = sr.Sightreader(runner, budget=10, target_x=None, verbose=False)
+    root_outcome = _mk_outcome(sr.Plan(()), max_x=0.0, end_tick=10)
+    root = sr.Node(plan=sr.Plan(()), outcome=root_outcome, parent=None, depth=0,
+                   source=sr.CandidateSource(sr.Plan(()), root_outcome, rhythm),
+                   subtree_best_x=0.0)
+    child_plan = sr.Plan((sr.Interval(4, 10),))
+    child_outcome = _mk_outcome(child_plan, max_x=50.0, end_tick=10)
+    child = sr.Node(plan=child_plan, outcome=child_outcome, parent=root, depth=1,
+                    source=sr.CandidateSource(child_plan, child_outcome, rhythm),
+                    subtree_best_x=50.0)
+    root.children.append(child)
+
+    search.root = root
+    search.best_node = child
+    search.best = child.outcome
+    search._backtrack_depth = 500        # absurdly deep, tree is only 2 nodes
+    search._escalate()
+
+    assert child.blocked and child.exhausted
+    assert root.blocked is False and root.exhausted is False
+    assert any(node is root for _, _, node in search._heap)
+
+
+def test_wall_tolerance_is_derived_from_the_measured_hop_not_a_constant():
+    """``_wall_tolerance`` scales with measured unit and units-per-tick; it
+    is not a fixed number and must move when either measurement does."""
+    runner = _FakeRunner(lambda plan: dict(max_x=0.0, end_tick=10))
+    search = sr.Sightreader(runner, budget=5, target_x=None, verbose=False)
+    search.rhythm.units_per_tick = 2.0
+    search.rhythm.airtime_ticks = 100
+    tol_a = search._wall_tolerance()
+    assert tol_a == pytest.approx(0.05 * 100 * 2.0)
+
+    search.rhythm.airtime_ticks = 40
+    tol_b = search._wall_tolerance()
+    assert tol_b == pytest.approx(0.05 * 40 * 2.0)
+    assert tol_b != tol_a, "tolerance must move when the measured hop does"
+
+
+def test_at_wall_is_silent_until_three_deaths_cluster_then_fires_on_a_match():
+    """``_at_wall`` -- silent (False) before Memory has >= 3 clustered deaths
+    at the current best x, then True only for a death within tolerance of
+    that x, never for a death somewhere else entirely."""
+    runner = _FakeRunner(lambda plan: dict(max_x=0.0, end_tick=10))
+    search = sr.Sightreader(runner, budget=5, target_x=None, verbose=False)
+    search.rhythm.units_per_tick = 1.3
+    search.rhythm.airtime_ticks = 48
+
+    wall_x = 500.0
+    def death(x, tick, i):
+        return _mk_outcome(sr.Plan((sr.Interval(4, 10),)), max_x=x, end_tick=tick,
+                           attempt_index=i)
+
+    # Two deaths at the wall: not yet a confirmed wall.
+    search.memory.remember(death(wall_x, 400, 1))
+    search.memory.remember(death(wall_x, 400, 2))
+    assert search._at_wall(death(wall_x, 400, 3)) is False
+
+    # Third death completes the cluster.
+    search.memory.remember(death(wall_x, 400, 3))
+    assert search._at_wall(death(wall_x, 400, 4)) is True
+
+    # A death at a genuinely different x is not "the wall", even now.
+    assert search._at_wall(death(wall_x - 50.0, 350, 5)) is False
+
+
+def test_press_was_airborne_true_false_and_unknown():
+    """``_press_was_airborne`` -- the three-valued signal, all three checked:
+    grounded (False), airborne (True), and outside the watched tail (None,
+    which must never be conflated with "grounded" -- that is exactly the
+    "measurement changed, not the simulation" mistake this repo has a rule
+    about)."""
+    runner = _FakeRunner(lambda plan: dict(max_x=0.0, end_tick=10))
+    search = sr.Sightreader(runner, budget=5, target_x=None, verbose=False)
+    iv = sr.Interval(200, 10)
+
+    grounded_out = _mk_outcome(sr.Plan(()), max_x=0.0, end_tick=10,
+                               sights=(_mk_sight(200, is_on_ground=True),))
+    assert search._press_was_airborne(grounded_out, iv) is False
+
+    airborne_out = _mk_outcome(sr.Plan(()), max_x=0.0, end_tick=10,
+                               sights=(_mk_sight(200, is_on_ground=False),))
+    assert search._press_was_airborne(airborne_out, iv) is True
+
+    unwatched_out = _mk_outcome(sr.Plan(()), max_x=0.0, end_tick=10,
+                                sights=(_mk_sight(150, is_on_ground=True),
+                                        _mk_sight(199, is_on_ground=False)))
+    assert search._press_was_airborne(unwatched_out, iv) is None
+
+
+def test_candidate_source_widen_broadens_span_and_holds_without_forgetting():
+    """``CandidateSource.widen`` -- span doubles, the hold menu gains a
+    coarser AND a finer multiplier every call, ``widen_level`` counts calls,
+    and already-tried candidates stay filtered (``next()`` never repeats
+    one) even though ``_generate()`` restarts from candidate 0 internally."""
+    rhythm = sr.Rhythm()
+    outcome = _mk_outcome(sr.Plan(()), max_x=0.0, end_tick=400, first_tick=2)
+    src = sr.CandidateSource(sr.Plan(()), outcome, rhythm)
+
+    span0 = src.max_span_horizons
+    mults0 = list(src._hold_mults)
+    already = {src.next() for _ in range(5)}
+
+    src.widen()
+    assert src.widen_level == 1
+    assert src.max_span_horizons == pytest.approx(span0 * 2.0)
+    assert max(src._hold_mults) > max(mults0)
+    assert min(src._hold_mults) < min(mults0)
+
+    seen_after = []
+    for _ in range(30):
+        iv = src.next()
+        if iv is None:
+            break
+        seen_after.append(iv)
+    assert already.isdisjoint(seen_after), (
+        "widen()'s regenerated sweep re-yielded an already-tried candidate")
+
+    src.widen()
+    assert src.widen_level == 2
+
+
+# ---------------------------------------------------------------------------
+# Ship candidate generation (TODO Q5)
+#
+# TIER (i), REGRESSION ONLY -- and more so than the rest of this file. There is
+# no ship puppet: `sightread_toy.py` simulates only a cube's ground-contact hop,
+# so nothing here plays a ship or measures whether ShipCandidateSource's guesses
+# actually clear anything. These tests check three narrow, code-level claims:
+# the vehicle switch reads real wire bytes correctly, the ship generator
+# produces well-formed Intervals without touching the cube-only hop constant,
+# and CandidateSource itself was not touched by any of it. Whether the ship
+# generator's PRIOR (thrust scaled by sensor horizon rather than hop period) is
+# any good is unmeasured and stays unmeasured until this runs against a live
+# ship section.
+# ---------------------------------------------------------------------------
+
+def _wire_sight(game, chan, *, tick: int, player_x: float,
+                vehicle_flags: int = 0) -> sr.Sight:
+    """Publish one frame with a chosen ``vehicleFlags`` word and decode it.
+
+    Goes through the real wire path (``SyntheticGame`` -> ``Channel`` ->
+    ``Sight.decode``), the same route the ``one_frame`` fixture uses, rather
+    than fabricating a ``Sight`` in memory -- this exercises the actual
+    ``PlayerSense.vehicle_flags`` plumbing the driver depends on, not a
+    hand-built stand-in for it. ``game.publish`` always writes
+    ``vehicleFlags=0`` (env.py), so the field is poked afterward, the same
+    pattern ``test_env.py`` uses for fields ``publish`` has no parameter for.
+    """
+    game.publish(tick=tick, player_x=player_x)
+    game.obs["players"][0]["vehicleFlags"] = int(vehicle_flags)
+    return sr.Sight.decode(chan.poll(timeout=1.0))
+
+
+def _outcome(*, sights: tuple = (), end_tick: int = 500, first_tick: int = 2,
+             max_x: float = 100.0) -> sr.Outcome:
+    """A bare :class:`sr.Outcome` for exercising candidate sources directly,
+    without spending a real attempt through :class:`sr.Runner`."""
+    return sr.Outcome(
+        attempt_index=1, game_attempt=1, plan=sr.Plan(()),
+        max_x=max_x, max_x_tick=end_tick, max_x_stride=1,
+        end_tick=end_tick, first_tick=first_tick, sights=tuple(sights),
+        reached_end_of_level=False, unrunnable=None, wall_seconds=0.01,
+    )
+
+
+def test_the_vehicle_switch_reads_the_last_observed_sight():
+    """Selection follows the LAST sight in the tail, decoded off real wire bytes."""
+    buf = make_loopback_buffer()
+    game = SyntheticGame(buf)
+    chan = Channel(buf)
+    chan.attach()
+    try:
+        cube_sight = _wire_sight(game, chan, tick=10, player_x=100.0,
+                                 vehicle_flags=0)
+        ship_sight = _wire_sight(game, chan, tick=11, player_x=101.3,
+                                 vehicle_flags=int(sg.GdrlVehicleFlag.SHIP))
+    finally:
+        chan.detach()
+        buf.close()
+
+    rhythm = sr.Rhythm()
+    cube_src = sr.select_candidate_source(
+        sr.Plan(()), _outcome(sights=(cube_sight,)), rhythm)
+    ship_src = sr.select_candidate_source(
+        sr.Plan(()), _outcome(sights=(ship_sight,)), rhythm)
+    # A tail ending cube-then-ship must follow the LAST sight, not the first.
+    mixed_src = sr.select_candidate_source(
+        sr.Plan(()), _outcome(sights=(cube_sight, ship_sight)), rhythm)
+    reverted_src = sr.select_candidate_source(
+        sr.Plan(()), _outcome(sights=(ship_sight, cube_sight)), rhythm)
+
+    assert type(cube_src) is sr.CandidateSource
+    assert type(ship_src) is sr.ShipCandidateSource
+    assert type(mixed_src) is sr.ShipCandidateSource
+    assert type(reverted_src) is sr.CandidateSource
+
+
+def test_the_vehicle_switch_defaults_to_cube_with_no_sights():
+    """An outcome with no stride-1 tail (e.g. unrunnable) cannot know the
+    vehicle; it must fall back to the pre-existing cube behaviour, not guess."""
+    rhythm = sr.Rhythm()
+    src = sr.select_candidate_source(sr.Plan(()), _outcome(sights=()), rhythm)
+    assert type(src) is sr.CandidateSource
+
+
+def test_other_vehicles_also_default_to_cube():
+    """Only SHIP switches generators. Ball/UFO/wave/robot/spider/swing are
+    unaddressed by this task (TODO Q5 asks for ship only) and must keep
+    getting the cube generator rather than a guessed one."""
+    buf = make_loopback_buffer()
+    game = SyntheticGame(buf)
+    chan = Channel(buf)
+    chan.attach()
+    try:
+        ball_sight = _wire_sight(game, chan, tick=10, player_x=100.0,
+                                 vehicle_flags=int(sg.GdrlVehicleFlag.BALL))
+    finally:
+        chan.detach()
+        buf.close()
+    rhythm = sr.Rhythm()
+    src = sr.select_candidate_source(
+        sr.Plan(()), _outcome(sights=(ball_sight,)), rhythm)
+    assert type(src) is sr.CandidateSource
+
+
+def test_ship_generator_proposes_sane_candidates_without_a_hop_constant():
+    """The ship generator must produce legal, in-range Intervals even when
+    ``rhythm.airtime_ticks`` has never been measured -- the realistic ship
+    case, since a ship in flight does not cycle ground->air->ground."""
+    rhythm = sr.Rhythm()
+    rhythm.units_per_tick = 1.298250437
+    rhythm.horizon_ticks = 154
+    assert rhythm.airtime_ticks is None    # never observed a ground contact
+
+    outcome = _outcome(end_tick=500, first_tick=2)
+    src = sr.ShipCandidateSource(sr.Plan(()), outcome, rhythm)
+
+    seen = []
+    for _ in range(20):
+        iv = src.next()
+        if iv is None:
+            break
+        seen.append(iv)
+    assert len(seen) >= 10
+    for iv in seen:
+        assert iv.start_tick >= 4          # first_tick + 2
+        assert iv.hold_ticks >= 1
+        assert iv.start_tick <= outcome.end_tick + rhythm.horizon
+    # No duplicate proposals from one generator.
+    assert len(set(seen)) == len(seen)
+    # The sweep's hold-length menu (everything past candidate 0, the
+    # sustained-thrust probe) is scaled by the sensor horizon (154), not by
+    # the cube fallback hop (FALLBACK_AIRTIME_TICKS = 60): the longest swept
+    # hold is the full horizon, not a multiple of 60.
+    assert max(iv.hold_ticks for iv in seen[1:]) == 154
+    assert 60 not in (iv.hold_ticks for iv in seen), (
+        "a hold of exactly the cube fallback hop length appeared -- suspicious "
+        "reuse of FALLBACK_AIRTIME_TICKS")
+
+
+def test_ship_generator_first_candidate_is_sustained_thrust():
+    """Candidate 0 is the cheapest probe of "hold is continuous thrust": press
+    from the earliest legal tick, held past the death tick -- the ship
+    analogue of CandidateSource's own candidate 0."""
+    rhythm = sr.Rhythm()
+    rhythm.horizon_ticks = 100
+    outcome = _outcome(end_tick=500, first_tick=2)
+    src = sr.ShipCandidateSource(sr.Plan(()), outcome, rhythm)
+    first = src.next()
+    assert first.start_tick == 4                      # earliest_start()
+    assert first.end_tick > outcome.end_tick           # spans past the death
+
+
+def test_ship_generator_respects_a_committed_prefix():
+    """Candidates must start after the plan's last committed interval ends,
+    exactly like CandidateSource -- the ship generator reuses that rule."""
+    rhythm = sr.Rhythm()
+    rhythm.horizon_ticks = 100
+    plan = sr.Plan((sr.Interval(10, 50),))   # ends at tick 60
+    outcome = _outcome(end_tick=500, first_tick=2)
+    src = sr.ShipCandidateSource(plan, outcome, rhythm)
+    for _ in range(15):
+        iv = src.next()
+        if iv is None:
+            break
+        assert iv.start_tick >= 61
+
+
+def test_ship_generator_widen_broadens_the_sweep():
+    rhythm = sr.Rhythm()
+    rhythm.horizon_ticks = 100
+    outcome = _outcome(end_tick=500, first_tick=2)
+    src = sr.ShipCandidateSource(sr.Plan(()), outcome, rhythm)
+    before_span = src.max_span_horizons
+    before_fracs = list(src._hold_fracs)
+    src.widen()
+    assert src.max_span_horizons == pytest.approx(before_span * 2.0)
+    assert max(src._hold_fracs) > max(before_fracs)
+    assert min(src._hold_fracs) < min(before_fracs)
+    assert src.widen_level == 1
+
+
+def test_ship_generator_yields_nothing_once_the_plan_leaves_no_room():
+    """Same backtrack-not-loop guard as CandidateSource: a committed interval
+    that runs past the death tick means this node is exhausted."""
+    rhythm = sr.Rhythm()
+    rhythm.horizon_ticks = 100
+    plan = sr.Plan((sr.Interval(10, 600),))   # ends at 610, past death_tick
+    outcome = _outcome(end_tick=500, first_tick=2)
+    src = sr.ShipCandidateSource(plan, outcome, rhythm)
+    assert src.next() is None
+
+
+def test_cube_generator_is_unchanged_by_the_ship_addition():
+    """Pins CandidateSource's output for a fixed input. If this ever moves, the
+    ship addition (or anything else) touched the cube path, which the task
+    that added ship candidate generation was explicitly told not to do.
+
+    The pinned values were captured from this exact CandidateSource before any
+    ship-related code called it, using the same (plan, outcome, rhythm) shape
+    as the ship tests above so the two are a direct side-by-side contrast: cube
+    holds come out {384,192,96,48,24,6} (rhythm.unit=48 x the hop multipliers),
+    ship holds come out {154,77,38,19,9,4} (rhythm.horizon=154 x fractions) --
+    provably different constants from provably different code paths.
+    """
+    rhythm = sr.Rhythm()
+    rhythm.units_per_tick = 1.298250437
+    rhythm.airtime_ticks = 48
+    rhythm.horizon_ticks = 154
+    outcome = _outcome(end_tick=500, first_tick=2)
+
+    src = sr.CandidateSource(sr.Plan(()), outcome, rhythm)
+    first5 = [(iv.start_tick, iv.hold_ticks) for iv in
+              (src.next() for _ in range(5))]
+    assert first5 == [(4, 688), (476, 384), (476, 192), (476, 96), (476, 48)]
+    assert src._holds() == [384, 192, 96, 48, 24, 6]
+
+    # select_candidate_source must return exactly a CandidateSource, not some
+    # wrapper or subclass, when the vehicle is (or defaults to) cube.
+    picked = sr.select_candidate_source(sr.Plan(()), outcome, rhythm)
+    assert type(picked) is sr.CandidateSource
+    picked_first = picked.next()
+    assert (picked_first.start_tick, picked_first.hold_ticks) == (4, 688)
 
 
 # ---------------------------------------------------------------------------

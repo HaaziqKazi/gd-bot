@@ -19,6 +19,16 @@ backups/
 
 # Build output. mod/build alone is ~790MB (CPM deps, codegen, object files).
 mod/build/
+# ...and as a bare name too: mod/build is a SYMLINK on this machine, pointing
+# out of the repo to /Users/rexouyang/gdrl-build. ~/Desktop is iCloud-synced,
+# and a build tree living there gets its files evicted to the cloud, after
+# which every read blocks on the file provider -- 933 files totalling 1.2MB
+# measured at 119s to read, at 0% CPU. That is what made `geode build` appear
+# to hang at `-- Running Codegen` for 25 minutes. A trailing-slash pattern
+# matches directories only, so without this bare entry the symlink shows up as
+# untracked and can be committed, baking one machine's absolute path into the
+# repo.
+mod/build
 build/
 *.geode
 *.dylib
