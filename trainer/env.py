@@ -390,6 +390,69 @@ class Observation:
     def has_flag(self, flag: GdrlHeaderFlag) -> bool:
         return bool(self.flags & int(flag))
 
+    # -- GDRL_PRACTICE (wire version 2) ------------------------------------
+    #
+    # Four thin accessors over header fields that already existed on the wire
+    # (see gdrl_schema.hpp's GdrlObsHeader) but had no Python-side name yet.
+    # Deliberately not collapsed into one "in practice mode" bool: resumeTick
+    # is LATCHED per attempt, checkpointTick/hasCheckpoint are LIVE (can change
+    # mid-attempt via an on-demand CHECKPOINT_SAVE/CLEAR), and practiceMode is a
+    # whole-RUN switch that can be 1 on an attempt whose own resumeTick is still
+    # 0 (practice mode on, but this is the first attempt, before any checkpoint
+    # existed). Collapsing those into one flag would erase exactly the
+    # distinction the wire format was built to keep visible.
+    @property
+    def resume_tick(self) -> int:
+        """The tick THIS attempt began at. 0 for a full (tick-0) attempt."""
+        return int(self.header["resumeTick"])
+
+    @property
+    def checkpoint_tick(self) -> int:
+        """Tick of the checkpoint currently held, or -1 if none. Live, not latched."""
+        return int(self.header["checkpointTick"])
+
+    @property
+    def has_checkpoint(self) -> bool:
+        """A checkpoint exists right now and CHECKPOINT_RESTORE would do something."""
+        return bool(self.header["hasCheckpoint"])
+
+    @property
+    def practice_mode(self) -> bool:
+        """GDRL_PRACTICE=1 for this whole run, not just this attempt."""
+        return bool(self.header["practiceMode"])
+
+    @property
+    def is_practice_attempt(self) -> bool:
+        """Did THIS attempt begin from a checkpoint restore, not tick 0?
+
+        Derived from resumeTick, deliberately NOT from practice_mode -- see the
+        block comment above. This is the per-attempt question; practice_mode is
+        the per-run one. A caller building an A-attempts count must gate on
+        THIS, not on practice_mode, or a practice run's very first (tick-0)
+        attempt gets misfiled as not-A-eligible when it is, in fact, a real
+        tick-0 attempt.
+        """
+        return self.resume_tick != 0
+
+    @property
+    def full_attempts(self) -> int:
+        """GdrlValidity.fullAttempts: lifetime count of tick-0 attempts. Benchmark A's number."""
+        return int(self.validity["fullAttempts"])
+
+    @property
+    def practice_attempts(self) -> int:
+        """GdrlValidity.practiceAttempts: lifetime count of checkpoint-resumed attempts.
+
+        Kept on a SEPARATE wire field from full_attempts on purpose (see
+        gdrl_schema.hpp) so a decoder cannot average an A number and a
+        practice-assisted one into one figure just by reading "attempts".
+        There is deliberately no `.total_attempts` here: a caller that wants a
+        sum must write `full_attempts + practice_attempts` at its own call
+        site, in its own source, where the fact that it is mixing benchmark
+        variants is visible to whoever reads that line.
+        """
+        return int(self.validity["practiceAttempts"])
+
     # -- validity ---------------------------------------------------------
     def problems(self) -> list[str]:
         """Every reason this frame is not evidence, from the frame's own bytes.
@@ -1118,6 +1181,11 @@ class SyntheticGame:
                                  buffer=buf, offset=OFFSET_ACTION)
         self.seq = 0
         self.scheduled: list[tuple[int, bool, int, int]] = []   # (tick, push, button, player)
+        # GDRL_PRACTICE: every CHECKPOINT_SAVE/RESTORE/CLEAR seen by consume(),
+        # in order. Deliberately just a log, not a state machine -- see
+        # consume()'s own comment for why this fixture does not decide
+        # accept/refuse for these three kinds the way the mod does.
+        self.checkpoint_requests: list[GdrlActionKind] = []
         # How many coverage entries the LAST publish() actually marked SCANNED.
         # It is not always the ``coverage_cols`` that was asked for: the mod's
         # window can bind first (see publish()), and a test that assumed
@@ -1163,7 +1231,13 @@ class SyntheticGame:
                 win_ahead: float = FIXTURE_WIN_AHEAD,
                 win_vert: float = FIXTURE_WIN_VERT,
                 win_up: float | None = None,
-                win_down: float | None = None) -> int:
+                win_down: float | None = None,
+                resume_tick: int = 0,
+                checkpoint_tick: int = -1,
+                has_checkpoint: bool = False,
+                practice_mode: bool = False,
+                full_attempts: int = 0,
+                practice_attempts: int = 0) -> int:
         """Write one observation and advance the sequence, seqlock and all.
 
         ``coverage_cols`` is the fixture's stand-in for ``GDRL_COVERAGE_COLS``
@@ -1219,6 +1293,20 @@ class SyntheticGame:
         ``OBJECTS_UNAVAILABLE``, and an unusable factor as the only defect. That
         header is a test instrument. It is NOT asserted to be a state the game
         produces.
+
+        ``resume_tick`` / ``checkpoint_tick`` / ``has_checkpoint`` /
+        ``practice_mode`` / ``full_attempts`` / ``practice_attempts`` are the
+        GDRL_PRACTICE wire fields (wire version 2), written straight through with
+        no derivation and no bookkeeping -- exactly like ``status`` above. The
+        caller decides the sequence (e.g. "this call is a checkpoint-resumed
+        attempt") and passes the numbers that sequence implies; this method does
+        not infer resume_tick from has_checkpoint or increment either attempt
+        counter itself. That is deliberate: a fixture that decided this FOR the
+        test would be re-deriving the same accounting the mod does and then
+        checking its own derivation, which proves nothing about the mod. Defaults
+        (0, -1, False, False, 0, 0) match the mod's own "nothing happened yet"
+        state (gdrl_schema.hpp: checkpointTick is -1 when none exists), so a test
+        that never mentions these params gets a full, non-practice attempt.
         """
         self.seq += 1                       # odd: write in progress
         self.obs["seq"] = self.seq
@@ -1247,6 +1335,10 @@ class SyntheticGame:
         h["isDualMode"] = 0
         h["isPaused"] = 0
         h["inResetDelay"] = 0
+        h["resumeTick"] = resume_tick
+        h["checkpointTick"] = checkpoint_tick
+        h["hasCheckpoint"] = 1 if has_checkpoint else 0
+        h["practiceMode"] = 1 if practice_mode else 0
         h["commandCount"] = 0
         h["pendingCount"] = 0
         h["speedSegCount"] = 0
@@ -1387,6 +1479,8 @@ class SyntheticGame:
         v["levelPinned"] = 1
         v["blockInput"] = 1
         v["objectsTruncated"] = 0
+        v["fullAttempts"] = full_attempts
+        v["practiceAttempts"] = practice_attempts
 
         slots = self.obs["objects"]
         slots["known"] = 0
@@ -1450,6 +1544,20 @@ class SyntheticGame:
                 hold = max(1, int(act["holdTicks"]))
                 self.scheduled.append((tick, True, btn, player))
                 self.scheduled.append((tick + hold, False, btn, player))
+            elif kind in (GdrlActionKind.CHECKPOINT_SAVE,
+                          GdrlActionKind.CHECKPOINT_RESTORE,
+                          GdrlActionKind.CHECKPOINT_CLEAR):
+                # GDRL_PRACTICE. Deliberately NOT modelled beyond "a request of
+                # this kind arrived": the mod's actual accept/refuse decision
+                # (GDRL_PRACTICE off, no checkpoint held, getLastCheckpoint()
+                # returning null) is exactly the logic TODO.md 2.1 says is
+                # UNVERIFIED without the game, and this fixture has no game to
+                # check it against. Encoding a guess here and then testing
+                # against that guess would be self-consistency, not evidence
+                # (see this repo's own rule on that). This log is enough to
+                # prove the three new action kinds survive the wire intact;
+                # see checkpoint_requests.
+                self.checkpoint_requests.append(kind)
         self.control["actSeq"] = self.seq
         self.control["stepsServed"] = int(self.control["stepsServed"]) + 1
         return max(1, int(a["advanceSteps"]))
