@@ -76,6 +76,44 @@ Status as of commit `478cd16` + the 2026-08-13 (L), 2026-08-14 (M/N),
 >    interaction is unknown. Still a **declared Benchmark B variant** — A
 >    attempts and practice-assisted attempts must never be confusable.
 >
+> **PRACTICE MODE WAS RUN, AND RESTORE IS DETERMINISTIC — but read the
+> verdict carefully, because the harness printed `FAIL` and the harness is
+> wrong about the criterion.** First live run of
+> `./scripts/practice_determinism.sh`, 2026-08-19, provenance OK on both the
+> `autoplay ->` and `STAMP telemetry GDRL_PRACTICE=1` greps.
+>
+> TODO 2.1's criterion is *"restore the same checkpoint N times with the same
+> subsequent inputs and require bit-identical outcomes."* Tested directly from
+> the per-step log: the four death-triggered restores from `checkpointTick=261`
+> (game attempts 3, 4, 5, 6) are **bit-identical to each other across all 372
+> common steps** — x, y, y-velocity, rotation and ground flag all equal. By the
+> criterion as written, **restore passes**. The idea does not die here.
+>
+> The harness reported `FAIL` for two separate reasons, neither of which is the
+> criterion:
+> 1. **It compares each restored leg against the un-restored original**, not
+>    against the other restores. That is a different and stricter property.
+> 2. Its accounting assertion hardcodes `full_attempts == 1`; the run observed
+>    `2`. `practice_attempts` was exactly right (5 = restores + 1). The second
+>    full attempt is real — the level loads once, then the leg that saves the
+>    checkpoint is itself a full attempt — so the **expectation** is what is
+>    wrong, and it is not a constant: it depends on when the driver attaches.
+>
+> **THE REAL FINDING, and it is a caveat not a blocker: a restored run sits
+> exactly one tick of forward motion behind the original.** Every leg diverged
+> from the un-restored baseline at the same tick (262) by the same amount,
+> `dx = 1.298248291015625` — one tick at the documented 1.298250437 units/tick.
+> Perfectly reproducible, so it is a systematic offset, not noise. It matters
+> because a plan replayed after a restore is spatially one tick off, which can
+> flip a tight jump. Nothing has measured whether it does.
+>
+> **Phase B (on-demand mid-attempt restore) reproduces positions exactly but
+> mislabels ticks.** Its x-sequence is identical to a death-triggered leg's,
+> while its tick counter repeats a value and then lags by one. Combined with
+> the already-known gap that on-demand restore **does not call
+> `clearSchedule()`**, on-demand restore is not safe for a driver with queued
+> actions. Death-triggered restore is the path with evidence behind it.
+
 > **Preserved evidence** (`backups/2026-08-18/`, gitignored but durable):
 > `sightread_live_20260818-235533.jsonl` is the 255-attempt run above and is
 > **the new baseline to beat**; `control_head_20260818-232618.jsonl` is the
