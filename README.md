@@ -117,6 +117,52 @@ the bundle isolates them:
 - `~/Library/Application Support/GeometryDash/geode/mods/<id>/` — per-mod saved
   data and settings (redirected by the `HOME` override)
 
+## Build gotcha: the repo lives in iCloud, and that stalls builds for hours
+
+`~/Desktop` is iCloud-managed on this machine — `~/Library/Mobile
+Documents/com~apple~CloudDocs/Desktop` is a symlink to it — so **every file in
+this repo is subject to iCloud eviction**. An evicted file keeps its metadata
+locally and must be fetched on read, and the fetch is priced per file, not per
+byte.
+
+Measured 2026-08-18 against `mod/build/_deps/bindings-src/bindings/2.2081/inline`:
+
+| operation over the same 933 files (1.2 MB total) | wall time | CPU |
+|---|---|---|
+| `find -type f` (metadata only) | 0.017s | — |
+| `cat` (actual bytes) | **119s** | **0%** |
+
+That directory is exactly what Codegen reads. The 2026-08-17 session lost most
+of a day to this: `cmake -B build` hung 23 minutes and `geode build` hung ~25
+minutes at `-- Running Codegen`, both with zero file activity, and both were
+written up as a toolchain problem. They were not. The Codegen binary is fine —
+run it directly and it prints its usage and exits in milliseconds. `brctl
+status` names the stalled path under "Client Truth Unclean Items".
+
+**The fix, and the invariant to preserve:** `mod/build` is a symlink to
+`/Users/rexouyang/gdrl-build`, outside the synced tree. A symlink rather than a
+relocation because every absolute path already baked into `CMakeCache.txt`
+stays valid. With it in place the same build completes in **5m18s**, clean.
+
+Two consequences worth keeping in mind:
+
+* **Deleting evicted files is fast; moving them is not.** `rm -rf` on the
+  700 MB / 11,137-file build tree took 2 seconds, because unlink needs no
+  content. Moving it out would have had to materialise all of it first, which
+  at the measured per-file rate is hours. If you ever need to relocate a build
+  tree here, delete and rebuild instead.
+* **`.gitignore` needs `mod/build` without a trailing slash.** `mod/build/`
+  matches directories only, so once it became a symlink it showed up as
+  untracked and was one `git add -A` away from committing one machine's
+  absolute path into the repo.
+
+The diagnostic that distinguishes this from a genuine hang: a stalled process
+sits at **0% CPU with no file activity**. A real compile does not. Time a `cat`
+against a `find` over the same files before blaming any tool.
+
+Still exposed: `sandbox/Geometry Dash.app` is inside the synced tree too. It has
+not caused a problem yet, but it is the same class of risk.
+
 ## Launch gotcha: working directory
 
 `exec`ing the binary from a shell makes GD exit a few hundred ms after start.
@@ -1236,7 +1282,55 @@ dt = 1 / 8 / 32 / 64. **17x, no divergence.** dt=64 is the operating point.
 ~34 s of wall clock against a default 20 s per-observation timeout, which is the
 only reason two dt=1 attempts failed. At dt=64 the same stride is ~0.5 s.
 
-## The search's binding failure: it does not back out of a wall
+## The search backs out of walls now — and the cause was not what it looked like
+
+**Superseded the section below.** Fixed and validated live 2026-08-19, at
+matched attempt counts (254 vs 255), same level, same 493 sensor stratum,
+same dt=64, and a rebuilt binary proven not to change physics (attempts #1-#7
+bit-identical to the old one):
+
+| | baseline | fixed |
+|---|---|---|
+| best `max_x` | 3071.545 | **3314.335** |
+| deaths at the single worst spot | 237/254 = **93%** | 28/255 = **11%** |
+| distinct outcomes | 16 | 43 |
+| deepest backtrack before death | 87 ticks | 1947 ticks |
+| probes starting at/after the death tick | 49 | **0** |
+
+It cleared two successive walls in the one run — 3071 -> 3091 at attempt 44,
+then -> 3314 at attempt 178. The second one is the load-bearing observation:
+clearing one obstacle can fall out of a merely wider search, but clearing the
+next one after it is evidence the escalate-and-back-out loop keeps working as
+the plan grows.
+
+**Three diagnoses were wrong on the way here, which is worth recording.**
+
+1. *"The search holds in the same place."* It does not. All 238 post-best
+   plans in the baseline ledger are **distinct**, across 101 distinct final
+   intervals. It was working hard inside an 87-tick window that could not
+   contain the fix.
+2. *"The wall code committed in `9547e2a` is inert."* Also wrong. Run live it
+   escalates aggressively — the flaw was the opposite of inertness. With
+   `wall_patience` held flat at every depth, three failures retired a freshly
+   widened ancestor that could still hold hundreds of untried candidates,
+   blocked it permanently, and climbed on; median divergence tick fell from
+   2292 to 340 and the minimum to 3. It went from never backing up far enough
+   to backing up to the plan root almost immediately, and lost either way.
+   `_escalate_patience() = wall_patience * 2 ** backtrack_depth` exhausts cheap
+   shallow revisions before offering expensive deep ones, leaving the root
+   reachable at bounded geometric cost.
+3. *"The no-op probe guard already existed."* It did not. A live run showed
+   0/108 probes starting at or after the death tick and that was inferred to be
+   structural; reading the code showed `_start_passes` capped `hi` at
+   `death_tick`, not `death_tick - 1`, so the run was simply lucky. It is a
+   guarantee now, in the ship generator too.
+
+The growth rate `2 ** depth` is a judgment call supported by **one** live run.
+It is not a measured constant.
+
+---
+
+## The search's binding failure: it does not back out of a wall (HISTORICAL)
 
 From the acceptance run's ledger:
 

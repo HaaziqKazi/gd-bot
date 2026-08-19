@@ -6,95 +6,85 @@ been **established**; this file records what has **not**.
 Status as of commit `478cd16` + the 2026-08-13 (L), 2026-08-14 (M/N),
 2026-08-15 (O/P), 2026-08-16 and **2026-08-17 (second, R)** sessions below.
 
-> ## RESUME HERE — 2026-08-17 wrap. Read this box before anything else.
+> ## RESUME HERE — 2026-08-19 wrap. Read this box before anything else.
 >
-> **Rex's goal is unchanged: an agent that plays Stereo Madness all the way
-> through.** This session ran the game a lot. Read "Session 2026-08-17 (second)"
-> below in full.
+> **THE WALL IS BROKEN, AND THE SEARCH NOW BACKS OUT OF WALLS.** The failure
+> this file has led with since 2026-08-17 is fixed and validated live. At
+> matched attempt counts:
 >
-> **THE HEADLINE: the driver played the game, autonomously, for the first time.**
-> `trainer/sightread.py` reached `x=2431.463867188` in 12 attempts and
-> `x=3071.545410156` in 254, with zero hardcoded tick numbers and a clean
-> attempt-count audit. The acceptance criterion (reach the human record
-> `3959.183837891`) is **NOT met** — 3071.5 is 77.6% of it.
+> | | baseline 2026-08-17 | fixed 2026-08-19 |
+> |---|---|---|
+> | attempts | 254 | 255 |
+> | best `max_x` | 3071.545 | **3314.335** |
+> | deaths at single worst spot | 237/254 = **93%** | 28/255 = **11%** |
+> | distinct outcomes | 16 | 43 |
+> | deepest backtrack | 87 ticks | 1947 ticks |
+> | no-op probes (start >= death tick) | 49 | **0** |
 >
-> **THE ONE THING THAT MATTERS NEXT: the search does not back out of a wall.**
-> **237 of 254 attempts died at exactly `x=3071.545`, `end_tick=2368`.** Best was
-> reached at attempt **#15**; attempts #16-#254 improved nothing. Rex spotted this
-> live: *"its still holding in the same place even though it has killed itself in
-> the same place many times."*
+> It cleared **two** successive walls in one run (3071 -> 3091 at attempt 44,
+> -> 3314 at attempt 178). Clearing a second one after the first is the part
+> that matters: it is evidence the escalate-and-back-out loop keeps working as
+> the plan grows, which is the property a full clear needs ~80-120 times over.
 >
-> The cause is diagnosed, not guessed (R9, and see the boundary note there). The
-> obstacle is **one ordinary spike at x=3075** on flat ground. The cube arrives
-> **airborne**, because the plan's last interval `(2170,110)` auto-repeats into a
-> jump landing ~2376 while the spike is at tick ~2365 — so every near-frontier
-> press the search tried was issued off the ground and did nothing. **Only
-> revising an interval ~195 ticks earlier can fix it**, and the candidate
-> generator never goes back that far.
+> **THE ONE THING THAT MATTERS NEXT: no run can currently reach the end.**
+> Both of today's runs died early rather than exhausting their budget:
+> * the control ended at attempt 175 when a stray **ESC** reached the focused
+>   game window (`UI KEY swallowed key=27`, then Geode shut down);
+> * the treatment ended at attempt 255 of a **600** budget with
+>   `FATAL, run stopped early: action waits expired: timeouts=1`.
 >
-> **Throughput is solved. The sensor is adequate. The search is what fails.**
-> Do not spend the next session on measurement.
+> A full clear is estimated at 800-2400 attempts (see line ~2226 of this file).
+> **A single ENV timeout must not be fatal** — the driver should tolerate it and
+> resume — and the game window needs protecting from stray keystrokes. Until
+> that is fixed, budget is not the limit; survival is.
 >
-> **dt=64 is the operating point, and my earlier "N=16 ceiling" claim was wrong.**
-> Physics is bit-identical at every dt tested (null input at N=1..64 all give
-> `maxX=507.615234375, finalTick=391`). For a client that strides to its own
-> action ticks — which `sightread.py` does, `sightread.py:1001` — dt = 1, 8, 32,
-> 64 give **bit-identical results attempt-for-attempt**, 17x faster at dt=64,
-> `fired LATE` 0, `protoErr=0`. The N>=32 degradation is real **only** for the
-> `GDRL_INJECT_SEQ` path, which has no adaptive stride.
+> **THE BUILD WAS NEVER BROKEN — it was iCloud.** The `-- Running Codegen` hang
+> that cost the 2026-08-17 session was not Geode, CMake or Codegen. `~/Desktop`
+> is iCloud-synced and `mod/build`'s files had been evicted; reading the 933
+> files under `bindings/2.2081/inline` (1.2 MB) took **119s at 0% CPU**, against
+> 0.017s for a metadata-only `find`. `mod/build` is now a **symlink** to
+> `/Users/rexouyang/gdrl-build`, outside the synced tree, and the build takes
+> **5m18s** clean. See README "Build gotcha: the repo lives in iCloud".
+> Diagnostic rule: a hang at **0% CPU with no file activity** is I/O, not a
+> compiler. Do not let a build tree be created inside the repo again.
 >
-> **Run it with:** `./scripts/sightread_live.sh --budget N --dt 64`. It puts every
-> switch inline, waits for the shm properly, single-instances, writes every
-> attempt to JSONL as it happens, and does the provenance grep afterwards.
+> **The mod is built and the schema danger is closed.** Binary `cc75f7ef`
+> (was `034fb3ac`). `python3 trainer/schema.py --check` reports `unchanged` for
+> both generated files, so generator, C++ header and Python client all agree on
+> wire version 2 / hash `0x1932358CD5ED7E73`. The rebuild did **not** change
+> physics: attempts #1-#7 are bit-identical to the old binary's.
 >
-> **IN FLIGHT AT WRAP, verify before trusting** — two implementers were still
-> working when the session ended, and their work is committed as-is:
-> 1. **Search wall fix** (`trainer/sightread.py`) — wall detection, escalating
->    backtrack depth, candidate diversity. See its handoff below for what is
->    actually landed vs scaffolded.
-> 2. **Practice mode** (`mod/src/`, `GDRL_PRACTICE`) — requested by Rex. **The mod
->    was NOT successfully rebuilt this session; `mod/build/gdrl.probe.geode` is
->    still the Aug 16 binary `034fb3ac`.** Build it first thing and expect to fix
->    compile errors.
+> **Run it with:** `./scripts/sightread_live.sh --budget N --dt 64`.
 >
-> **DANGER — THE WIRE SCHEMA CHANGED AND THE MOD DID NOT.** This commit contains
-> edits to `mod/src/gdrl_schema.hpp`, `trainer/schema.py` and
-> `trainer/schema_generated.py`, but `mod/build/gdrl.probe.geode` is the **old**
-> `034fb3ac` binary that predates them. The Python suite is green (277) because it
-> grades Python against Python — it cannot see the mismatch. **Do not run
-> `sightread_live.sh` or any ENV client until you have rebuilt the mod**, or the
-> client and the game will disagree about the layout of shared memory. The schema
-> is hash-pinned precisely so this is caught; expect it to be caught.
+> **HONEST DISTANCE.** `levelLength` is **26724**. Best-ever 3314 is **12.4%**
+> of Stereo Madness. The `RECORD_MAX_X = 3959.183837891` in `sightread.py` is a
+> README "12 jumps" milestone, **not** the end of the level — the previous
+> RESUME box's "77.6%" was 77.6% *of that milestone*, which reads as far more
+> progress than it is. This file already had the correct figure at the
+> orientation table and in Q5; the summary at the top contradicted its own body.
+> Do not repeat that.
 >
-> **The last known-good, fully-validated state is the previous commit's binary
-> `034fb3ac` with the previous commit's schema.** Every live number in this
-> session (R1-R9) was measured against that pair.
+> **UNVERIFIED, do not treat as established:**
+> 1. The `2 ** backtrack_depth` patience growth rate is supported by **one**
+>    live run. It is a judgment call, not a measured constant.
+> 2. **Ship has never been flown.** `ShipCandidateSource` exists and is tested
+>    tier (i) only; the first ship portal is at x=7995 and nothing has ever
+>    reached it. Q5 remains open.
+> 3. **Practice mode has never been run.** It is built (`GDRL_PRACTICE=0`
+>    confirmed in a live STAMP line) but wholly unexercised, and GD's own
+>    `resetLevel()` appears to restore from a checkpoint by itself, so the
+>    interaction is unknown. Still a **declared Benchmark B variant** — A
+>    attempts and practice-assisted attempts must never be confusable.
 >
-> **Practice mode is a declared Benchmark change, not a tuning knob.** Benchmark
-> A's third property is *"replay is paid for -- there is no rewind"*, and this
-> file already says rewinding without paying for replay is Benchmark B by
-> definition. Ruling taken this session, subject to Rex: build it **declared, not
-> smuggled** — default-off, practice attempts counted and reported **separately**
-> from A attempts, stamped in the log. An A number and a practice-assisted number
-> must never be confusable.
+> **Preserved evidence** (`backups/2026-08-18/`, gitignored but durable):
+> `sightread_live_20260818-235533.jsonl` is the 255-attempt run above and is
+> **the new baseline to beat**; `control_head_20260818-232618.jsonl` is the
+> new-binary/old-search control that proves the rebuild changed nothing;
+> `gdrl.probe.geode.034fb3ac` is the previous known-good binary.
 >
-> **Stereo Madness still ends in ship** (Q5) and nothing has been built for it.
-> The action space transfers unchanged — `Interval(start_tick, hold_ticks)` is
-> vehicle-agnostic and maps directly onto ship thrust, and the `x >= levelLength`
-> completion path already exists in the driver. Only candidate *generation* is
-> cube-specific. Sequenced after the wall fix.
->
-> **Preserved evidence** (`backups/2026-08-17/`, gitignored but durable — the
-> originals were in `/tmp` and are one reboot from gone):
-> `sightread_live_20260817-230706.jsonl` is the 254-attempt acceptance ledger
-> and is **the baseline the wall fix must beat**;
-> `sightread_live_20260817-225850.jsonl` is the 12-attempt smoke run;
-> `dtsweep_hi.txt` is the N=8/16/32/64 sweep output.
->
-> **Provenance:** always `grep "gdrl\] autoplay ->"` the log. And the mod now has
-> a `[gdrl] STAMP` block (uncommitted-at-wrap work, unbuilt) that logs every
-> resolved `GDRL_*` switch plus the screen size and derived sensor width —
-> **today's runs were the 493 stratum** (built-in Color LCD main, 2560x1664).
+> **Provenance:** always `grep "gdrl\] autoplay ->"` the log. The mod now emits
+> a `[gdrl] STAMP` block logging every resolved `GDRL_*` switch plus screen size
+> and derived sensor width — today's runs were the **493** stratum.
 
 > **Read sections L and M first.** Between them they close I, J and K, harden
 > the observation decoder, and delete one loop that could never have done
@@ -153,13 +143,16 @@ decided yet.
 | Search algorithm | **RUN AGAINST GD 2026-08-17 — it plays.** `trainer/sightread.py` built 2026-08-15 — best-first over hold *intervals*, real backtracking, A-legality enforced by construction. Solves a 7-hazard puppet level in 12 attempts. **Never run against GD**; acceptance criterion not met. Its interval premise is now **confirmed live** (hold auto-repeats, landing +1 tick, 6/6) — but that is a *cube* law, and Stereo Madness ends in **ship**, which this action space cannot fly |
 | Env-loop throughput | **Re-measured 2026-08-17 and the earlier reading was wrong twice over.** The 2026-08-16 conclusion ("the stride buys 0%") measured `advanceSteps`, which is not the dt knob. `GDRL_ENV_DELTA_TICKS` **is** the dt knob and it works: one 1825-tick attempt costs 31.47s / 4.87s / 2.27s / **1.85s** at dt = 1/8/32/64, bit-identical throughout. **dt=64 is the operating point.** |
 | Policy / training loop | **Does not exist** |
-| Autonomous play | **PROVEN 2026-08-17.** First autonomous run: `x=2431.463867188` in 12 attempts, `x=3071.545410156` in 254, zero hardcoded ticks, attempt audit clean. Acceptance criterion (`3959.183837891`) **not met** |
-| Search backtracking | **THE BINDING CONSTRAINT.** 237 of 254 attempts died at one spot (`x=3071.545`); best reached at attempt #15, 239 attempts after it gained nothing. Diagnosed (R9): the cube arrives airborne, so the fatal decision is ~195 ticks earlier than anything the candidate generator proposes |
+| Autonomous play | **PROVEN 2026-08-17, improved 2026-08-19.** Best `x=3314.3349609375` in 255 attempts, zero hardcoded ticks, audit clean. That is **12.4% of `levelLength` 26724** — the `3959.183837891` criterion is a README "12 jumps" milestone, not the end of the level |
+| Search backtracking | **FIXED 2026-08-19, validated live.** Deaths at the worst single spot fell 93% -> 11%, distinct outcomes 16 -> 43, deepest backtrack 87 -> 1947 ticks, no-op probes 49 -> 0. Cleared two successive walls in one run. Cause was NOT depth capability but flat `wall_patience` at every depth; `_escalate_patience() = wall_patience * 2 ** backtrack_depth`. Growth rate UNVERIFIED beyond one run |
+| Run durability | **THE NEW BINDING CONSTRAINT.** Neither run today reached its budget: one died at attempt 175 to a stray **ESC** in the focused game window, one at 255/600 to `action waits expired: timeouts=1`. A full clear needs 800-2400 attempts |
 | Throughput | **SOLVED.** dt = 1/8/32/64 bit-identical for a client that strides to its own action ticks; 17x at dt=64, `protoErr=0`. Earlier "N=16 ceiling" applies only to `GDRL_INJECT_SEQ` |
-| Practice mode | **Requested by Rex 2026-08-17; in flight at wrap, mod NOT rebuilt.** A declared Benchmark variant, not a knob — see R10 |
+| Practice mode | **Built and now compiled in** (binary `cc75f7ef`, `GDRL_PRACTICE=0` confirmed in a live STAMP line) but **never exercised**. Still a declared Benchmark B variant, not a knob — see R10. Note GD's `resetLevel()` appears to restore from a checkpoint by itself |
 
-Deepest reach: 12 jumps, `maxX=3959.183837891`, `deathTick=3048`, ~14.8% of
-Stereo Madness.
+Deepest reach by the search: `maxX=3314.3349609375` (2026-08-19), **12.4%** of
+Stereo Madness by `levelLength` 26724. The older 12-jump figure
+`maxX=3959.183837891` / `deathTick=3048` (~14.8%) came from hand-placed
+injection, not from the search, and remains the number the search is chasing.
 
 ---
 
